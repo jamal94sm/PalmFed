@@ -1,88 +1,62 @@
 """
-Federated Learning for Palmprint Recognition on CASIA-MS
-===========================================================
-Each of the 6 clients holds one spectral domain of CASIA-MS as its
-local dataset (e.g., client_0 → "940nm", client_1 → "850nm", etc.).
+CompNet on CASIA-MS Dataset
+==================================================
+Single-file implementation with closed-set and open-set protocols.
 
-Dataset layout assumed
-───────────────────────
-  data_root/
-    {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
-  Example: 001_L_850_1.jpg
+PROTOCOL options (edit CONFIG below):
+  'closed-set' : 80% of samples per identity → train | 20% → test
+                 Evaluation: test probe vs train gallery (Rank-1 + EER)
 
-Protocol
-─────────
-  Identities : 200 shared IDs across all 6 clients (closed-set).
-  Global test : TEST_RATIO (20%) of each ID's samples per spectrum,
-                collected once before training.
-                Size: ~TEST_RATIO × n_iters × 200_IDs × 6_spectra
-  Local train : remaining 80% of each client's samples.
+  'open-set'   : 80% of identities → train | 20% of identities → test
+                 Within test identities: 50% samples → gallery, 50% → probe
+                 Evaluation: Rank-1 identification + EER
 
-FL Algorithm (FedAvg)
-──────────────────────
-  Round 0 : server initialises global model, broadcasts weights to all clients.
-  Each round (1 … R):
-    Step 1 – every client:
-               • loads global weights into local model
-               • trains for E local epochs on local training set
-               • evaluates local model on global test set
-               • returns updated weights to server
-    Step 2 – server:
-               • FedAvg: simple average of all client weight dicts
-               • updates global model
-               • evaluates global model on global test set
+Dataset: CASIA-MS-ROI
+  Filename format : {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
+  Identity key    : subjectID + handSide  (e.g. "001_L")
+  All spectra and iterations are treated as samples of the same identity.
 
-Results saved to BASE_RESULTS_DIR:
-  round_results.json   — EER and Rank-1 per round (local + global)
-  summary.txt          — final global model performance
-  round_{r:04d}/       — per-round checkpoint and eval scores
+Architecture: CompNet (unchanged from original)
+  compnet.py → GaborConv2d + CompetitiveBlock + ArcMarginProduct
+  Input: 128×128 grayscale   FC input: 9708   Embedding dim: 512
 """
 
 # ==============================================================
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    # ── Paths ──────────────────────────────────────────────────
-    "data_root"        : "path to CASIA-MS-ROI",
-    "base_results_dir" : "./rst_fedavg_casiams",
-
-    # ── Dataset ────────────────────────────────────────────────
-    "n_ids"            : 200,       # number of shared identities across clients
-    "test_ratio"       : 0.20,      # fraction of each ID's samples → global test set
-
-    # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 100,       # R: total communication rounds
-    "local_epochs"     : 1,         # E: local training epochs per round
-
-    # ── Model (CompNet — unchanged) ────────────────────────────
-    "img_side"         : 128,
-    "embedding_dim"    : 512,
-    "dropout"          : 0.25,
-    "arcface_s"        : 30.0,
-    "arcface_m"        : 0.50,
-
-    # ── Training ───────────────────────────────────────────────
-    "batch_size"       : 32,
-    "lr"               : 0.001,
-    "lr_step"          : 30,
-    "lr_gamma"         : 0.8,
-
-    # ── Misc ───────────────────────────────────────────────────
-    "random_seed"      : 42,
-    "num_workers"      : 4,
-    "save_every"       : 10,        # save global checkpoint every N rounds
+    "protocol"        : "open-set",   # "closed-set" | "open-set"
+    "data_root"       : "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    "results_dir"     : "./rst_casia_ms",
+    "img_side"        : 128,            # input image size (128×128 keeps fc=9708)
+    "batch_size"      : 32,
+    "num_epochs"      : 100,
+    "lr"              : 0.001,
+    "lr_step"         : 300,
+    "lr_gamma"        : 0.8,
+    "dropout"         : 0.25,
+    "arcface_s"       : 30.0,
+    "arcface_m"       : 0.50,
+    "embedding_dim"   : 512,
+    "train_ratio"     : 0.50,           # fraction of samples (closed) or IDs (open) for training
+    "gallery_ratio"   : 0.10,           # open-set only: fraction of test-ID samples → gallery
+    "val_ratio"       : 0.10,           # fraction of train samples held out for validation
+    "random_seed"     : 42,
+    "save_every"      : 10,             # save model every N epochs
+    "eval_every"      : 50,             # run full evaluation every N epochs
+    "num_workers"     : 4,
 }
 # ==============================================================
 
 import os
-import copy
-import json
+import sys
 import math
 import time
 import random
+import pickle
 import warnings
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
 from PIL import Image
 
 import torch
@@ -94,700 +68,971 @@ from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
-from sklearn.metrics import roc_curve
+from sklearn.metrics import roc_curve, auc
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
 warnings.filterwarnings("ignore")
 
+# ──────────────────────────────────────────────────────────────
+#  REPRODUCIBILITY
+# ──────────────────────────────────────────────────────────────
 SEED = CONFIG["random_seed"]
-random.seed(SEED); np.random.seed(SEED)
-torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
 
 # ══════════════════════════════════════════════════════════════
-#  MODEL  (CompNet — exact copy, unchanged)
+#  MODEL  (exact copy of models/compnet.py — unchanged)
 # ══════════════════════════════════════════════════════════════
 
 class GaborConv2d(nn.Module):
+    """Learnable Gabor Convolution (LGC) layer."""
     def __init__(self, channel_in, channel_out, kernel_size,
                  stride=1, padding=0, init_ratio=1):
         super().__init__()
-        self.channel_in  = channel_in; self.channel_out = channel_out
-        self.kernel_size = kernel_size; self.stride = stride
+        assert channel_in == 1
+        self.channel_in  = channel_in
+        self.channel_out = channel_out
+        self.kernel_size = kernel_size
+        self.stride      = stride
         self.padding     = padding
         self.init_ratio  = init_ratio if init_ratio > 0 else 1.0
         self.kernel      = 0
-        _S = 9.2 * self.init_ratio; _F = 0.057 / self.init_ratio; _G = 2.0
-        self.gamma = nn.Parameter(torch.FloatTensor([_G]))
-        self.sigma = nn.Parameter(torch.FloatTensor([_S]))
+
+        _SIGMA  = 9.2   * self.init_ratio
+        _FREQ   = 0.057 / self.init_ratio
+        _GAMMA  = 2.0
+
+        self.gamma = nn.Parameter(torch.FloatTensor([_GAMMA]))
+        self.sigma = nn.Parameter(torch.FloatTensor([_SIGMA]))
         self.theta = nn.Parameter(
-            torch.arange(0, channel_out).float() * math.pi / channel_out,
+            torch.FloatTensor(torch.arange(0, channel_out).float()) * math.pi / channel_out,
             requires_grad=False)
-        self.f   = nn.Parameter(torch.FloatTensor([_F]))
+        self.f   = nn.Parameter(torch.FloatTensor([_FREQ]))
         self.psi = nn.Parameter(torch.FloatTensor([0]), requires_grad=False)
 
-    def _gen_bank(self, ksize, c_in, c_out, sigma, gamma, theta, f, psi):
-        half = ksize // 2; ksz = 2 * half + 1
-        y0 = torch.arange(-half, half + 1).float()
-        x0 = torch.arange(-half, half + 1).float()
-        y  = y0.view(1,-1).repeat(c_out, c_in, ksz, 1)
-        x  = x0.view(-1,1).repeat(c_out, c_in, 1, ksz)
-        x  = x.to(sigma.device); y = y.to(sigma.device)
-        xt =  x*torch.cos(theta.view(-1,1,1,1)) + y*torch.sin(theta.view(-1,1,1,1))
-        yt = -x*torch.sin(theta.view(-1,1,1,1)) + y*torch.cos(theta.view(-1,1,1,1))
-        gb = -torch.exp(-0.5*((gamma*xt)**2+yt**2)/(8*sigma.view(-1,1,1,1)**2)
-            ) * torch.cos(2*math.pi*f.view(-1,1,1,1)*xt+psi.view(-1,1,1,1))
-        return gb - gb.mean(dim=[2,3], keepdim=True)
+    def genGaborBank(self, kernel_size, channel_in, channel_out,
+                     sigma, gamma, theta, f, psi):
+        xmax = kernel_size // 2
+        ymax = kernel_size // 2
+        xmin, ymin = -xmax, -ymax
+        ksize = xmax - xmin + 1
+
+        y_0 = torch.arange(ymin, ymax + 1).float()
+        x_0 = torch.arange(xmin, xmax + 1).float()
+
+        y = y_0.view(1, -1).repeat(channel_out, channel_in, ksize, 1)
+        x = x_0.view(-1, 1).repeat(channel_out, channel_in, 1, ksize)
+        x = x.float().to(sigma.device)
+        y = y.float().to(sigma.device)
+
+        x_theta = ( x * torch.cos(theta.view(-1,1,1,1))
+                  + y * torch.sin(theta.view(-1,1,1,1)))
+        y_theta = (-x * torch.sin(theta.view(-1,1,1,1))
+                  + y * torch.cos(theta.view(-1,1,1,1)))
+
+        gb = -torch.exp(
+            -0.5 * ((gamma * x_theta)**2 + y_theta**2)
+            / (8 * sigma.view(-1,1,1,1)**2)
+        ) * torch.cos(2 * math.pi * f.view(-1,1,1,1) * x_theta
+                      + psi.view(-1,1,1,1))
+        gb = gb - gb.mean(dim=[2, 3], keepdim=True)
+        return gb
 
     def forward(self, x):
-        self.kernel = self._gen_bank(self.kernel_size, self.channel_in,
-                                     self.channel_out, self.sigma, self.gamma,
-                                     self.theta, self.f, self.psi)
-        return F.conv2d(x, self.kernel, stride=self.stride, padding=self.padding)
+        kernel = self.genGaborBank(
+            self.kernel_size, self.channel_in, self.channel_out,
+            self.sigma, self.gamma, self.theta, self.f, self.psi)
+        self.kernel = kernel
+        return F.conv2d(x, kernel, stride=self.stride, padding=self.padding)
 
 
 class CompetitiveBlock(nn.Module):
+    """CB = LGC + soft-argmax + PPU"""
     def __init__(self, channel_in, n_competitor, ksize, stride, padding,
                  init_ratio=1, o1=32, o2=12):
         super().__init__()
-        self.gabor   = GaborConv2d(channel_in, n_competitor, ksize,
-                                   stride, padding, init_ratio)
-        self.a       = nn.Parameter(torch.FloatTensor([1]))
-        self.b       = nn.Parameter(torch.FloatTensor([0]))
-        self.argmax  = nn.Softmax(dim=1)
-        self.conv1   = nn.Conv2d(n_competitor, o1, 5, 1, 0)
+        assert channel_in == 1
+        self.channel_in    = 1
+        self.n_competitor  = n_competitor
+        self.init_ratio    = init_ratio
+
+        self.gabor_conv2d = GaborConv2d(1, n_competitor, ksize, stride, padding, init_ratio)
+        self.a      = nn.Parameter(torch.FloatTensor([1]))
+        self.b      = nn.Parameter(torch.FloatTensor([0]))
+        self.argmax = nn.Softmax(dim=1)
+        self.conv1  = nn.Conv2d(n_competitor, o1, 5, 1, 0)
         self.maxpool = nn.MaxPool2d(2, 2)
-        self.conv2   = nn.Conv2d(o1, o2, 1, 1, 0)
+        self.conv2  = nn.Conv2d(o1, o2, 1, 1, 0)
 
     def forward(self, x):
-        x = self.gabor(x)
-        x = self.argmax((x - self.b) * self.a)
-        return self.conv2(self.maxpool(self.conv1(x)))
+        x = self.gabor_conv2d(x)
+        x = (x - self.b) * self.a
+        x = self.argmax(x)
+        x = self.conv1(x)
+        x = self.maxpool(x)
+        x = self.conv2(x)
+        return x
 
 
 class ArcMarginProduct(nn.Module):
+    """ArcFace angular margin product layer."""
     def __init__(self, in_features, out_features, s=30.0, m=0.50,
                  easy_margin=False):
         super().__init__()
-        self.s = s; self.m = m
-        self.weight      = Parameter(torch.FloatTensor(out_features, in_features))
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = Parameter(torch.FloatTensor(out_features, in_features))
         nn.init.xavier_uniform_(self.weight)
         self.easy_margin = easy_margin
-        self.cos_m = math.cos(m); self.sin_m = math.sin(m)
-        self.th    = math.cos(math.pi - m); self.mm = math.sin(math.pi - m) * m
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th    = math.cos(math.pi - m)
+        self.mm    = math.sin(math.pi - m) * m
 
-    def forward(self, x, label=None):
-        cosine = F.linear(F.normalize(x), F.normalize(self.weight))
+    def forward(self, inp, label=None):
+        cosine = F.linear(F.normalize(inp), F.normalize(self.weight))
         if self.training:
             assert label is not None
-            sine = torch.sqrt((1.0 - cosine.pow(2)).clamp(0, 1))
+            sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
             phi  = cosine * self.cos_m - sine * self.sin_m
-            phi  = (torch.where(cosine > 0, phi, cosine) if self.easy_margin
-                    else torch.where(cosine > self.th, phi, cosine - self.mm))
-            one_hot = torch.zeros_like(cosine)
+            if self.easy_margin:
+                phi = torch.where(cosine > 0, phi, cosine)
+            else:
+                phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+            one_hot = torch.zeros(cosine.size(), device=cosine.device)
             one_hot.scatter_(1, label.view(-1, 1).long(), 1)
-            return self.s * ((one_hot * phi) + ((1 - one_hot) * cosine))
-        return self.s * cosine
+            output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+            output *= self.s
+        else:
+            assert label is None
+            output = self.s * cosine
+        return output
 
 
 class CompNet(nn.Module):
-    """CompNet = CB1 // CB2 // CB3 + FC(9708→emb_dim) + Dropout + ArcFace."""
+    """
+    CompNet = CB1 // CB2 // CB3 + FC + Dropout + ArcFace output
+    Fixed fc input: 9708  (valid for 128×128 input images)
+    """
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25):
         super().__init__()
+        self.num_classes   = num_classes
+        self.embedding_dim = embedding_dim
+
         self.cb1 = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
         self.cb2 = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.fc   = nn.Linear(9708, embedding_dim)
-        self.drop = nn.Dropout(p=dropout)
-        self.arc  = ArcMarginProduct(embedding_dim, num_classes,
-                                     s=arcface_s, m=arcface_m)
 
-    def _backbone(self, x):
-        x1 = self.cb1(x).flatten(1); x2 = self.cb2(x).flatten(1)
-        x3 = self.cb3(x).flatten(1)
-        return self.fc(torch.cat([x1, x2, x3], dim=1))
+        self.fc       = nn.Linear(9708, embedding_dim)
+        self.drop     = nn.Dropout(p=dropout)
+        self.arclayer = ArcMarginProduct(embedding_dim, num_classes,
+                                         s=arcface_s, m=arcface_m)
+
+    def _extract_concat(self, x):
+        x1 = self.cb1(x).view(x.shape[0], -1)
+        x2 = self.cb2(x).view(x.shape[0], -1)
+        x3 = self.cb3(x).view(x.shape[0], -1)
+        return torch.cat((x1, x2, x3), dim=1)
 
     def forward(self, x, y=None):
-        return self.arc(self.drop(self._backbone(x)), y)
+        x = self._extract_concat(x)
+        x = self.fc(x)
+        x = self.drop(x)
+        x = self.arclayer(x, y)
+        return x
 
-    @torch.no_grad()
-    def get_embedding(self, x):
-        """L2-normalised embedding for matching."""
-        return F.normalize(self._backbone(x), p=2, dim=1)
-
-
-# ══════════════════════════════════════════════════════════════
-#  NORMALISATION
-# ══════════════════════════════════════════════════════════════
-
-class NormSingleROI:
-    def __init__(self, outchannels=1): self.outchannels = outchannels
-
-    def __call__(self, tensor):
-        c, h, w = tensor.size(); tensor = tensor.view(c, h * w)
-        idx = tensor > 0; t = tensor[idx]
-        tensor[idx] = t.sub_(t.mean()).div_(t.std() + 1e-6)
-        tensor = tensor.view(c, h, w)
-        if self.outchannels > 1:
-            tensor = torch.repeat_interleave(tensor, self.outchannels, dim=0)
-        return tensor
+    def getFeatureCode(self, x):
+        """Return L2-normalised 512-d embedding (no grad required)."""
+        x = self._extract_concat(x)
+        x = self.fc(x)
+        x = x / torch.norm(x, p=2, dim=1, keepdim=True)
+        return x
 
 
 # ══════════════════════════════════════════════════════════════
-#  DATASET
+#  DATASET UTILITIES
 # ══════════════════════════════════════════════════════════════
 
-class PalmDataset(Dataset):
-    """Simple palmprint dataset: list of (path, int_label) pairs."""
+class CASIAMSDataset(Dataset):
+    """
+    Dataset for CASIA-MS ROI images.
+    Images are loaded as grayscale, resized to img_side × img_side,
+    and converted to a float tensor in [0, 1].
+    No augmentation or normalisation is applied.
 
-    def __init__(self, samples, img_side=128):
-        self.samples   = samples
-        self.transform = T.Compose([
+    Parameters
+    ----------
+    samples  : list of (image_path, int_label)
+    img_side : resize target (default 128)
+    """
+    def __init__(self, samples, img_side=128, **kwargs):
+        # **kwargs absorbs any legacy `train=` keyword without error
+        self.samples  = samples
+        self.img_side = img_side
+        self.to_tensor = T.Compose([
             T.Resize((img_side, img_side)),
-            T.ToTensor(),
-            NormSingleROI(outchannels=1),
+            T.ToTensor(),           # → float32 in [0, 1], shape [1, H, W]
         ])
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        return self.transform(Image.open(path).convert("L")), label
+        img = Image.open(path).convert("L")
+        img = self.to_tensor(img)
+        return img, label
 
 
 # ══════════════════════════════════════════════════════════════
-#  DATA LOADING & PARTITIONING
+#  DATA LOADING & SPLIT LOGIC
 # ══════════════════════════════════════════════════════════════
 
 def parse_casia_ms(data_root):
     """
-    Scan data_root for CASIA-MS ROI images.
-    Filename format: {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
-
+    Scan data_root for files matching  {subjectID}_{handSide}_{spectrum}_{iter}.jpg
     Returns
     -------
-    data : dict   spectrum → identity → [path, ...]
+    id2paths : dict  identity_key → sorted list of absolute paths
     """
-    data = defaultdict(lambda: defaultdict(list))
-    img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    id2paths = defaultdict(list)
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+
     for fname in sorted(os.listdir(data_root)):
-        if os.path.splitext(fname)[1].lower() not in img_exts:
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in exts:
             continue
         parts = os.path.splitext(fname)[0].split("_")
         if len(parts) < 4:
+            print(f"  [WARN] Skipping unexpected filename: {fname}")
             continue
         subject_id = parts[0]
         hand_side  = parts[1]
-        spectrum   = parts[2]
         identity   = f"{subject_id}_{hand_side}"   # e.g. "001_L"
-        data[spectrum][identity].append(os.path.join(data_root, fname))
-    return data
+        id2paths[identity].append(os.path.join(data_root, fname))
+
+    return dict(id2paths)
 
 
-def build_federated_splits(data_root, n_ids, test_ratio, seed=42):
+def make_label_map(identities_sorted):
+    """Map sorted identity keys to consecutive integer labels starting at 0."""
+    return {ident: idx for idx, ident in enumerate(sorted(identities_sorted))}
+
+
+def split_closed_set(id2paths, train_ratio=0.80, seed=42):
     """
-    Build per-client local train sets and a shared global test set.
-
-    Strategy
-    ─────────
-    1. Parse dataset; discover all spectra (clients) and identities.
-    2. Select n_ids shared identities present in ALL spectra.
-    3. For each (spectrum, identity): shuffle samples, take the first
-       test_ratio fraction → global test set; the rest → local train set.
+    Closed-set split:
+      - All identities appear in both train and test.
+      - Per identity: first `train_ratio` fraction of samples → train,
+        remainder → test.
 
     Returns
     -------
-    client_data  : list of dicts, one per spectrum/client
-                     {"spectrum": str,
-                      "train_samples": [(path, label), ...],
-                      "label_map": {identity: int}}
-    test_samples : [(path, label), ...]   — shared global test set
-    label_map    : {identity: int}        — same for all clients / test set
-    spectra      : list of spectrum strings (client ID order)
+    train_samples, test_samples : list of (path, int_label)
+    label_map                   : dict  identity → int
     """
-    rng  = random.Random(seed)
-    data = parse_casia_ms(data_root)
+    rng = random.Random(seed)
+    identities = sorted(id2paths.keys())
+    label_map  = make_label_map(identities)
 
-    spectra = sorted(data.keys())
-    print(f"  Spectra found ({len(spectra)}): {spectra}")
+    train_samples, test_samples = [], []
+    for ident in identities:
+        paths = id2paths[ident][:]
+        rng.shuffle(paths)
+        label   = label_map[ident]
+        n_train = max(1, int(len(paths) * train_ratio))
+        for p in paths[:n_train]:
+            train_samples.append((p, label))
+        for p in paths[n_train:]:
+            test_samples.append((p, label))
 
-    # ── find identities common to ALL spectra ─────────────────────────────
-    common_ids = set(data[spectra[0]].keys())
-    for sp in spectra[1:]:
-        common_ids &= set(data[sp].keys())
-    common_ids = sorted(common_ids)
-    print(f"  Identities common to all spectra: {len(common_ids)}")
-
-    if len(common_ids) < n_ids:
-        raise ValueError(
-            f"Requested {n_ids} shared IDs but only {len(common_ids)} "
-            f"identities are present in all {len(spectra)} spectra.")
-
-    # sample n_ids shared identities deterministically
-    selected_ids = sorted(rng.sample(common_ids, n_ids))
-    label_map    = {ident: i for i, ident in enumerate(selected_ids)}
-
-    # ── split per (spectrum, identity) ───────────────────────────────────
-    client_data  = []
-    test_samples = []
-
-    for sp in spectra:
-        local_train = []
-        for ident in selected_ids:
-            paths = list(data[sp][ident])
-            rng.shuffle(paths)
-            label   = label_map[ident]
-            n_test  = max(1, round(len(paths) * test_ratio))
-            # first n_test → global test set; rest → local training set
-            for p in paths[:n_test]:
-                test_samples.append((p, label))
-            for p in paths[n_test:]:
-                local_train.append((p, label))
-
-        client_data.append({
-            "spectrum"      : sp,
-            "train_samples" : local_train,
-            "label_map"     : label_map,   # shared label space
-        })
-
-        print(f"    Client [{sp:>6}]  train={len(local_train):5d}  "
-              f"test_contribution={len(selected_ids)}")
-
-    print(f"  Global test set size: {len(test_samples)}")
-    return client_data, test_samples, label_map, spectra
+    print(f"  [closed-set] identities: {len(identities)} | "
+          f"train: {len(train_samples)} | test: {len(test_samples)}")
+    return train_samples, test_samples, label_map
 
 
-# ══════════════════════════════════════════════════════════════
-#  EVALUATION  (cosine similarity, EER, Rank-1)
-# ══════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def extract_features(model, loader, device):
-    model.eval()
-    feats, labels = [], []
-    for imgs, labs in loader:
-        feats.append(model.get_embedding(imgs.to(device)).cpu().numpy())
-        labels.append(labs.numpy())
-    return np.concatenate(feats), np.concatenate(labels)
-
-
-def compute_eer(scores_array):
-    """Single EER from an Nx2 array of [score, label(+1/-1)]."""
-    ins  = scores_array[scores_array[:, 1] ==  1, 0]
-    outs = scores_array[scores_array[:, 1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0:
-        return 1.0
-    y = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
-    s = np.concatenate([ins, outs])
-    fpr, tpr, _ = roc_curve(y, s, pos_label=1)
-    return brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
-
-
-def evaluate_model(model, test_loader, device, out_dir=None, tag="eval"):
+def split_open_set(id2paths, train_ratio=0.80, gallery_ratio=0.50,
+                   val_ratio=0.10, seed=42):
     """
-    Evaluate model on the global test set.
-    Uses 50% of test IDs as gallery and 50% as probe (random, seeded split).
+    Open-set split:
+      - 80% of identities → training.
+      - 20% of identities → test, never seen during training.
+      - Within train identities: `val_ratio` of samples → validation,
+        rest → training.  (FIX: previously val was a copy of train.)
+      - Within test identities: `gallery_ratio` of samples → gallery,
+        rest → probe.
 
     Returns
     -------
-    eer   : float  EER in [0, 1]
-    rank1 : float  Rank-1 accuracy in [0, 100]
+    train_samples   : list of (path, int_label)  — labels from 0 … N_train-1
+    val_samples     : list of (path, int_label)  — same label space as train
+    gallery_samples : list of (path, int_label)  — labels from 0 … N_test-1
+    probe_samples   : list of (path, int_label)  — same label space as gallery
+    train_label_map : dict  identity → int (for training)
+    test_label_map  : dict  identity → int (for test, independent range)
     """
-    feats, labels = extract_features(model, test_loader, device)
+    rng = random.Random(seed)
+    identities = sorted(id2paths.keys())
+    rng_ids    = identities[:]
+    rng.shuffle(rng_ids)
 
-    # deterministic gallery/probe split on test set (50/50 per identity)
-    rng       = random.Random(42)
-    id_to_idx = defaultdict(list)
-    for i, lbl in enumerate(labels):
-        id_to_idx[lbl].append(i)
+    n_train = max(1, int(len(rng_ids) * train_ratio))
+    train_ids = sorted(rng_ids[:n_train])
+    test_ids  = sorted(rng_ids[n_train:])
 
-    gal_idx, prb_idx = [], []
-    for lbl, idxs in id_to_idx.items():
-        idxs_s = list(idxs); rng.shuffle(idxs_s)
-        mid    = max(1, len(idxs_s) // 2)
-        gal_idx.extend(idxs_s[:mid])
-        prb_idx.extend(idxs_s[mid:])
+    train_label_map = make_label_map(train_ids)
+    test_label_map  = make_label_map(test_ids)
 
-    gal_feats  = feats[gal_idx];  gal_labels  = labels[gal_idx]
-    prb_feats  = feats[prb_idx];  prb_labels  = labels[prb_idx]
+    train_samples   = []
+    val_samples     = []
+    gallery_samples = []
+    probe_samples   = []
 
-    # cosine similarity matrix
-    sim_matrix = prb_feats @ gal_feats.T   # embeddings are L2-normalised
+    # ── FIX: split each train identity's samples into train / val ──
+    for ident in train_ids:
+        paths = id2paths[ident][:]
+        rng.shuffle(paths)
+        label = train_label_map[ident]
+        n_val = max(1, int(len(paths) * val_ratio))
+        for p in paths[:n_val]:
+            val_samples.append((p, label))
+        for p in paths[n_val:]:
+            train_samples.append((p, label))
 
-    # EER
-    scores_list, labels_list = [], []
-    for i in range(len(prb_feats)):
-        for j in range(len(gal_feats)):
-            scores_list.append(float(sim_matrix[i, j]))
-            labels_list.append(1 if prb_labels[i] == gal_labels[j] else -1)
-    scores_arr = np.column_stack([scores_list, labels_list])
-    eer = compute_eer(scores_arr)
+    for ident in test_ids:
+        paths = id2paths[ident][:]
+        rng.shuffle(paths)
+        label    = test_label_map[ident]
+        n_gallery = max(1, int(len(paths) * gallery_ratio))
+        for p in paths[:n_gallery]:
+            gallery_samples.append((p, label))
+        for p in paths[n_gallery:]:
+            probe_samples.append((p, label))
 
-    # Rank-1
-    nn_idx  = np.argmax(sim_matrix, axis=1)
-    correct = sum(prb_labels[i] == gal_labels[nn_idx[i]]
-                  for i in range(len(prb_feats)))
-    rank1   = 100.0 * correct / max(len(prb_feats), 1)
-
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, f"scores_{tag}.txt"), "w") as f:
-            for s, l in zip(scores_list, labels_list):
-                f.write(f"{s} {l}\n")
-
-    return eer, rank1
+    print(f"  [open-set] train IDs: {len(train_ids)} | test IDs: {len(test_ids)}")
+    print(f"             train samples: {len(train_samples)} | "
+          f"val samples: {len(val_samples)} | "
+          f"gallery: {len(gallery_samples)} | probe: {len(probe_samples)}")
+    return (train_samples, val_samples, gallery_samples, probe_samples,
+            train_label_map, test_label_map)
 
 
 # ══════════════════════════════════════════════════════════════
-#  FL CLIENT
+#  FEATURE EXTRACTION
 # ══════════════════════════════════════════════════════════════
 
-class FLClient:
+def extract_features(net, data_loader, device):
     """
-    Represents one federated learning client.
-
-    Each client holds:
-      - a local training dataset (one spectral domain)
-      - a local CompNet model
-      - a local optimiser + scheduler (re-created each round from global weights)
+    Returns
+    -------
+    feats  : np.ndarray  [N, embedding_dim]
+    labels : np.ndarray  [N]
     """
-
-    def __init__(self, client_id, spectrum, train_samples, label_map,
-                 num_classes, cfg, device):
-        self.client_id     = client_id
-        self.spectrum      = spectrum
-        self.label_map     = label_map
-        self.num_classes   = num_classes
-        self.cfg           = cfg
-        self.device        = device
-
-        # local dataset
-        self.train_dataset = PalmDataset(train_samples, cfg["img_side"])
-        self.train_loader  = DataLoader(
-            self.train_dataset,
-            batch_size  = cfg["batch_size"],
-            shuffle     = True,
-            num_workers = cfg["num_workers"],
-            pin_memory  = True,
-        )
-
-        # local model (initialised to random; will be overwritten each round)
-        self.model = CompNet(
-            num_classes   = num_classes,
-            embedding_dim = cfg["embedding_dim"],
-            arcface_s     = cfg["arcface_s"],
-            arcface_m     = cfg["arcface_m"],
-            dropout       = cfg["dropout"],
-        ).to(device)
-
-        print(f"  Client {client_id} [{spectrum}] — "
-              f"train samples: {len(train_samples)}")
-
-    # ── public interface ────────────────────────────────────────────────────
-
-    def set_weights(self, state_dict):
-        """Load global model weights into the local model."""
-        self.model.load_state_dict(copy.deepcopy(state_dict))
-
-    def get_weights(self):
-        """Return a CPU copy of the local model state dict."""
-        return {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
-
-    def local_train(self, local_epochs):
-        """
-        Train the local model for `local_epochs` epochs.
-        Optimiser and scheduler are re-created each round so that
-        every client starts from the same lr regardless of round number.
-        """
-        optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
-        scheduler = lr_scheduler.StepLR(
-            optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
-        criterion = nn.CrossEntropyLoss()
-
-        self.model.train()
-        for epoch in range(local_epochs):
-            running_loss = 0.0; correct = 0; total = 0
-            for imgs, labels in self.train_loader:
-                imgs, labels = imgs.to(self.device), labels.to(self.device)
-                optimizer.zero_grad()
-                out  = self.model(imgs, labels)
-                loss = criterion(out, labels)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item() * imgs.size(0)
-                correct      += out.argmax(1).eq(labels).sum().item()
-                total        += imgs.size(0)
-            scheduler.step()
-
-        avg_loss = running_loss / max(total, 1)
-        accuracy = 100.0 * correct / max(total, 1)
-        return avg_loss, accuracy
+    net.eval()
+    feats_list  = []
+    labels_list = []
+    with torch.no_grad():
+        for data, target in data_loader:
+            data = data.to(device)
+            codes = net.getFeatureCode(data)
+            feats_list.append(codes.cpu().numpy())
+            labels_list.append(target.numpy())
+    feats  = np.concatenate(feats_list,  axis=0)
+    labels = np.concatenate(labels_list, axis=0)
+    return feats, labels
 
 
 # ══════════════════════════════════════════════════════════════
-#  FL SERVER
+#  MATCHING & METRICS  (inlined — no subprocess)
 # ══════════════════════════════════════════════════════════════
 
-class FLServer:
+def angular_distance(f1, f2):
+    """Normalised angular distance in [0, 1] between two L2-norm vectors."""
+    cos = np.dot(f1, f2)
+    return np.arccos(np.clip(cos, -1.0, 1.0)) / np.pi
+
+
+def compute_scores(probe_feats, probe_labels,
+                   gallery_feats, gallery_labels):
     """
-    Central server that:
-      - maintains the global CompNet model
-      - performs FedAvg aggregation
-      - evaluates the global model on the shared test set
+    Compute all probe × gallery matching scores.
+
+    Returns
+    -------
+    s : list of float  — angular distances
+    l : list of int    — 1 (genuine) or -1 (impostor)
     """
+    s, l = [], []
+    n_probe   = probe_feats.shape[0]
+    n_gallery = gallery_feats.shape[0]
+    for i in range(n_probe):
+        for j in range(n_gallery):
+            d = angular_distance(probe_feats[i], gallery_feats[j])
+            s.append(d)
+            l.append(1 if probe_labels[i] == gallery_labels[j] else -1)
+    return s, l
 
-    def __init__(self, num_classes, test_samples, cfg, device):
-        self.cfg    = cfg
-        self.device = device
 
-        # global model
-        self.global_model = CompNet(
-            num_classes   = num_classes,
-            embedding_dim = cfg["embedding_dim"],
-            arcface_s     = cfg["arcface_s"],
-            arcface_m     = cfg["arcface_m"],
-            dropout       = cfg["dropout"],
-        ).to(device)
+def compute_eer(scores, labels):
+    """
+    Compute EER from a list of (score, label) pairs.
+    Scores are distances (lower = more similar → genuine scores are smaller).
 
-        # shared global test loader
-        self.test_loader = DataLoader(
-            PalmDataset(test_samples, cfg["img_side"]),
-            batch_size  = cfg["batch_size"],
-            shuffle     = False,
-            num_workers = cfg["num_workers"],
-            pin_memory  = True,
-        )
+    Returns
+    -------
+    eer       : float  — EER in [0, 1]
+    thresh    : float  — threshold at EER
+    roc_auc   : float
+    eer_half  : float  — (FAR + FRR) / 2 at closest operating point
+    """
+    scores = np.array(scores)
+    labels = np.array(labels)
 
-        print(f"  Server — global test samples: {len(test_samples)}")
+    # Convert to similarity (negate distance) so that genuine > impostor
+    sim = -scores
 
-    def get_global_weights(self):
-        """Return a CPU copy of the global model state dict."""
-        return {k: v.cpu().clone()
-                for k, v in self.global_model.state_dict().items()}
+    in_scores  = sim[labels ==  1]
+    out_scores = sim[labels == -1]
 
-    def aggregate(self, client_weight_dicts):
-        """
-        FedAvg: simple average of all client weight dicts.
-        All clients have equal weight (same number of classes, uniform datasets).
-        """
-        n = len(client_weight_dicts)
-        avg_dict = {}
-        for key in client_weight_dicts[0].keys():
-            stacked = torch.stack(
-                [client_weight_dicts[i][key].float() for i in range(n)], dim=0)
-            avg_dict[key] = stacked.mean(dim=0)
-        self.global_model.load_state_dict(avg_dict)
+    y    = np.concatenate([np.ones(len(in_scores)), np.zeros(len(out_scores))])
+    sall = np.concatenate([in_scores, out_scores])
 
-    def evaluate(self, out_dir=None, tag="global"):
-        """Evaluate the global model on the shared test set."""
-        return evaluate_model(
-            self.global_model, self.test_loader, self.device, out_dir, tag)
+    fpr, tpr, thresholds = roc_curve(y, sall, pos_label=1)
+    roc_auc = auc(fpr, tpr)
 
-    def save_checkpoint(self, path):
-        torch.save(self.global_model.state_dict(), path)
+    eer    = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
+    thresh = float(interp1d(fpr, thresholds)(eer))
+
+    diff    = np.abs(fpr - (1 - tpr))
+    idx     = np.argmin(diff)
+    eer_half = (fpr[idx] + (1 - tpr[idx])) / 2.0
+
+    return eer, thresh, roc_auc, eer_half, fpr, tpr, thresholds
+
+
+def compute_rank1(probe_feats, probe_labels,
+                  gallery_feats, gallery_labels,
+                  scores_matrix=None):
+    """
+    Rank-1 identification accuracy.
+
+    scores_matrix : optional pre-computed [n_probe × n_gallery] distance array.
+    """
+    n_probe   = probe_feats.shape[0]
+    n_gallery = gallery_feats.shape[0]
+
+    if scores_matrix is None:
+        dist = np.zeros((n_probe, n_gallery))
+        for i in range(n_probe):
+            for j in range(n_gallery):
+                dist[i, j] = angular_distance(probe_feats[i], gallery_feats[j])
+    else:
+        dist = scores_matrix
+
+    correct = 0
+    for i in range(n_probe):
+        best_j = int(np.argmin(dist[i]))
+        if probe_labels[i] == gallery_labels[best_j]:
+            correct += 1
+    rank1 = correct / n_probe * 100.0
+    return rank1, dist
+
+
+def compute_aggregated_eer(dist_matrix, prb_labels, gal_labels):
+    """
+    Aggregated EER (best-of-N per gallery class).
+
+    For every probe i and every gallery identity class c, take the MINIMUM
+    distance among all gallery samples that belong to class c.  This produces
+    one score per (probe, gallery-class) pair — a fairer metric when multiple
+    gallery samples per identity exist, matching the aggregation in test.py.
+
+    Parameters
+    ----------
+    dist_matrix : np.ndarray [n_probe, n_gallery]  — angular distances
+    prb_labels  : np.ndarray [n_probe]              — integer class labels
+    gal_labels  : np.ndarray [n_gallery]            — integer class labels
+
+    Returns
+    -------
+    aggr_s : list of float  — aggregated distances
+    aggr_l : list of int    — 1 (genuine) or -1 (impostor)
+    """
+    class_ids = sorted(set(gal_labels.tolist()))
+    n_probe   = dist_matrix.shape[0]
+
+    aggr_s, aggr_l = [], []
+    for i in range(n_probe):
+        for cls in class_ids:
+            cls_mask = (gal_labels == cls)          # boolean over gallery axis
+            min_dist = dist_matrix[i, cls_mask].min()
+            aggr_s.append(min_dist)
+            aggr_l.append(1 if prb_labels[i] == cls else -1)
+
+    return aggr_s, aggr_l
 
 
 # ══════════════════════════════════════════════════════════════
-#  PLOTTING HELPERS
+#  PLOTTING & SAVING
 # ══════════════════════════════════════════════════════════════
 
-def plot_fl_curves(round_results, out_dir):
-    """Plot global EER and Rank-1 across rounds."""
-    rounds  = [r["round"] for r in round_results]
-    g_eer   = [r["global_eer"]   * 100 for r in round_results]
-    g_rank1 = [r["global_rank1"]       for r in round_results]
+def save_scores_txt(scores, labels, path):
+    with open(path, "w") as f:
+        for s, l in zip(scores, labels):
+            f.write(f"{s} {l}\n")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 
-    ax1.plot(rounds, g_eer, "b-o", markersize=3, label="Global EER (%)")
-    ax1.set_xlabel("Round"); ax1.set_ylabel("EER (%)")
-    ax1.set_title("Global Model — EER vs. Round")
-    ax1.grid(True); ax1.legend()
+def plot_and_save(fpr, tpr, fnr, thresholds, eer, rank1, out_dir, tag):
+    os.makedirs(out_dir, exist_ok=True)
+    fpr_pct = fpr * 100
+    tpr_pct = tpr * 100
+    fnr_pct = fnr * 100
+    thr     = thresholds
 
-    ax2.plot(rounds, g_rank1, "g-o", markersize=3, label="Global Rank-1 (%)")
-    ax2.set_xlabel("Round"); ax2.set_ylabel("Rank-1 (%)")
-    ax2.set_title("Global Model — Rank-1 vs. Round")
-    ax2.grid(True); ax2.legend()
+    pdf_path = os.path.join(out_dir, f"roc_det_{tag}.pdf")
+    with PdfPages(pdf_path) as pdf:
+        # ROC
+        plt.figure()
+        plt.plot(fpr_pct, tpr_pct, "b-^", label="ROC")
+        plt.plot(np.linspace(0,100,101), np.linspace(100,0,101), "k-", label="EER")
+        plt.xlim([0, 5]); plt.ylim([90, 100])
+        plt.legend(); plt.grid(True)
+        plt.title(f"ROC  |  EER={eer*100:.4f}%  Rank-1={rank1:.2f}%")
+        plt.xlabel("FAR (%)"); plt.ylabel("GAR (%)")
+        plt.savefig(os.path.join(out_dir, f"ROC_{tag}.png"))
+        pdf.savefig(); plt.close()
 
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "fl_global_curves.png"), dpi=150)
-    plt.close(fig)
+        # DET
+        plt.figure()
+        plt.plot(fpr_pct, fnr_pct, "b-^", label="DET")
+        plt.plot(np.linspace(0,100,101), np.linspace(0,100,101), "k-", label="EER")
+        plt.xlim([0, 5]); plt.ylim([0, 5])
+        plt.legend(); plt.grid(True)
+        plt.title("DET curve")
+        plt.xlabel("FAR (%)"); plt.ylabel("FRR (%)")
+        plt.savefig(os.path.join(out_dir, f"DET_{tag}.png"))
+        pdf.savefig(); plt.close()
 
-    # per-client local EER
-    spectra = [r["spectrum"] for r in round_results[0]["clients"]]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    for sp in spectra:
-        eer_list = [r["clients"][
-            next(i for i,c in enumerate(r["clients"]) if c["spectrum"]==sp)
-        ]["eer"] * 100 for r in round_results]
-        ax.plot(rounds, eer_list, label=sp)
-    ax.set_xlabel("Round"); ax.set_ylabel("Local EER (%) after local training")
-    ax.set_title("Per-Client Local EER vs. Round")
-    ax.grid(True); ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "fl_client_eer_curves.png"), dpi=150)
-    plt.close(fig)
+        # FAR/FRR vs threshold
+        plt.figure()
+        plt.plot(thr, fpr_pct, "r-.", label="FAR")
+        plt.plot(thr, fnr_pct, "b-^", label="FRR")
+        plt.legend(); plt.grid(True)
+        plt.title("FAR and FRR Curves")
+        plt.xlabel("Threshold"); plt.ylabel("FAR / FRR (%)")
+        plt.savefig(os.path.join(out_dir, f"FAR_FRR_{tag}.png"))
+        pdf.savefig(); plt.close()
+
+
+def plot_loss_acc(train_losses, val_losses, train_acc, val_acc, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    ep = range(1, len(train_losses) + 1)
+
+    plt.figure()
+    plt.plot(ep, train_losses, "b", label="train loss")
+    plt.plot(ep, val_losses,   "r", label="val loss")
+    plt.legend(); plt.xlabel("epoch"); plt.ylabel("loss")
+    plt.savefig(os.path.join(out_dir, "losses.png")); plt.close()
+
+    plt.figure()
+    plt.plot(ep, train_acc, "b", label="train acc")
+    plt.plot(ep, val_acc,   "r", label="val acc")
+    plt.legend(); plt.grid(True)
+    plt.xlabel("epoch"); plt.ylabel("accuracy (%)")
+    plt.savefig(os.path.join(out_dir, "accuracy.png")); plt.close()
+
+
+def plot_gi_histogram(in_scores, out_scores, out_dir, tag):
+    """Genuine-Impostor matching score distribution."""
+    os.makedirs(out_dir, exist_ok=True)
+    samples = 100
+    in_arr  = np.array(in_scores)
+    out_arr = np.array(out_scores)
+
+    def normalise_hist(arr):
+        lo, hi = arr.min(), arr.max()
+        idx_arr = np.round((arr - lo) / (hi - lo + 1e-10) * samples).astype(int)
+        h = np.zeros(samples + 1)
+        for v in idx_arr:
+            h[v] += 1
+        h = h / h.sum() * 100
+        x = np.linspace(0, 1, samples + 1) * (hi - lo) + lo
+        return x, h
+
+    xi, hi  = normalise_hist(in_arr)
+    xo, ho  = normalise_hist(out_arr)
+
+    plt.figure()
+    plt.plot(xo, ho, "r", label="Impostor")
+    plt.plot(xi, hi, "b", label="Genuine")
+    plt.legend(fontsize=13)
+    plt.xlabel("Matching Score", fontsize=13)
+    plt.ylabel("Percentage (%)", fontsize=13)
+    plt.ylim([0, 1.2 * max(hi.max(), ho.max())])
+    plt.grid(True)
+    plt.savefig(os.path.join(out_dir, f"GI_{tag}.png")); plt.close()
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN TRAINING LOOP
+#  TRAINING
+# ══════════════════════════════════════════════════════════════
+
+def run_one_epoch(epoch, model, loader, criterion, optimizer, device,
+                  phase="training"):
+    if phase == "training":
+        model.train()
+    else:
+        model.eval()
+
+    running_loss    = 0.0
+    running_correct = 0
+
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+
+        if phase == "training":
+            optimizer.zero_grad()
+            output = model(data, target)
+        else:
+            with torch.no_grad():
+                output = model(data, None)
+
+        loss = criterion(output, target)
+        running_loss += loss.item()
+
+        preds = output.argmax(dim=1, keepdim=True)
+        running_correct += preds.eq(target.view_as(preds)).sum().item()
+
+        if phase == "training":
+            loss.backward()
+            optimizer.step()
+
+    total    = len(loader.dataset)
+    avg_loss = running_loss / total
+    acc      = 100.0 * running_correct / total
+    return avg_loss, acc
+
+
+# ══════════════════════════════════════════════════════════════
+#  EVALUATION PIPELINE
+# ══════════════════════════════════════════════════════════════
+
+
+
+def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
+             device, out_dir, tag="eval"):
+    """
+    Shared evaluation for both protocols.
+
+    For closed-set  : train_loader = train split,  test loaders = test split
+                      (probe and gallery are the SAME test split,
+                       matched against the training gallery)
+    For open-set    : train_loader = None (not used for matching),
+                      gallery = open-set gallery, probe = open-set probe
+
+    FIX: Always compute both pairwise EER and aggregated EER.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- extract features ---
+    print("  Extracting gallery features …")
+    gal_feats, gal_labels = extract_features(net, test_gallery_loader, device)
+
+    print("  Extracting probe features …")
+    prb_feats, prb_labels = extract_features(net, test_probe_loader, device)
+
+    n_probe   = prb_feats.shape[0]
+    n_gallery = gal_feats.shape[0]
+    print(f"  probe: {n_probe}  gallery: {n_gallery}")
+
+    # --- compute all pairwise scores ---
+    print("  Computing pairwise distances …")
+    s, l = [], []
+    dist_matrix = np.zeros((n_probe, n_gallery))
+    for i in range(n_probe):
+        for j in range(n_gallery):
+            d = angular_distance(prb_feats[i], gal_feats[j])
+            dist_matrix[i, j] = d
+            s.append(d)
+            l.append(1 if prb_labels[i] == gal_labels[j] else -1)
+
+    # save raw scores
+    scores_path = os.path.join(out_dir, f"scores_{tag}.txt")
+    save_scores_txt(s, l, scores_path)
+
+    # --- Pairwise EER ---
+    eer, thresh, roc_auc, eer_half, fpr, tpr, thresholds = compute_eer(s, l)
+    fnr = 1 - tpr
+    print(f"  Pairwise EER: {eer*100:.4f}%  |  thresh: {thresh:.4f}  |  AUC: {roc_auc:.6f}")
+    print(f"  Pairwise EER½: {eer_half*100:.4f}%")
+
+    # --- Rank-1 ---
+    rank1, _ = compute_rank1(prb_feats, prb_labels,
+                              gal_feats, gal_labels,
+                              scores_matrix=dist_matrix)
+    print(f"  Rank-1 acc: {rank1:.3f}%")
+
+    # --- GI histogram ---
+    in_scores  = [s[k] for k in range(len(s)) if l[k] ==  1]
+    out_scores = [s[k] for k in range(len(s)) if l[k] == -1]
+    plot_gi_histogram(in_scores, out_scores, out_dir, tag)
+
+    # --- plots ---
+    plot_and_save(fpr, tpr, fnr, thresholds, eer, rank1, out_dir, tag)
+
+    # save text summary
+    with open(os.path.join(out_dir, f"rst_{tag}.txt"), "w") as f:
+        f.write(f"Pairwise EER  : {eer*100:.6f}%\n")
+        f.write(f"Pairwise EER½ : {eer_half*100:.6f}%\n")
+        f.write(f"Threshold     : {thresh:.4f}\n")
+        f.write(f"AUC           : {roc_auc:.10f}\n")
+        f.write(f"Rank-1        : {rank1:.3f}%\n")
+
+    # --- FIX: Always compute aggregated EER (min-distance per gallery class) ---
+    n_gallery_classes = len(set(gal_labels.tolist()))
+    if n_gallery_classes < n_gallery:
+        # multiple gallery samples per class exist → aggregation is meaningful
+        print("  Computing aggregated EER …")
+        aggr_s, aggr_l = compute_aggregated_eer(dist_matrix, prb_labels, gal_labels)
+        (aggr_eer, aggr_thresh, aggr_auc,
+         aggr_eer_half, aggr_fpr, aggr_tpr, _) = compute_eer(aggr_s, aggr_l)
+        print(f"  Aggregated EER: {aggr_eer*100:.4f}%  |  AUC: {aggr_auc:.6f}")
+        with open(os.path.join(out_dir, f"rst_{tag}.txt"), "a") as f:
+            f.write(f"\nAggregated EER      : {aggr_eer*100:.6f}%\n")
+            f.write(f"Aggregated EER_half : {aggr_eer_half*100:.6f}%\n")
+            f.write(f"Aggregated AUC      : {aggr_auc:.10f}\n")
+    else:
+        aggr_eer = eer   # single sample per class → aggregated = pairwise
+
+    return eer, aggr_eer, rank1
+
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    cfg  = CONFIG
-    seed = cfg["random_seed"]
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    # ---------- unpack config ----------
+    protocol       = CONFIG["protocol"]
+    data_root      = CONFIG["data_root"]
+    results_dir    = CONFIG["results_dir"]
+    img_side       = CONFIG["img_side"]
+    batch_size     = CONFIG["batch_size"]
+    num_epochs     = CONFIG["num_epochs"]
+    lr             = CONFIG["lr"]
+    lr_step        = CONFIG["lr_step"]
+    lr_gamma       = CONFIG["lr_gamma"]
+    dropout        = CONFIG["dropout"]
+    arc_s          = CONFIG["arcface_s"]
+    arc_m          = CONFIG["arcface_m"]
+    emb_dim        = CONFIG["embedding_dim"]
+    train_ratio    = CONFIG["train_ratio"]
+    gallery_ratio  = CONFIG["gallery_ratio"]
+    val_ratio      = CONFIG["val_ratio"]
+    seed           = CONFIG["random_seed"]
+    save_every     = CONFIG["save_every"]
+    eval_every     = CONFIG["eval_every"]
+    nw             = CONFIG["num_workers"]
+
+    assert protocol in ("closed-set", "open-set"), \
+        f"Unknown protocol: {protocol}. Use 'closed-set' or 'open-set'."
+
+    os.makedirs(results_dir, exist_ok=True)
+    rst_eval = os.path.join(results_dir, "eval")
+    os.makedirs(rst_eval, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    base_dir = cfg["base_results_dir"]
-    os.makedirs(base_dir, exist_ok=True)
-
-    print(f"\n{'='*62}")
-    print(f"  Federated Learning — Palmprint (CASIA-MS)")
+    print(f"\n{'='*60}")
+    print(f"  Protocol : {protocol}")
     print(f"  Device   : {device}")
-    print(f"  Rounds   : {cfg['n_rounds']}   "
-          f"Local epochs/round : {cfg['local_epochs']}")
-    print(f"  Shared IDs : {cfg['n_ids']}   "
-          f"Test ratio : {cfg['test_ratio']*100:.0f}%")
-    print(f"{'='*62}\n")
+    print(f"  Data     : {data_root}")
+    print(f"{'='*60}\n")
 
-    # ── Step 0a: build data splits ───────────────────────────────────────
-    print("Building federated data splits …")
-    client_data, test_samples, label_map, spectra = build_federated_splits(
-        cfg["data_root"], cfg["n_ids"], cfg["test_ratio"], seed=seed)
+    # ---------- parse dataset ----------
+    print("Scanning dataset …")
+    id2paths = parse_casia_ms(data_root)
+    n_total_ids = len(id2paths)
+    n_total_imgs = sum(len(v) for v in id2paths.values())
+    print(f"  Found {n_total_ids} identities, {n_total_imgs} images total.\n")
 
-    num_classes = len(label_map)
-    n_clients   = len(client_data)
-    print(f"\n  Clients      : {n_clients}  ({spectra})")
-    print(f"  Classes      : {num_classes}")
-    print(f"  Global test  : {len(test_samples)} samples\n")
+    # ---------- protocol-specific split ----------
+    if protocol == "closed-set":
+        train_samples, test_samples, label_map = split_closed_set(
+            id2paths, train_ratio=train_ratio, seed=seed)
+        num_classes = len(label_map)
 
-    # ── Step 0b: initialise server ────────────────────────────────────────
-    print("Initialising server …")
-    server = FLServer(num_classes, test_samples, cfg, device)
+        train_dataset   = CASIAMSDataset(train_samples, img_side=img_side)
+        test_dataset    = CASIAMSDataset(test_samples,  img_side=img_side)
+        train_gal_data  = CASIAMSDataset(train_samples, img_side=img_side)
 
-    # ── Step 0c: initialise clients ───────────────────────────────────────
-    print("Initialising clients …")
-    clients = []
-    for i, cd in enumerate(client_data):
-        clients.append(FLClient(
-            client_id    = i,
-            spectrum     = cd["spectrum"],
-            train_samples= cd["train_samples"],
-            label_map    = cd["label_map"],
-            num_classes  = num_classes,
-            cfg          = cfg,
-            device       = device,
-        ))
+        train_loader    = DataLoader(train_dataset,  batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True)
+        val_loader      = DataLoader(test_dataset,   batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+        gallery_loader  = DataLoader(train_gal_data, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+        probe_loader    = val_loader
 
-    # evaluate global model at round 0 (random init)
-    print("\n--- Round 0 (random init) ---")
-    g_eer_0, g_rank1_0 = server.evaluate(
-        out_dir=os.path.join(base_dir, "round_0000"),
-        tag="global_r0000")
-    print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
+        train_label_counts = Counter(l for _, l in train_samples)
+        train_num_per_class = int(np.median(list(train_label_counts.values())))
+        print(f"  [closed-set] #classes={num_classes} | "
+              f"~{train_num_per_class} train samples/class\n")
 
-    round_results = []
+    else:  # open-set
+        # ── FIX: split_open_set now returns a proper val split ──
+        (train_samples, val_samples, gallery_samples, probe_samples,
+         train_label_map, test_label_map) = split_open_set(
+            id2paths, train_ratio=train_ratio,
+            gallery_ratio=gallery_ratio,
+            val_ratio=val_ratio, seed=seed)
+        num_classes = len(train_label_map)
 
-    # ── FL rounds ─────────────────────────────────────────────────────────
-    for rnd in range(1, cfg["n_rounds"] + 1):
-        t_start  = time.time()
-        rnd_dir  = os.path.join(base_dir, f"round_{rnd:04d}")
-        os.makedirs(rnd_dir, exist_ok=True)
+        train_dataset   = CASIAMSDataset(train_samples,   img_side=img_side)
+        val_dataset     = CASIAMSDataset(val_samples,      img_side=img_side)
+        gallery_dataset = CASIAMSDataset(gallery_samples,  img_side=img_side)
+        probe_dataset   = CASIAMSDataset(probe_samples,    img_side=img_side)
 
-        global_weights = server.get_global_weights()
-        client_weights = []
-        client_metrics = []
+        train_loader    = DataLoader(train_dataset,   batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True)
+        val_loader      = DataLoader(val_dataset,     batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+        gallery_loader  = DataLoader(gallery_dataset, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+        probe_loader    = DataLoader(probe_dataset,   batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
-        # ── Step 1: local training ────────────────────────────────────────
-        for client in clients:
-            # load global weights into local model
-            client.set_weights(global_weights)
+        print(f"  [open-set] #train_classes={num_classes}\n")
 
-            # train locally
-            loss, acc = client.local_train(cfg["local_epochs"])
+    # ---------- model ----------
+    print(f"Building CompNet — num_classes={num_classes} …")
+    net = CompNet(num_classes=num_classes, embedding_dim=emb_dim,
+                  arcface_s=arc_s, arcface_m=arc_m, dropout=dropout)
+    net.to(device)
+    if torch.cuda.device_count() > 1:
+        print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)")
+        net = DataParallel(net)
 
-            # evaluate local model on global test set
-            c_eer, c_rank1 = evaluate_model(
-                client.model, server.test_loader, device,
-                out_dir=rnd_dir,
-                tag=f"client{client.client_id}_{client.spectrum}")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=lr)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=lr_step, gamma=lr_gamma)
 
-            client_weights.append(client.get_weights())
-            client_metrics.append({
-                "client_id" : client.client_id,
-                "spectrum"  : client.spectrum,
-                "train_loss": round(loss, 6),
-                "train_acc" : round(acc, 3),
-                "eer"       : round(c_eer, 6),
-                "rank1"     : round(c_rank1, 3),
-            })
+    # ---------- training loop ----------
+    train_losses, val_losses = [], []
+    train_accs,   val_accs   = [], []
+    best_val_acc = 0.0
+    best_eer     = 1.0
 
-        # ── Step 2: FedAvg aggregation ────────────────────────────────────
-        server.aggregate(client_weights)
+    # cached quick-eval metrics shown in every-10-epoch print
+    last_eer   = float("nan")
+    last_rank1 = float("nan")
 
-        # evaluate global model
-        g_eer, g_rank1 = server.evaluate(
-            out_dir=rnd_dir, tag=f"global_r{rnd:04d}")
+    print(f"\nStarting training for {num_epochs} epochs …")
+    print(f"  EER / Rank-1 computed every {eval_every} epochs and shown in every 10-epoch log.\n")
 
-        elapsed = time.time() - t_start
+    for epoch in range(num_epochs):
+        t_loss, t_acc = run_one_epoch(
+            epoch, net, train_loader, criterion, optimizer, device, "training")
+        v_loss, v_acc = run_one_epoch(
+            epoch, net, val_loader,   criterion, optimizer, device, "testing")
+        scheduler.step()
 
-        # logging
-        ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} | "
-              f"Global EER={g_eer*100:.4f}%  Rank-1={g_rank1:.2f}%  "
-              f"({elapsed:.1f}s)")
-        for cm in client_metrics:
-            print(f"  Client {cm['client_id']} [{cm['spectrum']:>6}] | "
-                  f"loss={cm['train_loss']:.4f}  acc={cm['train_acc']:.1f}%  "
-                  f"EER={cm['eer']*100:.3f}%  R1={cm['rank1']:.1f}%")
+        train_losses.append(t_loss)
+        val_losses.append(v_loss)
+        train_accs.append(t_acc)
+        val_accs.append(v_acc)
 
-        round_results.append({
-            "round"       : rnd,
-            "global_eer"  : round(g_eer, 6),
-            "global_rank1": round(g_rank1, 3),
-            "clients"     : client_metrics,
-        })
+        _net = net.module if isinstance(net, DataParallel) else net
 
-        # periodic checkpoint
-        if rnd % cfg["save_every"] == 0 or rnd == cfg["n_rounds"]:
-            server.save_checkpoint(
-                os.path.join(base_dir, f"global_model_r{rnd:04d}.pth"))
+        # ── periodic evaluation (EER / Rank-1) ───────────────────────────────
+        # runs at epoch 0 and every eval_every epochs thereafter
+        if epoch % eval_every == 0 or epoch == num_epochs - 1:
+            eval_net = _net
+            tag = f"ep{epoch:04d}_{protocol.replace('-','')}"
+            cur_eer, cur_aggr_eer, cur_rank1 = evaluate(
+                eval_net,
+                train_loader,
+                probe_loader,
+                gallery_loader,
+                device,
+                out_dir=rst_eval,
+                tag=tag,
+            )
+            last_eer   = cur_eer
+            last_rank1 = cur_rank1
 
-    # ── Final reporting ───────────────────────────────────────────────────
-    print(f"\n{'='*62}")
-    print(f"  FL COMPLETE — {cfg['n_rounds']} rounds")
-    final = round_results[-1]
-    print(f"  Final Global EER   : {final['global_eer']*100:.4f}%")
-    print(f"  Final Global Rank-1: {final['global_rank1']:.2f}%")
-    print(f"{'='*62}")
+            if cur_eer < best_eer:
+                best_eer = cur_eer
+                torch.save(_net.state_dict(),
+                           os.path.join(results_dir, "net_params_best_eer.pth"))
+                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
 
-    # save round results JSON
-    json_path = os.path.join(base_dir, "round_results.json")
-    with open(json_path, "w") as f:
-        json.dump(round_results, f, indent=2)
-    print(f"  Round results saved to: {json_path}")
+        # ── every-10-epoch console print ──────────────────────────────────────
+        if epoch % 10 == 0 or epoch == num_epochs - 1:
+            ts = time.strftime("%H:%M:%S")
+            eer_str   = f"{last_eer*100:.4f}%"   if not math.isnan(last_eer)   else "N/A"
+            rank1_str = f"{last_rank1:.2f}%"      if not math.isnan(last_rank1) else "N/A"
+            print(
+                f"[{ts}] ep {epoch:04d} | "
+                f"loss  train={t_loss:.5f}  val={v_loss:.5f} | "
+                f"cls-acc  train={t_acc:.2f}%  val={v_acc:.2f}% | "
+                f"EER={eer_str}  Rank-1={rank1_str}"
+            )
 
-    # save summary
-    with open(os.path.join(base_dir, "summary.txt"), "w") as f:
-        f.write(f"Clients      : {n_clients}  ({spectra})\n")
-        f.write(f"Shared IDs   : {num_classes}\n")
-        f.write(f"Global test  : {len(test_samples)} samples\n")
-        f.write(f"Rounds       : {cfg['n_rounds']}\n")
-        f.write(f"Local epochs : {cfg['local_epochs']}\n")
-        f.write(f"\nFinal Global EER   : {final['global_eer']*100:.6f}%\n")
-        f.write(f"Final Global Rank-1: {final['global_rank1']:.3f}%\n")
+        # ── save best classification model ────────────────────────────────────
+        if v_acc > best_val_acc:
+            best_val_acc = v_acc
+            torch.save(_net.state_dict(),
+                       os.path.join(results_dir, "net_params_best.pth"))
 
-    # plot curves
-    plot_fl_curves(round_results, base_dir)
-    print(f"  Plots saved to: {base_dir}")
+        # ── periodic checkpoint + loss/acc plots ──────────────────────────────
+        if epoch % save_every == 0 or epoch == num_epochs - 1:
+            torch.save(_net.state_dict(),
+                       os.path.join(results_dir, "net_params.pth"))
+            plot_loss_acc(train_losses, val_losses, train_accs, val_accs, results_dir)
+
+    # ---------- final evaluation with best model ----------
+    print("\n=== Final evaluation with best EER model ===")
+    best_model_path = os.path.join(results_dir, "net_params_best_eer.pth")
+    if not os.path.exists(best_model_path):
+        best_model_path = os.path.join(results_dir, "net_params_best.pth")
+
+    eval_net = net.module if isinstance(net, DataParallel) else net
+    eval_net.load_state_dict(torch.load(best_model_path, map_location=device))
+
+    final_eer, final_aggr_eer, final_rank1 = evaluate(
+        eval_net,
+        train_loader,
+        probe_loader,
+        gallery_loader,
+        device,
+        out_dir=rst_eval,
+        tag=f"FINAL_{protocol.replace('-','')}",
+    )
+
+    print(f"\n{'='*60}")
+    print(f"  PROTOCOL : {protocol}")
+    print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
+    print(f"  FINAL Aggregated EER : {final_aggr_eer*100:.4f}%")
+    print(f"  FINAL Rank-1         : {final_rank1:.3f}%")
+    print(f"  Results saved to: {results_dir}")
+    print(f"{'='*60}\n")
+
+    # save final summary
+    with open(os.path.join(results_dir, "summary.txt"), "w") as f:
+        f.write(f"Protocol  : {protocol}\n")
+        f.write(f"Data root : {data_root}\n")
+        f.write(f"Identities: {n_total_ids}\n")
+        f.write(f"Images    : {n_total_imgs}\n")
+        f.write(f"Classes (train): {num_classes}\n")
+        f.write(f"Best val acc       : {best_val_acc:.3f}%\n")
+        f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
+        f.write(f"Final Aggreg. EER  : {final_aggr_eer*100:.6f}%\n")
+        f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
 
 
 if __name__ == "__main__":
