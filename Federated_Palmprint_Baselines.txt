@@ -1,0 +1,16 @@
+[Wiley 2020] Towards privacy palmprint recognition via federated hash learning
+
+[TIFS 2023] Privacy Preserving Palmprint Recognition via Federated Metric Learning
+
+[IJCV 2024] Physics-Driven Spectrum-Consistent Federated Learning for Palmprint Verification
+
+[CCBR 2024] A Federated Learning Framework Using FedProx Algorithm for Private Palmprint Recognition 
+
+[TIP 2025] Dynamic Personalized Federated Learning for Cross-Spectral Palmprint Recognition
+
+[IJCAI 2025] AdaptPFL: Unlocking Cross-Device Palmprint Recognition via Adaptive Personalized Federated Learning
+
+[BR 2026] A Domain-Adapted and Federated Approach to Palmprint Recognition
+
+[TIFS 2026] FedPalm – Federated learning for closed‑ and open‑set palmprint verification, TIFS 2026
+https://github.com/Zi-YuanYang/FedPalm/tree/main
