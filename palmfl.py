@@ -43,7 +43,7 @@ Results saved to BASE_RESULTS_DIR:
 # ==============================================================
 CONFIG = {
     # ── Paths ──────────────────────────────────────────────────
-    "data_root"        : "path to CASIA-MS-ROI",
+    "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "base_results_dir" : "./rst_fedavg_casiams",
 
     # ── Dataset ────────────────────────────────────────────────
