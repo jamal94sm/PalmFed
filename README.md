@@ -1,1 +1,15 @@
-palmfl: a federated learning framework for closed-set palmprint recognition on CASIA-MS, where each of 6 clients holds one spectral domain and trains a local CompNet (Gabor-filter competitive blocks + ArcFace) on 80% of its samples for E epochs per round, with the server performing FedAvg aggregation and evaluating the resulting global model on a shared test set — pooled from all 6 spectra across 200 shared identities — using EER and Rank-1 accuracy.
+palmfl: 
+Train and test IDs are the same.
+IDs are shared among clients
+each client holds one domain (spectrum)
+k = 20% (adjustable) of samples in each IDs of each client are allocated to test set
+samples in test set are split into gallery and probe sets by a 50% split
+
+
+palmfl_v2: 
+Train and test IDs are different.
+train IDs are shared among clients
+each client holds one domain (spectrum)
+k = 20% (adjustable) of IDs are allocated to test set
+samples of test IDs in test set are split into gallery and probe sets by a m = 50% (adjustable) split
+
