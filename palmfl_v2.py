@@ -58,7 +58,7 @@ CONFIG = {
 
     "fft_beta"  : 0.05,   # Gaussian mask sigma fraction (cut-off frequency for fft swapping)
     "M"         : 3,      # total augmented images per sample (1 original + M-1 synthetic)
-  
+    "use_fft_aug" : True,   # True → FFT style augmentation | False → standard training
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 100,       # R: total communication rounds
     "local_epochs"     : 1,         # E: local training epochs per round
@@ -577,22 +577,28 @@ class FLClient:
         return {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
 
     def local_train(self, local_epochs, style_bank, M):
-        """Train with FFT-augmented dataset using shared style bank."""
-        aug_dataset = FFTAugmentedDataset(
-            samples    = self.train_dataset.samples,
-            style_bank = style_bank,
-            client_id  = self.client_id,
-            M          = M,
-            beta       = self.cfg["fft_beta"],
-            img_side   = self.cfg["img_side"],
-        )
-        train_loader = DataLoader(
-            aug_dataset,
-            batch_size  = self.cfg["batch_size"],
-            shuffle     = True,
-            num_workers = self.cfg["num_workers"],
-            pin_memory  = True,
-        )
+        def local_train(self, local_epochs, style_bank, M):
+            if self.cfg["use_fft_aug"] and style_bank and self.cfg["M"] > 1:
+                dataset = FFTAugmentedDataset(
+                    samples    = self.train_samples,
+                    style_bank = style_bank,
+                    client_id  = self.client_id,
+                    M          = M,
+                    beta       = self.cfg["fft_beta"],
+                    img_side   = self.cfg["img_side"],
+                )
+            else:
+                dataset = PalmDataset(self.train_samples, self.cfg["img_side"])
+        
+            train_loader = DataLoader(
+                dataset,
+                batch_size     = self.cfg["batch_size"],
+                shuffle        = True,
+                num_workers    = self.cfg["num_workers"],
+                pin_memory     = True,
+                worker_init_fn = worker_init_fn,
+            )
+
         optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
         scheduler = lr_scheduler.StepLR(
             optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
@@ -772,14 +778,17 @@ def main():
         f.write(f"Round\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
 
     # ── style template extraction and style bank creation ─────────────────────────
-    print("\nExtracting style templates from all clients …")
-    style_bank = {
-        client.client_id: client.extract_style_templates()
-        for client in clients
-    }
-    total_templates = sum(len(v) for v in style_bank.values())
-    print(f"  Style bank ready — {total_templates} templates "
-          f"across {len(style_bank)} clients\n")
+    if cfg["use_fft_aug"]:
+        print("\nExtracting style templates from all clients …")
+        style_bank = {
+            client.client_id: client.extract_style_templates()
+            for client in clients
+        }
+        total = sum(len(v) for v in style_bank.values())
+        print(f"  Style bank ready — {total} templates across {len(style_bank)} clients\n")
+    else:
+        style_bank = {}
+        print("\nFFT augmentation disabled — using original samples only.\n")
 
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
