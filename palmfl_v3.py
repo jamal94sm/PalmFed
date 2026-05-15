@@ -618,26 +618,26 @@ class FLClient:
             worker_init_fn = worker_init_fn,
         )
 
-    optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
-    scheduler = lr_scheduler.StepLR(
-        optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
-    criterion = nn.CrossEntropyLoss()
-
-    self.model.train()
-    running_loss = 0.0; correct = 0; total = 0
-    for epoch in range(local_epochs):
-        for imgs, labels in train_loader:
-            imgs, labels = imgs.to(self.device), labels.to(self.device)
-            optimizer.zero_grad()
-            out  = self.model(imgs, labels)
-            loss = criterion(out, labels)
-            loss.backward(); optimizer.step()
-            running_loss += loss.item() * imgs.size(0)
-            correct      += out.argmax(1).eq(labels).sum().item()
-            total        += imgs.size(0)
-        scheduler.step()
-
-    return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
+        scheduler = lr_scheduler.StepLR(
+            optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
+        criterion = nn.CrossEntropyLoss()
+    
+        self.model.train()
+        running_loss = 0.0; correct = 0; total = 0
+        for epoch in range(local_epochs):
+            for imgs, labels in train_loader:
+                imgs, labels = imgs.to(self.device), labels.to(self.device)
+                optimizer.zero_grad()
+                out  = self.model(imgs, labels)
+                loss = criterion(out, labels)
+                loss.backward(); optimizer.step()
+                running_loss += loss.item() * imgs.size(0)
+                correct      += out.argmax(1).eq(labels).sum().item()
+                total        += imgs.size(0)
+            scheduler.step()
+    
+        return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
       
     def extract_style_templates(self):
         """
