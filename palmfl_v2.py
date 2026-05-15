@@ -49,7 +49,7 @@ CONFIG = {
     # ── Dataset ────────────────────────────────────────────────
     "n_ids"            : 200,       # number of shared identities across clients
     "k_test"        : 0.20,   # fraction of IDs allocated to test set
-    "gallery_ratio" : 0.50,   # fraction of test-ID samples → gallery
+    "gallery_ratio" : 0.20,   # fraction of test-ID samples → gallery
 
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 100,       # R: total communication rounds
