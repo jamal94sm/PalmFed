@@ -799,7 +799,7 @@ def main():
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
             client.set_weights(global_weights)
-            loss, acc = client.local_train(cfg["local_epochs"])
+            loss, acc = client.local_train(cfg["local_epochs"], style_bank, cfg["M"])
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
