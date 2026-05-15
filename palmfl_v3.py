@@ -404,10 +404,11 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
     rng  = random.Random(seed)
     data = parse_casia_ms(data_root)
 
-    spectra = sorted(data.keys())
-    print(f"  Spectra found ({len(spectra)}): {spectra}")
+    spectra   = sorted(data.keys())
+    n_clients = len(spectra)
+    print(f"  Spectra found ({n_clients}): {spectra}")
 
-    # find identities common to ALL spectra
+    # identities common to ALL spectra
     common_ids = set(data[spectra[0]].keys())
     for sp in spectra[1:]:
         common_ids &= set(data[sp].keys())
@@ -419,43 +420,56 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
             f"Requested {n_ids} IDs but only {len(common_ids)} "
             f"are present in all spectra.")
 
-    # sample n_ids and split into train / test IDs
+    # select n_ids and split into test / train
     selected_ids = sorted(rng.sample(common_ids, n_ids))
     rng.shuffle(selected_ids)
-    n_test_ids   = max(1, round(len(selected_ids) * k_test))
-    test_ids     = sorted(selected_ids[:n_test_ids])
-    train_ids    = sorted(selected_ids[n_test_ids:])
+    n_test_ids     = max(1, round(n_ids * k_test))
+    test_ids       = sorted(selected_ids[:n_test_ids])
+    train_ids      = sorted(selected_ids[n_test_ids:])
+    test_label_map = {ident: i for i, ident in enumerate(test_ids)}
 
-    train_label_map = {ident: i for i, ident in enumerate(train_ids)}
-    test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
+    print(f"  Total train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
 
-    print(f"  Train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
+    # uniformly partition train IDs among clients — no overlap
+    rng.shuffle(train_ids)
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(train_ids):
+        client_id_splits[i % n_clients].append(ident)
 
-    # build per-client local train sets (train IDs only)
+    # equalise client sizes by trimming to the smallest partition
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+    n_dropped = len(train_ids) - min_ids * n_clients
+    print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
+
+    # per-client local train sets — each client has its OWN IDs and label space
     client_data = []
-    for sp in spectra:
-        local_train = []
-        for ident in train_ids:
-            label = train_label_map[ident]
-            for p in data[sp][ident]:
-                local_train.append((p, label))
+    for i, sp in enumerate(spectra):
+        c_ids       = client_id_splits[i]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+        local_train = [
+            (p, c_label_map[ident])
+            for ident in c_ids
+            for p in data[sp][ident]
+        ]
         client_data.append({
             "spectrum"      : sp,
             "train_samples" : local_train,
-            "label_map"     : train_label_map,
+            "label_map"     : c_label_map,
+            "num_classes"   : min_ids,
         })
-        print(f"    Client [{sp:>6}]  train samples={len(local_train)}")
+        print(f"    Client {i} [{sp:>6}]  "
+              f"train IDs={min_ids}  samples={len(local_train)}")
 
-    # build global test set (test IDs, all spectra, gallery/probe split)
+    # fixed global test set — test IDs, all spectra, gallery/probe split
     # split within each (spectrum, identity) pair by gallery_ratio
-    gallery_samples = []
-    probe_samples   = []
+    gallery_samples, probe_samples = [], []
     for sp in spectra:
         for ident in test_ids:
             paths = list(data[sp][ident])
             rng.shuffle(paths)
-            label   = test_label_map[ident]
-            n_gal   = max(1, round(len(paths) * gallery_ratio))
+            label = test_label_map[ident]
+            n_gal = max(1, round(len(paths) * gallery_ratio))
             for p in paths[:n_gal]:
                 gallery_samples.append((p, label))
             for p in paths[n_gal:]:
@@ -463,8 +477,7 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
 
     print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
     return (client_data, gallery_samples, probe_samples,
-            train_label_map, test_label_map, spectra)
-
+            test_label_map, spectra)
 
 # ══════════════════════════════════════════════════════════════
 #  EVALUATION  (cosine similarity, EER, Rank-1)
@@ -539,6 +552,7 @@ class FLClient:
                  num_classes, cfg, device):
         self.client_id     = client_id
         self.spectrum      = spectrum
+        self.train_samples = train_samples   # raw list — no PalmDataset wrapper
         self.label_map     = label_map
         self.num_classes   = num_classes
         self.cfg           = cfg
@@ -562,63 +576,68 @@ class FLClient:
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
         ).to(device)
-
+    
         print(f"  Client {client_id} [{spectrum}] — "
-              f"train samples: {len(train_samples)}")
+              f"train IDs: {num_classes}  samples: {len(train_samples)}")
 
     # ── public interface ────────────────────────────────────────────────────
 
-    def set_weights(self, state_dict):
-        """Load global model weights into the local model."""
-        self.model.load_state_dict(copy.deepcopy(state_dict))
-
+    def set_weights(self, backbone_state_dict):
+        """Load global backbone weights. ArcFace head kept local."""
+        local_state = self.model.state_dict()
+        for key, val in backbone_state_dict.items():
+            if key in local_state and local_state[key].shape == val.shape:
+                local_state[key] = val.clone()
+        self.model.load_state_dict(local_state)
+    
     def get_weights(self):
-        """Return a CPU copy of the local model state dict."""
-        return {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+        """Return backbone weights only — exclude ArcFace head."""
+        return {k: v.cpu().clone()
+                for k, v in self.model.state_dict().items()
+                if not k.startswith("arc.")}
 
     def local_train(self, local_epochs, style_bank, M):
-        def local_train(self, local_epochs, style_bank, M):
-            if self.cfg["use_fft_aug"] and style_bank and self.cfg["M"] > 1:
-                dataset = FFTAugmentedDataset(
-                    samples    = self.train_samples,
-                    style_bank = style_bank,
-                    client_id  = self.client_id,
-                    M          = M,
-                    beta       = self.cfg["fft_beta"],
-                    img_side   = self.cfg["img_side"],
-                )
-            else:
-                dataset = PalmDataset(self.train_samples, self.cfg["img_side"])
-        
-            train_loader = DataLoader(
-                dataset,
-                batch_size     = self.cfg["batch_size"],
-                shuffle        = True,
-                num_workers    = self.cfg["num_workers"],
-                pin_memory     = True,
-                worker_init_fn = worker_init_fn,
+        if self.cfg["use_fft_aug"] and style_bank and M > 1:
+            dataset = FFTAugmentedDataset(
+                samples    = self.train_samples,   # ← was self.train_dataset.samples
+                style_bank = style_bank,
+                client_id  = self.client_id,
+                M          = M,
+                beta       = self.cfg["fft_beta"],
+                img_side   = self.cfg["img_side"],
             )
+        else:
+            dataset = PalmDataset(self.train_samples, self.cfg["img_side"])
+    
+        train_loader = DataLoader(
+            dataset,
+            batch_size     = self.cfg["batch_size"],
+            shuffle        = True,
+            num_workers    = self.cfg["num_workers"],
+            pin_memory     = True,
+            worker_init_fn = worker_init_fn,
+        )
 
-        optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
-        scheduler = lr_scheduler.StepLR(
-            optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
-        criterion = nn.CrossEntropyLoss()
-    
-        self.model.train()
-        running_loss = 0.0; correct = 0; total = 0
-        for epoch in range(local_epochs):
-            for imgs, labels in train_loader:
-                imgs, labels = imgs.to(self.device), labels.to(self.device)
-                optimizer.zero_grad()
-                out  = self.model(imgs, labels)
-                loss = criterion(out, labels)
-                loss.backward(); optimizer.step()
-                running_loss += loss.item() * imgs.size(0)
-                correct      += out.argmax(1).eq(labels).sum().item()
-                total        += imgs.size(0)
-            scheduler.step()
-    
-        return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
+    optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
+    scheduler = lr_scheduler.StepLR(
+        optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
+    criterion = nn.CrossEntropyLoss()
+
+    self.model.train()
+    running_loss = 0.0; correct = 0; total = 0
+    for epoch in range(local_epochs):
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(self.device), labels.to(self.device)
+            optimizer.zero_grad()
+            out  = self.model(imgs, labels)
+            loss = criterion(out, labels)
+            loss.backward(); optimizer.step()
+            running_loss += loss.item() * imgs.size(0)
+            correct      += out.argmax(1).eq(labels).sum().item()
+            total        += imgs.size(0)
+        scheduler.step()
+
+    return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
       
     def extract_style_templates(self):
         """
@@ -630,7 +649,7 @@ class FLClient:
         templates = []
         img_side  = self.cfg["img_side"]
         beta      = self.cfg["fft_beta"]
-        for path, _ in self.train_dataset.samples:
+        for path, _ in self.train_samples:   # ← was self.train_dataset.samples
             img = Image.open(path).convert("L")
             img = img.resize((img_side, img_side), Image.BILINEAR)
             img_np = np.array(img, dtype=np.float32) / 255.0
@@ -689,17 +708,16 @@ class FLServer:
                 for k, v in self.global_model.state_dict().items()}
 
     def aggregate(self, client_weight_dicts):
-        """
-        FedAvg: simple average of all client weight dicts.
-        All clients have equal weight (same number of classes, uniform datasets).
-        """
-        n = len(client_weight_dicts)
+        """FedAvg on backbone parameters only (arc.* excluded)."""
+        n        = len(client_weight_dicts)
         avg_dict = {}
         for key in client_weight_dicts[0].keys():
-            stacked = torch.stack(
+            stacked      = torch.stack(
                 [client_weight_dicts[i][key].float() for i in range(n)], dim=0)
             avg_dict[key] = stacked.mean(dim=0)
-        self.global_model.load_state_dict(avg_dict)
+        global_state = self.global_model.state_dict()
+        global_state.update(avg_dict)
+        self.global_model.load_state_dict(global_state)
 
     def evaluate(self, out_dir=None, tag="global"):
         """Evaluate the global model on the shared gallery and probe sets."""
@@ -729,27 +747,29 @@ def main():
 
     print(f"\n{'='*62}")
     print(f"  Federated Learning — Palmprint (CASIA-MS)")
+    print(f"  Protocol : Open-Set, Non-Shared-ID, Cross-Domain")
     print(f"  Device   : {device}")
     print(f"  Rounds   : {cfg['n_rounds']}   "
           f"Local epochs/round : {cfg['local_epochs']}")
     print(f"  IDs : {cfg['n_ids']}   "
           f"Test ID ratio : {cfg['k_test']*100:.0f}%   "
           f"Gallery ratio : {cfg['gallery_ratio']*100:.0f}%")
+    print(f"  FFT Aug  : {cfg['use_fft_aug']}   M={cfg['M']}   beta={cfg['fft_beta']}")
     print(f"{'='*62}\n")
 
     # ── Step 0a: build data splits ────────────────────────────────────────
     print("Building federated data splits …")
     (client_data, gallery_samples, probe_samples,
-     train_label_map, test_label_map, spectra) = build_federated_splits(
+     test_label_map, spectra) = build_federated_splits(
         cfg["data_root"], cfg["n_ids"], cfg["k_test"],
         cfg["gallery_ratio"], seed=seed)
 
-    num_classes = len(train_label_map)
+    num_classes = client_data[0]["num_classes"]   # same for all clients (min_ids)
     n_clients   = len(client_data)
-    print(f"\n  Clients      : {n_clients}  ({spectra})")
-    print(f"  Train classes: {num_classes}")
-    print(f"  Test  classes: {len(test_label_map)}")
-    print(f"  Gallery      : {len(gallery_samples)}  "
+    print(f"\n  Clients        : {n_clients}  ({spectra})")
+    print(f"  IDs per client : {num_classes}")
+    print(f"  Test  classes  : {len(test_label_map)}")
+    print(f"  Gallery        : {len(gallery_samples)}  "
           f"Probe : {len(probe_samples)}\n")
 
     # ── Step 0b: initialise server ────────────────────────────────────────
@@ -765,7 +785,7 @@ def main():
             spectrum      = cd["spectrum"],
             train_samples = cd["train_samples"],
             label_map     = cd["label_map"],
-            num_classes   = num_classes,
+            num_classes   = cd["num_classes"],   # per-client (all equal to min_ids)
             cfg           = cfg,
             device        = device,
         ))
@@ -777,7 +797,7 @@ def main():
     with open(results_path, "w") as f:
         f.write(f"Round\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
 
-    # ── style template extraction and style bank creation ─────────────────────────
+    # ── style template extraction and style bank creation ─────────────────
     if cfg["use_fft_aug"]:
         print("\nExtracting style templates from all clients …")
         style_bank = {
@@ -785,7 +805,8 @@ def main():
             for client in clients
         }
         total = sum(len(v) for v in style_bank.values())
-        print(f"  Style bank ready — {total} templates across {len(style_bank)} clients\n")
+        print(f"  Style bank ready — {total} templates "
+              f"across {len(style_bank)} clients\n")
     else:
         style_bank = {}
         print("\nFFT augmentation disabled — using original samples only.\n")
@@ -796,9 +817,11 @@ def main():
     print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
     with open(results_path, "a") as f:
         f.write(f"0\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
-                + "\t".join("—\t—" for _ in range(n_clients)) + "\n")
+                + "\t".join("-1\t-1" for _ in range(n_clients)) + "\n")
 
     # ── FL rounds ─────────────────────────────────────────────────────────
+    g_eer, g_rank1 = g_eer_0, g_rank1_0   # FIX: ensures defined if n_rounds=0
+
     for rnd in range(1, cfg["n_rounds"] + 1):
         t_start        = time.time()
         global_weights = server.get_global_weights()
@@ -807,12 +830,14 @@ def main():
 
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
+            # load global backbone weights (ArcFace head kept local)
             client.set_weights(global_weights)
             loss, acc = client.local_train(cfg["local_epochs"], style_bank, cfg["M"])
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
-                device, out_dir=None)
+                device)
+            # return backbone weights only (ArcFace head excluded)
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -823,7 +848,7 @@ def main():
                 "rank1"     : round(c_rank1, 3),
             })
 
-        # ── Step 2: FedAvg aggregation + global evaluation ────────────────
+        # ── Step 2: FedAvg aggregation (backbone only) + global evaluation
         server.aggregate(client_weights)
         g_eer, g_rank1 = server.evaluate()
         elapsed = time.time() - t_start
