@@ -1,4 +1,4 @@
-palmfl: 
+palmfl: closed-set, shared-ID, cross-domain. 
 Train and test IDs are the same.
 IDs are shared among clients
 each client holds one domain (spectrum)
@@ -6,10 +6,17 @@ k = 20% (adjustable) of samples in each IDs of each client are allocated to test
 samples in test set are split into gallery and probe sets by a 50% split
 
 
-palmfl_v2: 
+palmfl_v2: open-set, shared-ID, cross-domain.
 Train and test IDs are different.
 train IDs are shared among clients
 each client holds one domain (spectrum)
-k = 20% (adjustable) of IDs are allocated to test set
-samples of test IDs in test set are split into gallery and probe sets by a m = 50% (adjustable) split
+k = 20% of IDs are allocated to test set
+samples of test IDs in test set are split into gallery and probe sets by a m = 20%  split
 
+palmfl_v3: open-set, non-shared-ID, cross-domain.
+Train and test IDs are different.
+train IDs are different among clients.
+train IDs are uniformly splited among clients (no overlapping). 
+each client holds one domain (spectrum).
+k = 20% (adjustable) of IDs are allocated to test set.
+samples of test IDs in test set are split into gallery and probe sets by a m = 20% (adjustable) split.
