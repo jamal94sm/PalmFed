@@ -390,46 +390,36 @@ def compute_eer(scores_array):
 
 
 def evaluate_model(model, test_loader, device, out_dir=None, tag="eval"):
-    """
-    Evaluate model on the global test set.
-    Uses 50% of test IDs as gallery and 50% as probe (random, seeded split).
-
-    Returns
-    -------
-    eer   : float  EER in [0, 1]
-    rank1 : float  Rank-1 accuracy in [0, 100]
-    """
     feats, labels = extract_features(model, test_loader, device)
+    paths = [s[0] for s in test_loader.dataset.samples]
 
-    # deterministic gallery/probe split on test set (50/50 per identity)
-    rng       = random.Random(42)
-    id_to_idx = defaultdict(list)
-    for i, lbl in enumerate(labels):
-        id_to_idx[lbl].append(i)
+    # group by (spectrum, identity) and split 50/50 within each group
+    rng = random.Random(42)
+    spec_id_to_idx = defaultdict(list)
+    for i, (path, lbl) in enumerate(zip(paths, labels)):
+        spectrum = os.path.splitext(os.path.basename(path))[0].split("_")[2]
+        spec_id_to_idx[(spectrum, int(lbl))].append(i)
 
     gal_idx, prb_idx = [], []
-    for lbl, idxs in id_to_idx.items():
+    for (sp, lbl), idxs in spec_id_to_idx.items():
         idxs_s = list(idxs); rng.shuffle(idxs_s)
         mid    = max(1, len(idxs_s) // 2)
         gal_idx.extend(idxs_s[:mid])
         prb_idx.extend(idxs_s[mid:])
 
-    gal_feats  = feats[gal_idx];  gal_labels  = labels[gal_idx]
-    prb_feats  = feats[prb_idx];  prb_labels  = labels[prb_idx]
+    gal_feats = feats[gal_idx]; gal_labels = labels[gal_idx]
+    prb_feats = feats[prb_idx]; prb_labels = labels[prb_idx]
 
-    # cosine similarity matrix
-    sim_matrix = prb_feats @ gal_feats.T   # embeddings are L2-normalised
-
-    # EER
+    # cosine similarity, EER, Rank-1
+    sim_matrix  = prb_feats @ gal_feats.T
     scores_list, labels_list = [], []
     for i in range(len(prb_feats)):
         for j in range(len(gal_feats)):
             scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if prb_labels[i] == gal_labels[j] else -1)
     scores_arr = np.column_stack([scores_list, labels_list])
-    eer = compute_eer(scores_arr)
+    eer        = compute_eer(scores_arr)
 
-    # Rank-1
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(prb_labels[i] == gal_labels[nn_idx[i]]
                   for i in range(len(prb_feats)))
