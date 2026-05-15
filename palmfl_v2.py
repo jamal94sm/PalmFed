@@ -303,6 +303,22 @@ def apply_style_template(img_np, amp_template, beta):
 # ══════════════════════════════════════════════════════════════
 #  DATASET
 # ══════════════════════════════════════════════════════════════
+class PalmDataset(Dataset):
+    """Plain dataset for gallery/probe evaluation — no augmentation."""
+    def __init__(self, samples, img_side=128):
+        self.samples   = samples
+        self.transform = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        return self.transform(Image.open(path).convert("L")), label
+
 
 class FFTAugmentedDataset(Dataset):
     """
