@@ -56,6 +56,9 @@ CONFIG = {
     "k_test"        : 0.20,   # fraction of IDs allocated to test set
     "gallery_ratio" : 0.20,   # fraction of test-ID samples → gallery
 
+    "fft_beta"  : 0.05,   # Gaussian mask sigma fraction (cut-off frequency for fft swapping)
+    "M"         : 3,      # total augmented images per sample (1 original + M-1 synthetic)
+  
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 100,       # R: total communication rounds
     "local_epochs"     : 1,         # E: local training epochs per round
@@ -246,25 +249,110 @@ class NormSingleROI:
 
 
 # ══════════════════════════════════════════════════════════════
+#  Knowledge Sharing and Augmentation
+# ══════════════════════════════════════════════════════════════
+def gaussian_mask(H, W, beta):
+    """Soft Gaussian low-frequency mask centred at DC."""
+    sigma = min(H, W) * beta
+    cy, cx = H // 2, W // 2
+    ys = np.arange(H) - cy
+    xs = np.arange(W) - cx
+    xs, ys = np.meshgrid(xs, ys)
+    return np.exp(-(xs**2 + ys**2) / (2 * sigma**2)).astype(np.float32)
+
+
+def extract_style_template(img_np, beta):
+    """
+    Extract the low-frequency amplitude template from an image.
+    Returns the fftshifted amplitude array (H, W) or (H, W, C).
+    This is the shareable style descriptor — no texture/identity info.
+    """
+    def _extract_channel(ch):
+        amp = np.abs(np.fft.fft2(ch))
+        return np.fft.fftshift(amp)
+
+    if img_np.ndim == 2:
+        return _extract_channel(img_np)
+    return np.stack([_extract_channel(img_np[..., c])
+                     for c in range(img_np.shape[2])], axis=-1)
+
+
+def apply_style_template(img_np, amp_template, beta):
+    """
+    Swap the low-frequency amplitude of img_np with amp_template
+    using a Gaussian soft mask. Phase (texture/structure) is preserved.
+    Returns a float32 image in [0, 1].
+    """
+    H, W = img_np.shape[:2]
+    mask = gaussian_mask(H, W, beta)
+
+    def _apply_channel(ch, amp_tpl_ch):
+        fft   = np.fft.fft2(ch)
+        amp_s = np.fft.fftshift(np.abs(fft))
+        pha   = np.angle(fft)
+        # soft blend: low-freq from template, high-freq from original
+        amp_syn = (1 - mask) * amp_s + mask * amp_tpl_ch
+        amp_syn = np.fft.ifftshift(amp_syn)
+        return np.clip(np.fft.ifft2(amp_syn * np.exp(1j * pha)).real, 0, 1)
+
+    if img_np.ndim == 2:
+        return _apply_channel(img_np, amp_template).astype(np.float32)
+    return np.stack([_apply_channel(img_np[..., c], amp_template[..., c])
+                     for c in range(img_np.shape[2])], axis=-1).astype(np.float32)
+
+# ══════════════════════════════════════════════════════════════
 #  DATASET
 # ══════════════════════════════════════════════════════════════
 
-class PalmDataset(Dataset):
-    """Simple palmprint dataset: list of (path, int_label) pairs."""
-
-    def __init__(self, samples, img_side=128):
-        self.samples   = samples
-        self.transform = T.Compose([
+class FFTAugmentedDataset(Dataset):
+    """
+    Training dataset with FFT style augmentation.
+    For each original sample, M-1 synthetic images are created by swapping
+    the low-frequency amplitude with randomly selected style templates from
+    M-1 other clients. The dataset returns M images per original sample.
+    """
+    def __init__(self, samples, style_bank, client_id, M, beta, img_side):
+        self.samples         = samples
+        self.style_bank      = style_bank   # {client_id: [amp_array, ...]}
+        self.client_id       = client_id
+        self.M               = M
+        self.beta            = beta
+        self.img_side        = img_side
+        self.other_ids       = [cid for cid in style_bank if cid != client_id]
+        self.transform       = T.Compose([
             T.Resize((img_side, img_side)),
             T.ToTensor(),
             NormSingleROI(outchannels=1),
         ])
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples) * self.M
+
+    def _load_np(self, path):
+        img = Image.open(path).convert("L")
+        img = img.resize((self.img_side, self.img_side), Image.BILINEAR)
+        return np.array(img, dtype=np.float32) / 255.0
+
+    def _to_tensor(self, img_np):
+        pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
+        return self.transform(pil)
 
     def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        return self.transform(Image.open(path).convert("L")), label
+        sample_idx = idx // self.M    # which original sample
+        aug_idx    = idx  % self.M    # 0 = original, 1..M-1 = synthetic
+
+        path, label = self.samples[sample_idx]
+        img_np = self._load_np(path)
+
+        if aug_idx == 0 or not self.other_ids:
+            # original sample — always included
+            return self._to_tensor(img_np), label
+
+        # select one random client (different each aug_idx) and one random template
+        rand_client   = random.choice(self.other_ids)
+        rand_template = random.choice(self.style_bank[rand_client])
+        img_syn       = apply_style_template(img_np, rand_template, self.beta)
+        return self._to_tensor(img_syn), label
 
 
 # ══════════════════════════════════════════════════════════════
@@ -472,35 +560,62 @@ class FLClient:
         """Return a CPU copy of the local model state dict."""
         return {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
 
-    def local_train(self, local_epochs):
-        """
-        Train the local model for `local_epochs` epochs.
-        Optimiser and scheduler are re-created each round so that
-        every client starts from the same lr regardless of round number.
-        """
+    def local_train(self, local_epochs, style_bank, M):
+        """Train with FFT-augmented dataset using shared style bank."""
+        aug_dataset = FFTAugmentedDataset(
+            samples    = self.train_dataset.samples,
+            style_bank = style_bank,
+            client_id  = self.client_id,
+            M          = M,
+            beta       = self.cfg["fft_beta"],
+            img_side   = self.cfg["img_side"],
+        )
+        train_loader = DataLoader(
+            aug_dataset,
+            batch_size  = self.cfg["batch_size"],
+            shuffle     = True,
+            num_workers = self.cfg["num_workers"],
+            pin_memory  = True,
+        )
         optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
         scheduler = lr_scheduler.StepLR(
             optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
         criterion = nn.CrossEntropyLoss()
-
+    
         self.model.train()
+        running_loss = 0.0; correct = 0; total = 0
         for epoch in range(local_epochs):
-            running_loss = 0.0; correct = 0; total = 0
-            for imgs, labels in self.train_loader:
+            for imgs, labels in train_loader:
                 imgs, labels = imgs.to(self.device), labels.to(self.device)
                 optimizer.zero_grad()
                 out  = self.model(imgs, labels)
                 loss = criterion(out, labels)
-                loss.backward()
-                optimizer.step()
+                loss.backward(); optimizer.step()
                 running_loss += loss.item() * imgs.size(0)
                 correct      += out.argmax(1).eq(labels).sum().item()
                 total        += imgs.size(0)
             scheduler.step()
-
-        avg_loss = running_loss / max(total, 1)
-        accuracy = 100.0 * correct / max(total, 1)
-        return avg_loss, accuracy
+    
+        return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
+      
+    def extract_style_templates(self):
+        """
+        Extract low-frequency amplitude templates from all local training samples.
+        These are safe to share — they capture only global style/illumination,
+        not identity-discriminative texture.
+        Returns a list of amplitude arrays, one per training sample.
+        """
+        templates = []
+        img_side  = self.cfg["img_side"]
+        beta      = self.cfg["fft_beta"]
+        for path, _ in self.train_dataset.samples:
+            img = Image.open(path).convert("L")
+            img = img.resize((img_side, img_side), Image.BILINEAR)
+            img_np = np.array(img, dtype=np.float32) / 255.0
+            templates.append(extract_style_template(img_np, beta))
+        print(f"  Client {self.client_id} [{self.spectrum}] "
+              f"— extracted {len(templates)} style templates")
+        return templates
 
 
 # ══════════════════════════════════════════════════════════════
@@ -639,6 +754,16 @@ def main():
         f"Client{i}_EER(%)\tClient{i}_Rank1(%)" for i in range(n_clients))
     with open(results_path, "w") as f:
         f.write(f"Round\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
+
+    # ── style template extraction and style bank creation ─────────────────────────
+    print("\nExtracting style templates from all clients …")
+    style_bank = {
+        client.client_id: client.extract_style_templates()
+        for client in clients
+    }
+    total_templates = sum(len(v) for v in style_bank.values())
+    print(f"  Style bank ready — {total_templates} templates "
+          f"across {len(style_bank)} clients\n")
 
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
