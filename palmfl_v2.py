@@ -10,13 +10,20 @@ Dataset layout assumed
     {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
   Example: 001_L_850_1.jpg
 
-Protocol
-─────────
-  Identities : 200 shared IDs across all 6 clients (closed-set).
-  Global test : TEST_RATIO (20%) of each ID's samples per spectrum,
-                collected once before training.
-                Size: ~TEST_RATIO × n_iters × 200_IDs × 6_spectra
-  Local train : remaining 80% of each client's samples.
+Protocol (Open-Set, Shared-ID)
+────────────────────────────────
+  Identities : N total IDs shared across all 6 clients.
+  ID split   : K_TEST (20%) of IDs → test set  |  remaining 80% → training.
+               Train and test IDs are fully disjoint (open-set).
+  Local train: all samples of train IDs in each client's spectral domain.
+               Train IDs and label space are identical across all clients.
+  Global test: all samples of test IDs across all 6 spectra, split into:
+               • Gallery : GALLERY_RATIO (50%) of each (spectrum, identity)
+                           pair's samples.
+               • Probe   : remaining 50% of each (spectrum, identity) pair.
+               Both gallery and probe contain all test IDs and all spectra.
+               The gallery/probe split is fixed before training and shared
+               across all rounds and clients.
 
 FL Algorithm (FedAvg)
 ──────────────────────
@@ -25,17 +32,15 @@ FL Algorithm (FedAvg)
     Step 1 – every client:
                • loads global weights into local model
                • trains for E local epochs on local training set
-               • evaluates local model on global test set
+               • evaluates local model on shared gallery/probe test sets
                • returns updated weights to server
     Step 2 – server:
                • FedAvg: simple average of all client weight dicts
                • updates global model
-               • evaluates global model on global test set
+               • evaluates global model on shared gallery/probe test sets
 
 Results saved to BASE_RESULTS_DIR:
-  round_results.json   — EER and Rank-1 per round (local + global)
-  summary.txt          — final global model performance
-  round_{r:04d}/       — per-round checkpoint and eval scores
+  results.txt  — tab-separated EER and Rank-1 per round (global + per-client)
 """
 
 # ==============================================================
