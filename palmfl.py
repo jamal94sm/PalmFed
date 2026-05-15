@@ -10,8 +10,8 @@ Dataset layout assumed
     {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
   Example: 001_L_850_1.jpg
 
-Protocol
-─────────
+Protocol (closed-set, shared-ID)
+────────────────────────────────
   Identities : 200 shared IDs across all 6 clients (closed-set).
   Global test : TEST_RATIO (20%) of each ID's samples per spectrum,
                 collected once before training.
