@@ -615,7 +615,10 @@ class FLClient:
             shuffle        = True,
             num_workers    = self.cfg["num_workers"],
             pin_memory     = True,
-            worker_init_fn = worker_init_fn,
+            worker_init_fn = lambda wid: (
+            np.random.seed(torch.initial_seed() % 2**32),
+            random.seed(torch.initial_seed() % 2**32)
+    ),
         )
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
