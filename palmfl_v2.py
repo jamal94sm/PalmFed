@@ -117,6 +117,12 @@ SEED = CONFIG["random_seed"]
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
+def worker_init_fn(worker_id):
+    """Seed each DataLoader worker independently for reproducible augmentation."""
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 # ══════════════════════════════════════════════════════════════
 #  MODEL  (CompNet — exact copy, unchanged)
