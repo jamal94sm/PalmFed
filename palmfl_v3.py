@@ -58,7 +58,7 @@ CONFIG = {
 
     "fft_beta"  : 0.05,   # Gaussian mask sigma fraction (cut-off frequency for fft swapping)
     "M"         : 3,      # total augmented images per sample (1 original + M-1 synthetic)
-    "use_fft_aug" : True,   # True → FFT style augmentation | False → standard training
+    "use_fft_aug" : False,   # True → FFT style augmentation | False → standard training
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 100,       # R: total communication rounds
     "local_epochs"     : 1,         # E: local training epochs per round
