@@ -296,7 +296,7 @@ def extract_style_template(img_np, beta):
 def apply_style_template(img_np, amp_template, beta):
     """
     Swap the low-frequency amplitude of img_np with amp_template
-    using a Gaussian soft mask. Phase (texture/structure) is preserved.
+    using a Gaussian soft mask. Phase (identity-specific information) is preserved.
     Returns a float32 image in [0, 1].
     """
     H, W = img_np.shape[:2]
@@ -350,13 +350,13 @@ class FFTAugmentedDataset(Dataset):
         self.M               = M
         self.beta            = beta
         self.img_side        = img_side
-        self.other_ids       = [cid for cid in style_bank if cid != client_id]
+        self.other_ids       = [cid for cid in style_bank if cid != client_id] # A client never borrows its own style since that would produce no domain shift
         self.transform       = T.Compose([
             T.Resize((img_side, img_side)),
             T.ToTensor(),
             NormSingleROI(outchannels=1),
         ])
-
+    
     def __len__(self):
         return len(self.samples) * self.M
 
@@ -368,7 +368,7 @@ class FFTAugmentedDataset(Dataset):
     def _to_tensor(self, img_np):
         pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
         return self.transform(pil)
-
+    
     def __getitem__(self, idx):
         sample_idx = idx // self.M    # which original sample
         aug_idx    = idx  % self.M    # 0 = original, 1..M-1 = synthetic
@@ -559,7 +559,7 @@ class FLClient:
     Represents one federated learning client.
 
     Each client holds:
-      - a local training dataset (one spectral domain)
+      - a local training sample list (one spectral domain, disjoint IDs)
       - a local CompNet model
       - a local optimiser + scheduler (re-created each round from global weights)
     """
@@ -568,21 +568,11 @@ class FLClient:
                  num_classes, cfg, device):
         self.client_id     = client_id
         self.spectrum      = spectrum
-        self.train_samples = train_samples   # raw list — no PalmDataset wrapper
+        self.train_samples = train_samples   # raw list of (path, label)
         self.label_map     = label_map
         self.num_classes   = num_classes
         self.cfg           = cfg
         self.device        = device
-
-        # local dataset
-        self.train_dataset = PalmDataset(train_samples, cfg["img_side"])
-        self.train_loader  = DataLoader(
-            self.train_dataset,
-            batch_size  = cfg["batch_size"],
-            shuffle     = True,
-            num_workers = cfg["num_workers"],
-            pin_memory  = True,
-        )
 
         # local model (initialised to random; will be overwritten each round)
         self.model = CompNet(
@@ -592,11 +582,9 @@ class FLClient:
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
         ).to(device)
-    
+
         print(f"  Client {client_id} [{spectrum}] — "
               f"train IDs: {num_classes}  samples: {len(train_samples)}")
-
-    # ── public interface ────────────────────────────────────────────────────
 
     def set_weights(self, backbone_state_dict):
         """Load global backbone weights. ArcFace head kept local."""
@@ -605,7 +593,7 @@ class FLClient:
             if key in local_state and local_state[key].shape == val.shape:
                 local_state[key] = val.clone()
         self.model.load_state_dict(local_state)
-    
+
     def get_weights(self):
         """Return backbone weights only — exclude ArcFace head."""
         return {k: v.cpu().clone()
@@ -615,7 +603,7 @@ class FLClient:
     def local_train(self, local_epochs, style_bank, M):
         if self.cfg["use_fft_aug"] and style_bank and M > 1:
             dataset = FFTAugmentedDataset(
-                samples    = self.train_samples,   # ← was self.train_dataset.samples
+                samples    = self.train_samples,
                 style_bank = style_bank,
                 client_id  = self.client_id,
                 M          = M,
@@ -624,7 +612,7 @@ class FLClient:
             )
         else:
             dataset = PalmDataset(self.train_samples, self.cfg["img_side"])
-    
+
         train_loader = DataLoader(
             dataset,
             batch_size     = self.cfg["batch_size"],
@@ -632,16 +620,16 @@ class FLClient:
             num_workers    = self.cfg["num_workers"],
             pin_memory     = True,
             worker_init_fn = lambda wid: (
-            np.random.seed(torch.initial_seed() % 2**32),
-            random.seed(torch.initial_seed() % 2**32)
-    ),
+                np.random.seed(torch.initial_seed() % 2**32),
+                random.seed(torch.initial_seed() % 2**32)
+            ),
         )
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
         scheduler = lr_scheduler.StepLR(
             optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
         criterion = nn.CrossEntropyLoss()
-    
+
         self.model.train()
         running_loss = 0.0; correct = 0; total = 0
         for epoch in range(local_epochs):
@@ -655,9 +643,9 @@ class FLClient:
                 correct      += out.argmax(1).eq(labels).sum().item()
                 total        += imgs.size(0)
             scheduler.step()
-    
+
         return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
-      
+
     def extract_style_templates(self):
         """
         Extract low-frequency amplitude templates from all local training samples.
@@ -668,7 +656,7 @@ class FLClient:
         templates = []
         img_side  = self.cfg["img_side"]
         beta      = self.cfg["fft_beta"]
-        for path, _ in self.train_samples:   # ← was self.train_dataset.samples
+        for path, _ in self.train_samples:
             img = Image.open(path).convert("L")
             img = img.resize((img_side, img_side), Image.BILINEAR)
             img_np = np.array(img, dtype=np.float32) / 255.0
