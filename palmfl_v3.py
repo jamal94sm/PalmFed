@@ -64,20 +64,22 @@ Results saved to BASE_RESULTS_DIR:
 # ==============================================================
 CONFIG = {
     # ── Paths ──────────────────────────────────────────────────
-    "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    "data_root"        : "path to CASIA-MS-ROI",
     "base_results_dir" : "./rst_fedavg_casiams",
 
     # ── Dataset ────────────────────────────────────────────────
-    "n_ids"            : 200,       # number of shared identities across clients
-    "k_test"        : 0.20,   # fraction of IDs allocated to test set
-    "gallery_ratio" : 0.20,   # fraction of test-ID samples → gallery
+    "n_ids"            : 200,    # number of identities to sample
+    "k_test"           : 0.20,   # fraction of IDs allocated to test set
+    "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
-    "fft_beta"  : 0.05,   # Gaussian mask sigma fraction (cut-off frequency for fft swapping)
-    "M"         : 5,      # total augmented images per sample (1 original + M-1 synthetic)
-    "use_fft_aug" : False,   # True → FFT style augmentation | False → standard training
+    # ── FFT style augmentation ─────────────────────────────────
+    "fft_beta"         : 0.05,   # Gaussian mask sigma as fraction of image size
+    "M"                : 5,      # augmented copies per sample (1 original + M-1 synthetic)
+    "use_fft_aug"      : False,  # True → FFT style augmentation | False → standard training
+
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 100,       # R: total communication rounds
-    "local_epochs"     : 1,         # E: local training epochs per round
+    "n_rounds"         : 100,    # R: total communication rounds
+    "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── Model (CompNet — unchanged) ────────────────────────────
     "img_side"         : 128,
@@ -88,20 +90,16 @@ CONFIG = {
 
     # ── Training ───────────────────────────────────────────────
     "batch_size"       : 32,
-    "lr"               : 0.001,
-    "lr_step"          : 30,
-    "lr_gamma"         : 0.8,
+    "lr"               : 0.001,  # constant lr across all rounds (no scheduler)
 
     # ── Misc ───────────────────────────────────────────────────
     "random_seed"      : 42,
     "num_workers"      : 4,
-    "save_every"       : 10,        # save global checkpoint every N rounds
 }
 # ==============================================================
 
 import os
 import copy
-import json
 import math
 import time
 import random
@@ -113,19 +111,14 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import Parameter, DataParallel
+from torch.nn import Parameter
 import torch.optim as optim
-from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
@@ -234,7 +227,8 @@ class CompNet(nn.Module):
                                      s=arcface_s, m=arcface_m)
 
     def _backbone(self, x):
-        x1 = self.cb1(x).flatten(1); x2 = self.cb2(x).flatten(1)
+        x1 = self.cb1(x).flatten(1)
+        x2 = self.cb2(x).flatten(1)
         x3 = self.cb3(x).flatten(1)
         return self.fc(torch.cat([x1, x2, x3], dim=1))
 
@@ -252,6 +246,11 @@ class CompNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class NormSingleROI:
+    """
+    Per-image normalisation applied only over foreground (non-zero) pixels.
+    Background zero-padding is excluded from mean/std computation so that
+    it does not distort the normalisation of the actual palm ROI region.
+    """
     def __init__(self, outchannels=1): self.outchannels = outchannels
 
     def __call__(self, tensor):
@@ -265,11 +264,15 @@ class NormSingleROI:
 
 
 # ══════════════════════════════════════════════════════════════
-#  Knowledge Sharing and Augmentation
+#  FFT STYLE AUGMENTATION
 # ══════════════════════════════════════════════════════════════
+
 def gaussian_mask(H, W, beta):
-    """Soft Gaussian low-frequency mask centred at DC."""
-    sigma = min(H, W) * beta
+    """
+    Soft Gaussian low-frequency mask centred at DC.
+    Values close to 1 at centre (low freq), close to 0 at edges (high freq).
+    """
+    sigma  = min(H, W) * beta
     cy, cx = H // 2, W // 2
     ys = np.arange(H) - cy
     xs = np.arange(W) - cx
@@ -277,50 +280,60 @@ def gaussian_mask(H, W, beta):
     return np.exp(-(xs**2 + ys**2) / (2 * sigma**2)).astype(np.float32)
 
 
-def extract_style_template(img_np, beta):
+def extract_style_template(img_np):
     """
-    Extract the low-frequency amplitude template from an image.
-    Returns the fftshifted amplitude array (H, W) or (H, W, C).
-    This is the shareable style descriptor — no texture/identity info.
-    """
-    def _extract_channel(ch):
-        amp = np.abs(np.fft.fft2(ch))
-        return np.fft.fftshift(amp)
+    Extract the full fftshifted amplitude spectrum of a grayscale image.
+    This is the shareable style descriptor — it captures global illumination
+    and spectral tone but no fine-grained texture or identity information.
+    The full spectrum is always extracted; the Gaussian mask is only applied
+    during augmentation in apply_style_template().
 
-    if img_np.ndim == 2:
-        return _extract_channel(img_np)
-    return np.stack([_extract_channel(img_np[..., c])
-                     for c in range(img_np.shape[2])], axis=-1)
+    Parameters
+    ----------
+    img_np : np.ndarray  (H, W)  float32 in [0, 1]
+
+    Returns
+    -------
+    amp_shifted : np.ndarray  (H, W)  fftshifted amplitude
+    """
+    amp = np.abs(np.fft.fft2(img_np))
+    return np.fft.fftshift(amp).astype(np.float32)
 
 
 def apply_style_template(img_np, amp_template, beta):
     """
-    Swap the low-frequency amplitude of img_np with amp_template
-    using a Gaussian soft mask. Phase (identity-specific information) is preserved.
-    Returns a float32 image in [0, 1].
+    Swap the low-frequency amplitude of img_np with amp_template using a
+    Gaussian soft mask. Phase (identity-specific texture) is preserved.
+
+    Parameters
+    ----------
+    img_np       : np.ndarray  (H, W)  float32 in [0, 1]
+    amp_template : np.ndarray  (H, W)  fftshifted amplitude from another client
+    beta         : float       Gaussian sigma as fraction of min(H, W)
+
+    Returns
+    -------
+    img_syn : np.ndarray  (H, W)  float32 in [0, 1]
     """
-    H, W = img_np.shape[:2]
-    mask = gaussian_mask(H, W, beta)
+    H, W  = img_np.shape[:2]
+    mask  = gaussian_mask(H, W, beta)
+    fft   = np.fft.fft2(img_np)
+    amp_s = np.fft.fftshift(np.abs(fft))
+    pha   = np.angle(fft)
+    # soft blend: low-freq from template, high-freq kept from original
+    amp_syn = (1.0 - mask) * amp_s + mask * amp_template
+    amp_syn = np.fft.ifftshift(amp_syn)
+    img_syn = np.fft.ifft2(amp_syn * np.exp(1j * pha)).real
+    return np.clip(img_syn, 0.0, 1.0).astype(np.float32)
 
-    def _apply_channel(ch, amp_tpl_ch):
-        fft   = np.fft.fft2(ch)
-        amp_s = np.fft.fftshift(np.abs(fft))
-        pha   = np.angle(fft)
-        # soft blend: low-freq from template, high-freq from original
-        amp_syn = (1 - mask) * amp_s + mask * amp_tpl_ch
-        amp_syn = np.fft.ifftshift(amp_syn)
-        return np.clip(np.fft.ifft2(amp_syn * np.exp(1j * pha)).real, 0, 1)
-
-    if img_np.ndim == 2:
-        return _apply_channel(img_np, amp_template).astype(np.float32)
-    return np.stack([_apply_channel(img_np[..., c], amp_template[..., c])
-                     for c in range(img_np.shape[2])], axis=-1).astype(np.float32)
 
 # ══════════════════════════════════════════════════════════════
-#  DATASET
+#  DATASETS
 # ══════════════════════════════════════════════════════════════
+
 class PalmDataset(Dataset):
     """Plain dataset for gallery/probe evaluation — no augmentation."""
+
     def __init__(self, samples, img_side=128):
         self.samples   = samples
         self.transform = T.Compose([
@@ -339,48 +352,58 @@ class PalmDataset(Dataset):
 class FFTAugmentedDataset(Dataset):
     """
     Training dataset with FFT style augmentation.
-    For each original sample, M-1 synthetic images are created by swapping
-    the low-frequency amplitude with randomly selected style templates from
-    M-1 other clients. The dataset returns M images per original sample.
+
+    For each original sample x_i, M-1 synthetic copies are produced by
+    replacing its low-frequency amplitude with a randomly chosen template
+    from a randomly chosen other client's style bank.
+
+    Index layout: indices [i*M .. i*M+M-1] all correspond to sample i.
+      aug_idx == 0  → original (no augmentation, always included)
+      aug_idx >= 1  → synthetic (FFT style swap from a random other client)
+
+    FIX: T.Resize removed from self.transform — images are already resized
+    to img_side in _load_np(), so applying Resize again is redundant.
     """
+
     def __init__(self, samples, style_bank, client_id, M, beta, img_side):
-        self.samples         = samples
-        self.style_bank      = style_bank   # {client_id: [amp_array, ...]}
-        self.client_id       = client_id
-        self.M               = M
-        self.beta            = beta
-        self.img_side        = img_side
-        self.other_ids       = [cid for cid in style_bank if cid != client_id] # A client never borrows its own style since that would produce no domain shift
-        self.transform       = T.Compose([
-            T.Resize((img_side, img_side)),
+        self.samples    = samples
+        self.style_bank = style_bank   # {client_id: [amp_array, ...]}
+        self.client_id  = client_id
+        self.M          = M
+        self.beta       = beta
+        self.img_side   = img_side
+        # a client never borrows its own style (no domain shift otherwise)
+        self.other_ids  = [cid for cid in style_bank if cid != client_id]
+        # no T.Resize here — _load_np already resizes
+        self.transform  = T.Compose([
             T.ToTensor(),
             NormSingleROI(outchannels=1),
         ])
-    
+
     def __len__(self):
         return len(self.samples) * self.M
 
     def _load_np(self, path):
-        img = Image.open(path).convert("L")
-        img = img.resize((self.img_side, self.img_side), Image.BILINEAR)
+        """Load, resize, and return float32 array in [0, 1]."""
+        img = Image.open(path).convert("L").resize(
+            (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
     def _to_tensor(self, img_np):
         pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
         return self.transform(pil)
-    
+
     def __getitem__(self, idx):
-        sample_idx = idx // self.M    # which original sample
-        aug_idx    = idx  % self.M    # 0 = original, 1..M-1 = synthetic
+        sample_idx = idx // self.M   # which original sample
+        aug_idx    = idx  % self.M   # 0 = original, 1..M-1 = synthetic
 
         path, label = self.samples[sample_idx]
         img_np = self._load_np(path)
 
         if aug_idx == 0 or not self.other_ids:
-            # original sample — always included
             return self._to_tensor(img_np), label
 
-        # select one random client (different each aug_idx) and one random template
+        # pick a random client (not self) and a random template from it
         rand_client   = random.choice(self.other_ids)
         rand_template = random.choice(self.style_bank[rand_client])
         img_syn       = apply_style_template(img_np, rand_template, self.beta)
@@ -398,9 +421,9 @@ def parse_casia_ms(data_root):
 
     Returns
     -------
-    data : dict   spectrum → identity → [path, ...]
+    data : dict  spectrum → identity → [path, ...]
     """
-    data = defaultdict(lambda: defaultdict(list))
+    data     = defaultdict(lambda: defaultdict(list))
     img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
     for fname in sorted(os.listdir(data_root)):
         if os.path.splitext(fname)[1].lower() not in img_exts:
@@ -408,15 +431,24 @@ def parse_casia_ms(data_root):
         parts = os.path.splitext(fname)[0].split("_")
         if len(parts) < 4:
             continue
-        subject_id = parts[0]
-        hand_side  = parts[1]
-        spectrum   = parts[2]
-        identity   = f"{subject_id}_{hand_side}"   # e.g. "001_L"
+        identity = f"{parts[0]}_{parts[1]}"   # e.g. "001_L"
+        spectrum = parts[2]
         data[spectrum][identity].append(os.path.join(data_root, fname))
     return data
 
 
 def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
+    """
+    Build per-client training sets and a fixed shared gallery/probe test set.
+
+    Returns
+    -------
+    client_data     : list of dicts {spectrum, train_samples, label_map, num_classes}
+    gallery_samples : list of (path, label)
+    probe_samples   : list of (path, label)
+    test_label_map  : {identity: int}
+    spectra         : list of spectrum strings
+    """
     rng  = random.Random(seed)
     data = parse_casia_ms(data_root)
 
@@ -424,7 +456,7 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
     n_clients = len(spectra)
     print(f"  Spectra found ({n_clients}): {spectra}")
 
-    # identities common to ALL spectra
+    # identities present in ALL spectra
     common_ids = set(data[spectra[0]].keys())
     for sp in spectra[1:]:
         common_ids &= set(data[sp].keys())
@@ -436,29 +468,29 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
             f"Requested {n_ids} IDs but only {len(common_ids)} "
             f"are present in all spectra.")
 
-    # select n_ids and split into test / train
+    # sample n_ids, shuffle, then split into test / train ID sets
     selected_ids = sorted(rng.sample(common_ids, n_ids))
     rng.shuffle(selected_ids)
-    n_test_ids     = max(1, round(n_ids * k_test))
-    test_ids       = sorted(selected_ids[:n_test_ids])
-    train_ids      = sorted(selected_ids[n_test_ids:])
-    test_label_map = {ident: i for i, ident in enumerate(test_ids)}
+    n_test_ids      = max(1, round(n_ids * k_test))
+    test_ids        = sorted(selected_ids[:n_test_ids])
+    train_ids       = sorted(selected_ids[n_test_ids:])
+    test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
 
     print(f"  Total train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
 
-    # uniformly partition train IDs among clients — no overlap
+    # uniformly partition train IDs among clients — round-robin, no overlap
     rng.shuffle(train_ids)
     client_id_splits = [[] for _ in range(n_clients)]
     for i, ident in enumerate(train_ids):
         client_id_splits[i % n_clients].append(ident)
 
-    # equalise client sizes by trimming to the smallest partition
+    # equalise by trimming all clients to the smallest partition size
     min_ids = min(len(ids) for ids in client_id_splits)
     client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
     n_dropped = len(train_ids) - min_ids * n_clients
     print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
 
-    # per-client local train sets — each client has its OWN IDs and label space
+    # build per-client local train sets — each client has its own label space
     client_data = []
     for i, sp in enumerate(spectra):
         c_ids       = client_id_splits[i]
@@ -477,8 +509,7 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
         print(f"    Client {i} [{sp:>6}]  "
               f"train IDs={min_ids}  samples={len(local_train)}")
 
-    # fixed global test set — test IDs, all spectra, gallery/probe split
-    # split within each (spectrum, identity) pair by gallery_ratio
+    # build fixed global test set — split within each (spectrum, identity) pair
     gallery_samples, probe_samples = [], []
     for sp in spectra:
         for ident in test_ids:
@@ -495,6 +526,7 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
     return (client_data, gallery_samples, probe_samples,
             test_label_map, spectra)
 
+
 # ══════════════════════════════════════════════════════════════
 #  EVALUATION  (cosine similarity, EER, Rank-1)
 # ══════════════════════════════════════════════════════════════
@@ -510,7 +542,7 @@ def extract_features(model, loader, device):
 
 
 def compute_eer(scores_array):
-    """Single EER from an Nx2 array of [score, label(+1/-1)]."""
+    """EER from an Nx2 array of [cosine_score, label(+1/-1)]."""
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
     if len(ins) == 0 or len(outs) == 0:
@@ -518,34 +550,36 @@ def compute_eer(scores_array):
     y = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
     s = np.concatenate([ins, outs])
     fpr, tpr, _ = roc_curve(y, s, pos_label=1)
-    return brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
+    return float(brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0))
 
 
-def evaluate_model(model, gallery_loader, probe_loader, device,
-                   out_dir=None, tag="eval"):
+def evaluate_model(model, gallery_loader, probe_loader, device):
+    """
+    Cosine-similarity evaluation on pre-split gallery and probe loaders.
+
+    Returns
+    -------
+    eer   : float  EER in [0, 1]
+    rank1 : float  Rank-1 accuracy in [0, 100]
+    """
     gal_feats, gal_labels = extract_features(model, gallery_loader, device)
     prb_feats, prb_labels = extract_features(model, probe_loader,   device)
 
+    # cosine similarity matrix (embeddings are L2-normalised)
     sim_matrix  = prb_feats @ gal_feats.T
+
     scores_list, labels_list = [], []
     for i in range(len(prb_feats)):
         for j in range(len(gal_feats)):
             scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if prb_labels[i] == gal_labels[j] else -1)
 
-    scores_arr = np.column_stack([scores_list, labels_list])
-    eer        = compute_eer(scores_arr)
+    eer = compute_eer(np.column_stack([scores_list, labels_list]))
 
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(prb_labels[i] == gal_labels[nn_idx[i]]
                   for i in range(len(prb_feats)))
     rank1   = 100.0 * correct / max(len(prb_feats), 1)
-
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, f"scores_{tag}.txt"), "w") as f:
-            for s, l in zip(scores_list, labels_list):
-                f.write(f"{s} {l}\n")
 
     return eer, rank1
 
@@ -556,12 +590,14 @@ def evaluate_model(model, gallery_loader, probe_loader, device,
 
 class FLClient:
     """
-    Represents one federated learning client.
+    One federated learning client — owns one spectral domain with
+    a disjoint subset of training identities.
 
-    Each client holds:
-      - a local training sample list (one spectral domain, disjoint IDs)
-      - a local CompNet model
-      - a local optimiser + scheduler (re-created each round from global weights)
+    The ArcFace classification head is always kept local and never
+    sent to the server — only backbone weights are shared via FedAvg.
+    The optimiser is recreated each round (no momentum carry-over) at a
+    constant learning rate — no scheduler, since the model is reset to
+    the global checkpoint at the start of every round.
     """
 
     def __init__(self, client_id, spectrum, train_samples, label_map,
@@ -574,7 +610,7 @@ class FLClient:
         self.cfg           = cfg
         self.device        = device
 
-        # local model (initialised to random; will be overwritten each round)
+        # local model — weights overwritten each round from global backbone
         self.model = CompNet(
             num_classes   = num_classes,
             embedding_dim = cfg["embedding_dim"],
@@ -587,7 +623,11 @@ class FLClient:
               f"train IDs: {num_classes}  samples: {len(train_samples)}")
 
     def set_weights(self, backbone_state_dict):
-        """Load global backbone weights. ArcFace head kept local."""
+        """
+        Load global backbone weights into local model.
+        ArcFace head (arc.*) is never in backbone_state_dict and is
+        therefore preserved unchanged.
+        """
         local_state = self.model.state_dict()
         for key, val in backbone_state_dict.items():
             if key in local_state and local_state[key].shape == val.shape:
@@ -595,12 +635,17 @@ class FLClient:
         self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """Return backbone weights only — exclude ArcFace head."""
+        """Return backbone weights only — ArcFace head excluded."""
         return {k: v.cpu().clone()
                 for k, v in self.model.state_dict().items()
                 if not k.startswith("arc.")}
 
     def local_train(self, local_epochs, style_bank, M):
+        """
+        Train local model for local_epochs epochs.
+        Uses FFTAugmentedDataset when use_fft_aug is True, else PalmDataset.
+        Optimiser is Adam with constant lr — no scheduler.
+        """
         if self.cfg["use_fft_aug"] and style_bank and M > 1:
             dataset = FFTAugmentedDataset(
                 samples    = self.train_samples,
@@ -625,9 +670,8 @@ class FLClient:
             ),
         )
 
+        # constant lr — no scheduler (model resets to global weights each round)
         optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
-        scheduler = lr_scheduler.StepLR(
-            optimizer, self.cfg["lr_step"], self.cfg["lr_gamma"])
         criterion = nn.CrossEntropyLoss()
 
         self.model.train()
@@ -642,25 +686,22 @@ class FLClient:
                 running_loss += loss.item() * imgs.size(0)
                 correct      += out.argmax(1).eq(labels).sum().item()
                 total        += imgs.size(0)
-            scheduler.step()
 
         return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
 
     def extract_style_templates(self):
         """
         Extract low-frequency amplitude templates from all local training samples.
-        These are safe to share — they capture only global style/illumination,
-        not identity-discriminative texture.
-        Returns a list of amplitude arrays, one per training sample.
+        Safe to share — captures only global style/illumination, not identity info.
+        Returns one amplitude array per training sample.
         """
         templates = []
         img_side  = self.cfg["img_side"]
-        beta      = self.cfg["fft_beta"]
         for path, _ in self.train_samples:
-            img = Image.open(path).convert("L")
-            img = img.resize((img_side, img_side), Image.BILINEAR)
+            img = Image.open(path).convert("L").resize(
+                (img_side, img_side), Image.BILINEAR)
             img_np = np.array(img, dtype=np.float32) / 255.0
-            templates.append(extract_style_template(img_np, beta))
+            templates.append(extract_style_template(img_np))
         print(f"  Client {self.client_id} [{self.spectrum}] "
               f"— extracted {len(templates)} style templates")
         return templates
@@ -672,16 +713,16 @@ class FLClient:
 
 class FLServer:
     """
-    Central server that:
+    Central server:
       - maintains the global CompNet model
-      - performs FedAvg aggregation
+      - performs FedAvg aggregation on backbone weights only
       - evaluates the global model on the shared gallery/probe test sets
     """
+
     def __init__(self, num_classes, gallery_samples, probe_samples, cfg, device):
         self.cfg    = cfg
         self.device = device
 
-        # global model
         self.global_model = CompNet(
             num_classes   = num_classes,
             embedding_dim = cfg["embedding_dim"],
@@ -690,7 +731,6 @@ class FLServer:
             dropout       = cfg["dropout"],
         ).to(device)
 
-        # shared gallery and probe loaders (fixed, created once before training)
         self.gallery_loader = DataLoader(
             PalmDataset(gallery_samples, cfg["img_side"]),
             batch_size  = cfg["batch_size"],
@@ -710,12 +750,21 @@ class FLServer:
               f"probe: {len(probe_samples)}")
 
     def get_global_weights(self):
-        """Return a CPU copy of the global model state dict."""
+        """
+        Return backbone weights only (arc.* excluded).
+        FIX: previously returned all parameters including arc.*, which
+        was unnecessary since clients only load backbone keys anyway.
+        """
         return {k: v.cpu().clone()
-                for k, v in self.global_model.state_dict().items()}
+                for k, v in self.global_model.state_dict().items()
+                if not k.startswith("arc.")}
 
     def aggregate(self, client_weight_dicts):
-        """FedAvg on backbone parameters only (arc.* excluded)."""
+        """
+        FedAvg on backbone parameters only.
+        ArcFace head is client-specific (different identity prototypes)
+        and is never shared or aggregated.
+        """
         n        = len(client_weight_dicts)
         avg_dict = {}
         for key in client_weight_dicts[0].keys():
@@ -726,20 +775,17 @@ class FLServer:
         global_state.update(avg_dict)
         self.global_model.load_state_dict(global_state)
 
-    def evaluate(self, out_dir=None, tag="global"):
+    def evaluate(self):
         """Evaluate the global model on the shared gallery and probe sets."""
         return evaluate_model(
             self.global_model,
             self.gallery_loader,
             self.probe_loader,
-            self.device, out_dir, tag)
-
-    def save_checkpoint(self, path):
-        torch.save(self.global_model.state_dict(), path)
+            self.device)
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN TRAINING LOOP
+#  MAIN
 # ══════════════════════════════════════════════════════════════
 
 def main():
@@ -761,7 +807,9 @@ def main():
     print(f"  IDs : {cfg['n_ids']}   "
           f"Test ID ratio : {cfg['k_test']*100:.0f}%   "
           f"Gallery ratio : {cfg['gallery_ratio']*100:.0f}%")
-    print(f"  FFT Aug  : {cfg['use_fft_aug']}   M={cfg['M']}   beta={cfg['fft_beta']}")
+    print(f"  FFT Aug  : {cfg['use_fft_aug']}   "
+          f"M={cfg['M']}   beta={cfg['fft_beta']}")
+    print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
     print(f"{'='*62}\n")
 
     # ── Step 0a: build data splits ────────────────────────────────────────
@@ -771,7 +819,7 @@ def main():
         cfg["data_root"], cfg["n_ids"], cfg["k_test"],
         cfg["gallery_ratio"], seed=seed)
 
-    num_classes = client_data[0]["num_classes"]   # same for all clients (min_ids)
+    num_classes = client_data[0]["num_classes"]   # same for all (min_ids)
     n_clients   = len(client_data)
     print(f"\n  Clients        : {n_clients}  ({spectra})")
     print(f"  IDs per client : {num_classes}")
@@ -792,19 +840,19 @@ def main():
             spectrum      = cd["spectrum"],
             train_samples = cd["train_samples"],
             label_map     = cd["label_map"],
-            num_classes   = cd["num_classes"],   # per-client (all equal to min_ids)
+            num_classes   = cd["num_classes"],
             cfg           = cfg,
             device        = device,
         ))
 
-    # ── results file (tab-separated, one row per round) ───────────────────
-    results_path = os.path.join(base_dir, "results.txt")
+    # ── results file ──────────────────────────────────────────────────────
+    results_path  = os.path.join(base_dir, "results.txt")
     client_header = "\t".join(
         f"Client{i}_EER(%)\tClient{i}_Rank1(%)" for i in range(n_clients))
     with open(results_path, "w") as f:
         f.write(f"Round\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
 
-    # ── style template extraction and style bank creation ─────────────────
+    # ── style bank (extracted once before all rounds) ─────────────────────
     if cfg["use_fft_aug"]:
         print("\nExtracting style templates from all clients …")
         style_bank = {
@@ -826,26 +874,26 @@ def main():
         f.write(f"0\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
                 + "\t".join("-1\t-1" for _ in range(n_clients)) + "\n")
 
-    # ── FL rounds ─────────────────────────────────────────────────────────
-    g_eer, g_rank1 = g_eer_0, g_rank1_0   # FIX: ensures defined if n_rounds=0
+    # ensures g_eer/g_rank1 are defined even if n_rounds=0
+    g_eer, g_rank1 = g_eer_0, g_rank1_0
 
+    # ── FL rounds ─────────────────────────────────────────────────────────
     for rnd in range(1, cfg["n_rounds"] + 1):
         t_start        = time.time()
-        global_weights = server.get_global_weights()
+        global_weights = server.get_global_weights()   # backbone only
         client_weights = []
         client_metrics = []
 
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
-            # load global backbone weights (ArcFace head kept local)
-            client.set_weights(global_weights)
-            loss, acc = client.local_train(cfg["local_epochs"], style_bank, cfg["M"])
+            client.set_weights(global_weights)   # load backbone; keep local arc
+            loss, acc = client.local_train(
+                cfg["local_epochs"], style_bank, cfg["M"])
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
                 device)
-            # return backbone weights only (ArcFace head excluded)
-            client_weights.append(client.get_weights())
+            client_weights.append(client.get_weights())   # backbone only
             client_metrics.append({
                 "client_id" : client.client_id,
                 "spectrum"  : client.spectrum,
@@ -855,12 +903,11 @@ def main():
                 "rank1"     : round(c_rank1, 3),
             })
 
-        # ── Step 2: FedAvg aggregation (backbone only) + global evaluation
+        # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
         g_eer, g_rank1 = server.evaluate()
         elapsed = time.time() - t_start
 
-        # console log
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} | "
               f"Global EER={g_eer*100:.4f}%  Rank-1={g_rank1:.2f}%  "
@@ -870,7 +917,6 @@ def main():
                   f"loss={cm['train_loss']:.4f}  acc={cm['train_acc']:.1f}%  "
                   f"EER={cm['eer']*100:.3f}%  R1={cm['rank1']:.1f}%")
 
-        # append to results file
         client_cols = "\t".join(
             f"{cm['eer']*100:.4f}\t{cm['rank1']:.2f}"
             for cm in client_metrics)
