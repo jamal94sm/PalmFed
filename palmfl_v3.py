@@ -10,34 +10,50 @@ Dataset layout assumed
     {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
   Example: 001_L_850_1.jpg
 
-Protocol (Open-Set, Shared-ID)
-────────────────────────────────
-  Identities : N total IDs shared across all 6 clients.
+Protocol (Open-Set, Non-Shared-ID, Cross-Domain)
+──────────────────────────────────────────────────
+  Identities : N total IDs present across all 6 spectral domains.
   ID split   : K_TEST (20%) of IDs → test set  |  remaining 80% → training.
                Train and test IDs are fully disjoint (open-set).
-  Local train: all samples of train IDs in each client's spectral domain.
-               Train IDs and label space are identical across all clients.
+  Local train: train IDs are partitioned uniformly among clients — no overlap.
+               Each client holds a disjoint subset of train IDs in its own
+               spectral domain. ID label spaces are client-specific and
+               are never shared.
+               All clients receive the same number of train IDs (smallest
+               partition size; excess IDs dropped to equalise).
   Global test: all samples of test IDs across all 6 spectra, split into:
-               • Gallery : GALLERY_RATIO (50%) of each (spectrum, identity)
+               • Gallery : GALLERY_RATIO (20%) of each (spectrum, identity)
                            pair's samples.
-               • Probe   : remaining 50% of each (spectrum, identity) pair.
+               • Probe   : remaining 80% of each (spectrum, identity) pair.
                Both gallery and probe contain all test IDs and all spectra.
                The gallery/probe split is fixed before training and shared
                across all rounds and clients.
 
-FL Algorithm (FedAvg)
-──────────────────────
-  Round 0 : server initialises global model, broadcasts weights to all clients.
+FL Algorithm (FedAvg — Backbone Only)
+───────────────────────────────────────
+  Round 0 : server initialises global model, broadcasts backbone weights
+            to all clients.
   Each round (1 … R):
     Step 1 – every client:
-               • loads global weights into local model
+               • loads global backbone weights into local model
+                 (ArcFace head is kept local — it encodes client-specific
+                  identity prototypes and is never shared)
                • trains for E local epochs on local training set
+                 (optionally augmented via FFT style sharing)
                • evaluates local model on shared gallery/probe test sets
-               • returns updated weights to server
+               • returns updated backbone weights to server
     Step 2 – server:
-               • FedAvg: simple average of all client weight dicts
-               • updates global model
+               • FedAvg: simple average of all client backbone weight dicts
+               • updates global model backbone
                • evaluates global model on shared gallery/probe test sets
+
+FFT Style Augmentation (optional, use_fft_aug toggle)
+───────────────────────────────────────────────────────
+  Before Round 1, each client extracts low-frequency amplitude templates
+  from its local training samples and shares them as a style bank.
+  During local training, each sample is augmented with M-1 synthetic copies
+  produced by swapping its low-frequency amplitude with randomly selected
+  templates from other clients' style banks.
 
 Results saved to BASE_RESULTS_DIR:
   results.txt  — tab-separated EER and Rank-1 per round (global + per-client)
@@ -57,7 +73,7 @@ CONFIG = {
     "gallery_ratio" : 0.20,   # fraction of test-ID samples → gallery
 
     "fft_beta"  : 0.05,   # Gaussian mask sigma fraction (cut-off frequency for fft swapping)
-    "M"         : 3,      # total augmented images per sample (1 original + M-1 synthetic)
+    "M"         : 5,      # total augmented images per sample (1 original + M-1 synthetic)
     "use_fft_aug" : False,   # True → FFT style augmentation | False → standard training
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 100,       # R: total communication rounds
