@@ -74,7 +74,7 @@ CONFIG = {
 
     # ── FFT style augmentation ─────────────────────────────────
     "fft_beta"         : 0.05,   # Gaussian mask sigma as fraction of image size
-    "M"                : 5,      # augmented copies per sample (1 original + M-1 synthetic)
+    "M"                : 3,      # augmented copies per sample (1 original + M-1 synthetic)
     "use_fft_aug"      : True,  # True → FFT style augmentation | False → standard training
 
     # ── FL hyperparameters ─────────────────────────────────────
