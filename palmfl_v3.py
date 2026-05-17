@@ -67,6 +67,13 @@ CONFIG = {
     "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "base_results_dir" : "./rst_fedavg_casiams",
 
+    # ── Fair comparison: shared splits and init weights ────────
+    # Both runs (use_fft_aug=True and False) must load from the
+    # same files so that data splits and starting weights are
+    # identical. Generated automatically on the first run.
+    "splits_path"      : "./rst_fedavg_casiams/splits.pkl",
+    "init_weights_path": "./rst_fedavg_casiams/init_weights.pth",
+
     # ── Dataset ────────────────────────────────────────────────
     "n_ids"            : 200,    # number of identities to sample
     "k_test"           : 0.20,   # fraction of IDs allocated to test set
@@ -74,8 +81,8 @@ CONFIG = {
 
     # ── FFT style augmentation ─────────────────────────────────
     "fft_beta"         : 0.05,   # Gaussian mask sigma as fraction of image size
-    "M"                : 3,      # augmented copies per sample (1 original + M-1 synthetic)
-    "use_fft_aug"      : True,  # True → FFT style augmentation | False → standard training
+    "M"                : 5,      # augmented copies per sample (1 original + M-1 synthetic)
+    "use_fft_aug"      : False,  # True → FFT style augmentation | False → standard training
 
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 100,    # R: total communication rounds
@@ -103,6 +110,7 @@ import copy
 import math
 import time
 import random
+import pickle
 import warnings
 import numpy as np
 from collections import defaultdict
@@ -640,11 +648,13 @@ class FLClient:
                 for k, v in self.model.state_dict().items()
                 if not k.startswith("arc.")}
 
-    def local_train(self, local_epochs, style_bank, M):
+    def local_train(self, local_epochs, style_bank, M, rnd):
         """
         Train local model for local_epochs epochs.
         Uses FFTAugmentedDataset when use_fft_aug is True, else PalmDataset.
         Optimiser is Adam with constant lr — no scheduler.
+        DataLoader workers are seeded deterministically per (round, client)
+        so that shuffling order is identical between augmented and baseline runs.
         """
         if self.cfg["use_fft_aug"] and style_bank and M > 1:
             dataset = FFTAugmentedDataset(
@@ -658,15 +668,18 @@ class FLClient:
         else:
             dataset = PalmDataset(self.train_samples, self.cfg["img_side"])
 
+        # deterministic seed per (round, client) — identical across both runs
+        round_seed = self.cfg["random_seed"] + rnd * 1000 + self.client_id
         train_loader = DataLoader(
             dataset,
             batch_size     = self.cfg["batch_size"],
             shuffle        = True,
             num_workers    = self.cfg["num_workers"],
             pin_memory     = True,
-            worker_init_fn = lambda wid: (
-                np.random.seed(torch.initial_seed() % 2**32),
-                random.seed(torch.initial_seed() % 2**32)
+            worker_init_fn = lambda wid, s=round_seed: (
+                np.random.seed(s + wid),
+                random.seed(s + wid),
+                torch.manual_seed(s + wid),
             ),
         )
 
@@ -812,12 +825,28 @@ def main():
     print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
     print(f"{'='*62}\n")
 
-    # ── Step 0a: build data splits ────────────────────────────────────────
-    print("Building federated data splits …")
-    (client_data, gallery_samples, probe_samples,
-     test_label_map, spectra) = build_federated_splits(
-        cfg["data_root"], cfg["n_ids"], cfg["k_test"],
-        cfg["gallery_ratio"], seed=seed)
+    # ── Step 0a: load or build data splits ────────────────────────────────
+    # Splits are saved on the first run and reloaded on subsequent runs so
+    # that both augmented and baseline experiments use identical train/test
+    # ID assignments and gallery/probe sample assignments.
+    splits_path = cfg["splits_path"]
+    os.makedirs(os.path.dirname(splits_path), exist_ok=True)
+
+    if os.path.exists(splits_path):
+        print(f"Loading existing data splits from: {splits_path}")
+        with open(splits_path, "rb") as f:
+            splits = pickle.load(f)
+        client_data, gallery_samples, probe_samples, test_label_map, spectra = splits
+        print("  Splits loaded.")
+    else:
+        print("Building federated data splits …")
+        splits = build_federated_splits(
+            cfg["data_root"], cfg["n_ids"], cfg["k_test"],
+            cfg["gallery_ratio"], seed=seed)
+        with open(splits_path, "wb") as f:
+            pickle.dump(splits, f)
+        print(f"  Splits saved to: {splits_path}")
+        client_data, gallery_samples, probe_samples, test_label_map, spectra = splits
 
     num_classes = client_data[0]["num_classes"]   # same for all (min_ids)
     n_clients   = len(client_data)
@@ -845,6 +874,29 @@ def main():
             device        = device,
         ))
 
+    # ── Step 0d: load or save initial model weights ───────────────────────
+    # Both runs start from identical random weights so that any difference
+    # in final performance is attributable solely to the augmentation.
+    init_weights_path = cfg["init_weights_path"]
+
+    if os.path.exists(init_weights_path):
+        print(f"\nLoading existing initial weights from: {init_weights_path}")
+        init_state = torch.load(init_weights_path, map_location=device)
+        server.global_model.load_state_dict(init_state)
+        backbone_init = {k: v for k, v in init_state.items()
+                         if not k.startswith("arc.")}
+        for client in clients:
+            client.set_weights(backbone_init)
+        print("  Initial weights loaded.")
+    else:
+        print(f"\nSaving initial weights to: {init_weights_path}")
+        torch.save(server.global_model.state_dict(), init_weights_path)
+        backbone_init = {k: v for k, v in server.global_model.state_dict().items()
+                         if not k.startswith("arc.")}
+        for client in clients:
+            client.set_weights(backbone_init)
+        print("  Initial weights saved.")
+
     # ── results file ──────────────────────────────────────────────────────
     results_path  = os.path.join(base_dir, "results.txt")
     client_header = "\t".join(
@@ -852,19 +904,25 @@ def main():
     with open(results_path, "w") as f:
         f.write(f"Round\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
 
-    # ── style bank (extracted once before all rounds) ─────────────────────
+    # ── Step 0e: extract style templates (always, both runs) ──────────────
+    # Templates are always extracted regardless of use_fft_aug so that the
+    # random state consumed by extraction is identical in both runs.
+    # Templates are only passed to local_train when use_fft_aug=True.
+    print("\nExtracting style templates from all clients …")
+    style_bank_full = {
+        client.client_id: client.extract_style_templates()
+        for client in clients
+    }
+    total = sum(len(v) for v in style_bank_full.values())
+    print(f"  Style bank ready — {total} templates "
+          f"across {len(style_bank_full)} clients")
+
+    style_bank = style_bank_full if cfg["use_fft_aug"] else {}
     if cfg["use_fft_aug"]:
-        print("\nExtracting style templates from all clients …")
-        style_bank = {
-            client.client_id: client.extract_style_templates()
-            for client in clients
-        }
-        total = sum(len(v) for v in style_bank.values())
-        print(f"  Style bank ready — {total} templates "
-              f"across {len(style_bank)} clients\n")
+        print("  FFT augmentation ENABLED — style bank will be used.\n")
     else:
-        style_bank = {}
-        print("\nFFT augmentation disabled — using original samples only.\n")
+        print("  FFT augmentation DISABLED — style bank extracted "
+              "but not used during training.\n")
 
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
@@ -888,7 +946,7 @@ def main():
         for client in clients:
             client.set_weights(global_weights)   # load backbone; keep local arc
             loss, acc = client.local_train(
-                cfg["local_epochs"], style_bank, cfg["M"])
+                cfg["local_epochs"], style_bank, cfg["M"], rnd)
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
