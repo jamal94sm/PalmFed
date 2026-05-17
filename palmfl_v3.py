@@ -357,6 +357,39 @@ class PalmDataset(Dataset):
         return self.transform(Image.open(path).convert("L")), label
 
 
+class AugmentedDataset(Dataset):
+    """
+    Training dataset with standard spatial/photometric augmentation.
+    Used when use_fft_aug=False to ensure the baseline is not disadvantaged
+    by training on unaugmented data.
+    """
+    def __init__(self, samples, img_side=128):
+        self.samples = samples
+        self.transform = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.RandomChoice([
+                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+                T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+                T.RandomPerspective(distortion_scale=0.15, p=1.0),
+                T.RandomChoice([
+                    T.RandomRotation(10, expand=False,
+                                     center=(int(0.5*img_side), 0)),
+                    T.RandomRotation(10, expand=False,
+                                     center=(0, int(0.5*img_side))),
+                ]),
+            ]),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        return self.transform(Image.open(path).convert("L")), label
+
+
+
 class FFTAugmentedDataset(Dataset):
     """
     Training dataset with FFT style augmentation.
@@ -666,7 +699,7 @@ class FLClient:
                 img_side   = self.cfg["img_side"],
             )
         else:
-            dataset = PalmDataset(self.train_samples, self.cfg["img_side"])
+            dataset = AugmentedDataset(self.train_samples, self.cfg["img_side"])
 
         # deterministic seed per (round, client) — identical across both runs
         round_seed = self.cfg["random_seed"] + rnd * 1000 + self.client_id
