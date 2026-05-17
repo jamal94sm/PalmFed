@@ -325,14 +325,22 @@ def apply_style_template(img_np, amp_template, beta):
     """
     H, W  = img_np.shape[:2]
     mask  = gaussian_mask(H, W, beta)
+    
+    # save foreground mask before FFT manipulation
+    fg_mask = img_np > 0
+
     fft   = np.fft.fft2(img_np)
     amp_s = np.fft.fftshift(np.abs(fft))
     pha   = np.angle(fft)
-    # soft blend: low-freq from template, high-freq kept from original
     amp_syn = (1.0 - mask) * amp_s + mask * amp_template
     amp_syn = np.fft.ifftshift(amp_syn)
     img_syn = np.fft.ifft2(amp_syn * np.exp(1j * pha)).real
-    return np.clip(img_syn, 0.0, 1.0).astype(np.float32)
+    img_syn = np.clip(img_syn, 0.0, 1.0).astype(np.float32)
+
+    # re-apply original foreground mask — background must stay zero
+    # so that NormSingleROI computes correct per-ROI statistics
+    img_syn[~fg_mask] = 0.0
+    return img_syn
 
 
 # ══════════════════════════════════════════════════════════════
