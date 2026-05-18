@@ -4,7 +4,7 @@
 
 CONFIG = {
     # ── Model selection ────────────────────────────────────────
-    "model"            : "compnet",  # "compnet" | "ccnet"
+    "model"            : "ccnet",  # "compnet" | "ccnet"
 
     # ── Paths ──────────────────────────────────────────────────
     "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
