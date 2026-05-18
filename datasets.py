@@ -119,34 +119,89 @@ class AugmentedDataset(Dataset):
 class PairedDataset(Dataset):
     """
     Paired same-class dataset for CCNet contrastive training.
-    Returns ([img1, img2], label) where img2 is a different sample
-    of the same identity — required to form the two views for SupConLoss.
-    Spatial augmentation is applied to both images independently.
+
+    Returns ([img1, img2], label) where img2 is a different sample of the
+    same identity — required to form the two views for SupConLoss.
+
+    Augmentation modes (controlled by style_bank argument):
+      style_bank is None or empty → standard spatial augmentation only
+      style_bank is populated      → FFT style swap on both views
+                                     (each view independently gets a random
+                                      template from a random other client)
+                                     + spatial augmentation applied after FFT
+
+    The foreground mask is saved before FFT and re-applied after
+    reconstruction so that NormSingleROI always operates on the correct
+    palm ROI pixels only.
     """
-    def __init__(self, samples, img_side=128):
-        self.samples     = samples
-        self.label2idxs  = defaultdict(list)
+    def __init__(self, samples, img_side=128,
+                 style_bank=None, client_id=None, beta=0.15):
+        self.samples    = samples
+        self.img_side   = img_side
+        self.style_bank = style_bank or {}
+        self.client_id  = client_id
+        self.beta       = beta
+        self.other_ids  = [cid for cid in self.style_bank
+                           if cid != client_id] if self.style_bank else []
+        self.use_fft    = bool(self.other_ids)
+
+        self.label2idxs = defaultdict(list)
         for i, (_, lab) in enumerate(samples):
             self.label2idxs[lab].append(i)
 
-        self.transform = T.Compose([
-            T.Resize((img_side, img_side)),
+        # spatial augmentation — applied to every image
+        self.spatial_aug = T.RandomChoice([
+            T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+            T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+            T.RandomPerspective(distortion_scale=0.15, p=1.0),
             T.RandomChoice([
-                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
-                T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
-                T.RandomPerspective(distortion_scale=0.15, p=1.0),
-                T.RandomChoice([
-                    T.RandomRotation(10, expand=False,
-                                     center=(int(0.5*img_side), 0)),
-                    T.RandomRotation(10, expand=False,
-                                     center=(0, int(0.5*img_side))),
-                ]),
+                T.RandomRotation(10, expand=False,
+                                 center=(int(0.5*img_side), 0)),
+                T.RandomRotation(10, expand=False,
+                                 center=(0, int(0.5*img_side))),
             ]),
+        ])
+
+        self.to_tensor = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+        # no T.Resize in to_tensor_fft — _load_np already resizes
+        self.to_tensor_fft = T.Compose([
             T.ToTensor(),
             NormSingleROI(outchannels=1),
         ])
 
     def __len__(self): return len(self.samples)
+
+    def _load_np(self, path):
+        """Load, resize, return float32 in [0, 1]."""
+        img = Image.open(path).convert("L").resize(
+            (self.img_side, self.img_side), Image.BILINEAR)
+        return np.array(img, dtype=np.float32) / 255.0
+
+    def _augment_image(self, path):
+        """
+        Load one image and apply the configured augmentation.
+        Returns a normalised tensor.
+        """
+        if self.use_fft:
+            img_np  = self._load_np(path)
+            fg_mask = img_np > 0
+
+            rand_client   = random.choice(self.other_ids)
+            rand_template = random.choice(self.style_bank[rand_client])
+            img_np = apply_style_template(img_np, rand_template, self.beta)
+            img_np[~fg_mask] = 0.0   # restore background zeros
+
+            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
+            pil = self.spatial_aug(pil)
+            return self.to_tensor_fft(pil)
+        else:
+            img = Image.open(path).convert("L")
+            img = self.spatial_aug(img)
+            return self.to_tensor(img)
 
     def __getitem__(self, idx):
         path1, label = self.samples[idx]
@@ -156,8 +211,9 @@ class PairedDataset(Dataset):
         while idx2 == idx and len(idxs) > 1:
             idx2 = random.choice(idxs)
         path2, _ = self.samples[idx2]
-        img1 = self.transform(Image.open(path1).convert("L"))
-        img2 = self.transform(Image.open(path2).convert("L"))
+
+        img1 = self._augment_image(path1)
+        img2 = self._augment_image(path2)
         return [img1, img2], label
 
 
