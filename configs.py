@@ -17,7 +17,7 @@ CONFIG = {
     "dataset"          : "xjtu",
 
     # ── Model selection ────────────────────────────────────────
-    "model"            : "compnet",  # "compnet" | "ccnet"
+    "model"            : "ccnet",  # "compnet" | "ccnet"
 
     # ── Paths ──────────────────────────────────────────────────
     # CASIA-MS
