@@ -22,7 +22,7 @@ from configs  import CONFIG
 from models   import build_model
 from datasets import (PalmDataset, AugmentedDataset,
                       PairedDataset, FFTAugmentedDataset,
-                      build_federated_splits)
+                      get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
                       train_compnet_epoch, train_ccnet_epoch)
 
@@ -123,9 +123,17 @@ class FLClient:
                 dataset = AugmentedDataset(self.train_samples, img_side)
 
         elif model_name == "ccnet":
-            # CCNet always uses paired images for SupConLoss
-            # FFT augmentation for CCNet can be added as a future extension
-            dataset = PairedDataset(self.train_samples, img_side)
+            # CCNet uses paired images for SupConLoss.
+            # When use_fft_aug=True, FFT style swap is applied independently
+            # to each of the two paired views; spatial aug is always applied.
+            # When use_fft_aug=False, spatial aug only (same as before).
+            dataset = PairedDataset(
+                samples    = self.train_samples,
+                img_side   = img_side,
+                style_bank = style_bank if self.cfg["use_fft_aug"] else {},
+                client_id  = self.client_id,
+                beta       = self.cfg["fft_beta"],
+            )
 
         else:
             raise ValueError(f"Unknown model: '{self.cfg['model']}'")
@@ -274,7 +282,8 @@ def main():
     os.makedirs(base_dir, exist_ok=True)
 
     print(f"\n{'='*62}")
-    print(f"  Federated Learning — Palmprint (CASIA-MS)")
+    print(f"  Federated Learning — Palmprint")
+    print(f"  Dataset  : {cfg['dataset'].upper()}")
     print(f"  Protocol : Open-Set, Non-Shared-ID, Cross-Domain")
     print(f"  Model    : {cfg['model'].upper()}")
     print(f"  Device   : {device}")
@@ -288,31 +297,36 @@ def main():
     print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
     print(f"{'='*62}\n")
 
+    # resolve dataset- and model-specific paths
+    dataset   = cfg["dataset"].strip().lower()
+    model_name = cfg["model"].strip().lower()
+    splits_path       = cfg["splits_path"].format(dataset=dataset)
+    init_weights_path = cfg["init_weights_path"].format(
+                            dataset=dataset, model=model_name)
+
     # ── Step 0a: load or build data splits ────────────────────────────────
-    # Saved on first run; reloaded on subsequent runs so that both
+    # Saved on first run and reloaded on subsequent runs so that both
     # augmented and baseline experiments use identical splits.
-    splits_path = cfg["splits_path"]
+    # Path is dataset-specific so CASIA-MS and XJTU never share splits.
     os.makedirs(os.path.dirname(splits_path), exist_ok=True)
 
     if os.path.exists(splits_path):
         print(f"Loading existing data splits from: {splits_path}")
         with open(splits_path, "rb") as f:
             splits = pickle.load(f)
-        client_data, gallery_samples, probe_samples, test_label_map, spectra = splits
+        client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
         print("  Splits loaded.")
     else:
-        print("Building federated data splits …")
-        splits = build_federated_splits(
-            cfg["data_root"], cfg["n_ids"], cfg["k_test"],
-            cfg["gallery_ratio"], seed=seed)
+        print(f"Building federated data splits for {cfg['dataset'].upper()} …")
+        splits = get_federated_splits(cfg, seed=seed)
         with open(splits_path, "wb") as f:
             pickle.dump(splits, f)
         print(f"  Splits saved to: {splits_path}")
-        client_data, gallery_samples, probe_samples, test_label_map, spectra = splits
+        client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
 
     num_classes = client_data[0]["num_classes"]   # same for all clients (min_ids)
     n_clients   = len(client_data)
-    print(f"\n  Clients        : {n_clients}  ({spectra})")
+    print(f"\n  Clients        : {n_clients}  ({domain_names})")
     print(f"  IDs per client : {num_classes}")
     print(f"  Test  classes  : {len(test_label_map)}")
     print(f"  Gallery        : {len(gallery_samples)}  "
@@ -337,9 +351,9 @@ def main():
         ))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
-    # Path is model-specific — CompNet and CCNet never share weight files.
-    init_weights_path = cfg["init_weights_path"].format(model=cfg["model"])
-    
+    # Both runs start from identical weights so any performance difference
+    # is solely attributable to the augmentation strategy.
+    # Path is dataset- and model-specific — they never share weight files.
     if os.path.exists(init_weights_path):
         print(f"\nLoading existing initial weights from: {init_weights_path}")
         init_state = torch.load(init_weights_path, map_location=device)
@@ -444,6 +458,7 @@ def main():
     # ── Final reporting ───────────────────────────────────────────────────
     print(f"\n{'='*62}")
     print(f"  FL COMPLETE — {cfg['n_rounds']} rounds")
+    print(f"  Dataset            : {cfg['dataset'].upper()}")
     print(f"  Model              : {cfg['model'].upper()}")
     print(f"  Final Global EER   : {g_eer*100:.4f}%")
     print(f"  Final Global Rank-1: {g_rank1:.2f}%")
