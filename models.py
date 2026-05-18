@@ -343,6 +343,71 @@ class CCNet(nn.Module):
         return F.normalize(self.fc1(self.fc(x)), p=2, dim=1)
 
 
+
+# ══════════════════════════════════════════════════════════════
+#  DINOV2
+# ══════════════════════════════════════════════════════════════
+
+class DINOBackbone(nn.Module):
+    """
+    DINOv2 ViT-S/14 backbone with selective unfreezing.
+    All parameters are frozen except blocks 10 and 11 of the ViT,
+    which are fine-tuned to adapt to palmprint recognition.
+    forward() returns the L2-normalised CLS token (384-d).
+    Requires: torch.hub access to facebookresearch/dinov2
+    """
+    EMBED_DIM = 384
+
+    def __init__(self):
+        super().__init__()
+        backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
+                                  verbose=False)
+        for name, p in backbone.named_parameters():
+            p.requires_grad = False
+            if "blocks.10" in name or "blocks.11" in name:
+                p.requires_grad = True
+        self.backbone = backbone
+
+    def forward(self, x):
+        """Returns L2-normalised 384-d CLS token."""
+        out = self.backbone.forward_features(x)
+        cls = out["x_norm_clstoken"]
+        return F.normalize(cls, p=2, dim=1)
+
+
+class DINOv2Model(nn.Module):
+    """
+    DINOv2 FL model = DINOBackbone + ArcFace.
+
+    Interface is identical to CompNet:
+      forward(x, y)    → logits             used during training
+      get_embedding(x) → L2-normalised 384-d CLS token  used at evaluation
+
+    Same augmentation policy as CompNet (AugmentedDataset / FFTAugmentedDataset
+    with grayscale=False — RGB ImageNet-normalised input).
+
+    Weight sharing in FL:
+      backbone.* → shared via FedAvg
+      arc.*      → kept local (client-specific identity prototypes)
+
+    Input: RGB 224×224 with ImageNet normalisation.
+    """
+    def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30):
+        super().__init__()
+        self.backbone = DINOBackbone()
+        self.arc      = ArcMarginProduct(DINOBackbone.EMBED_DIM, num_classes,
+                                         s=arcface_s, m=arcface_m)
+
+    def forward(self, x, y=None):
+        emb = self.backbone(x)      # [B, 384] L2-normalised
+        return self.arc(emb, y)     # [B, num_classes] logits
+
+    @torch.no_grad()
+    def get_embedding(self, x):
+        """L2-normalised 384-d CLS embedding for cosine matching."""
+        return self.backbone(x)
+
+
 # ══════════════════════════════════════════════════════════════
 #  MODEL FACTORY
 # ══════════════════════════════════════════════════════════════
@@ -358,7 +423,7 @@ def build_model(cfg, num_classes):
 
     Returns
     -------
-    model : nn.Module  (CompNet or CCNet)
+    model : nn.Module  (CompNet | CCNet | DINOv2Model)
     """
     name = cfg["model"].strip().lower()
     if name == "compnet":
@@ -377,6 +442,12 @@ def build_model(cfg, num_classes):
             arcface_s    = cfg["arcface_s"],
             arcface_m    = cfg["arcface_m"],
         )
+    elif name == "dinov2":
+        return DINOv2Model(
+            num_classes = num_classes,
+            arcface_s   = cfg.get("dino_scale",  16.0),
+            arcface_m   = cfg.get("dino_margin",  0.30),
+        )
     else:
         raise ValueError(f"Unknown model: '{cfg['model']}'. "
-                         f"Choose 'compnet' or 'ccnet'.")
+                         f"Choose 'compnet', 'ccnet', or 'dinov2'.")
