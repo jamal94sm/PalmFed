@@ -2,20 +2,39 @@
 #  configs.py — single source of truth for all hyperparameters
 # ==============================================================
 
+# XJTU domain definitions — 4 clients, one per (smartphone, lighting) pair
+XJTU_VARIATIONS = [
+    ("iPhone", "Flash"),
+    ("iPhone", "Nature"),
+    ("huawei", "Flash"),
+    ("huawei", "Nature"),
+]
+
 CONFIG = {
+    # ── Dataset selection ──────────────────────────────────────
+    # "casiams" : 6 clients, one per spectral band
+    # "xjtu"    : 4 clients, one per (smartphone, lighting) domain
+    "dataset"          : "casiams",
+
     # ── Model selection ────────────────────────────────────────
-    "model"            : "ccnet",  # "compnet" | "ccnet"
+    "model"            : "compnet",  # "compnet" | "ccnet"
 
     # ── Paths ──────────────────────────────────────────────────
+    # CASIA-MS
     "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    # XJTU  (only used when dataset="xjtu")
+    "xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",
+
     "base_results_dir" : "./rst_fedavg_casiams",
 
     # ── Fair comparison: shared splits and init weights ────────
     # Both runs (use_fft_aug=True and False) must load from the
     # same files so that data splits and starting weights are
     # identical. Generated automatically on the first run.
-    "splits_path"      : "./rst_fedavg_casiams/splits.pkl",
-    "init_weights_path": "./rst_fedavg_casiams/init_weights_{model}.pth",
+    # {dataset} and {model} are filled in at runtime so each
+    # combination gets its own file.
+    "splits_path"      : "./rst_fedavg_{dataset}/splits.pkl",
+    "init_weights_path": "./rst_fedavg_{dataset}/init_weights_{model}.pth",
 
     # ── Dataset ────────────────────────────────────────────────
     "n_ids"            : 200,    # number of identities to sample
@@ -23,12 +42,12 @@ CONFIG = {
     "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
     # ── FFT style augmentation ─────────────────────────────────
-    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
+    "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
     "use_fft_aug"      : False,  # True → FFT style augmentation | False → standard training
 
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 15,    # R: total communication rounds
+    "n_rounds"         : 100,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── CompNet hyperparameters ────────────────────────────────
