@@ -47,7 +47,7 @@ CONFIG = {
     "use_fft_aug"      : False,  # True → FFT style augmentation | False → standard training
 
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 30,    # R: total communication rounds
+    "n_rounds"         : 16,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── CompNet hyperparameters ────────────────────────────────
