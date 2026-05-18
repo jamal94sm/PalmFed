@@ -15,7 +15,7 @@ CONFIG = {
     # same files so that data splits and starting weights are
     # identical. Generated automatically on the first run.
     "splits_path"      : "./rst_fedavg_casiams/splits.pkl",
-    "init_weights_path": "./rst_fedavg_casiams/init_weights.pth",
+    "init_weights_path": "./rst_fedavg_casiams/init_weights_{model}.pth",
 
     # ── Dataset ────────────────────────────────────────────────
     "n_ids"            : 200,    # number of identities to sample
