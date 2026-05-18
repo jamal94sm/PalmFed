@@ -397,21 +397,27 @@ class AugmentedDataset(Dataset):
         return self.transform(Image.open(path).convert("L")), label
 
 
-
 class FFTAugmentedDataset(Dataset):
     """
-    Training dataset with FFT style augmentation.
+    Training dataset with FFT style augmentation + spatial augmentation.
 
     For each original sample x_i, M-1 synthetic copies are produced by
     replacing its low-frequency amplitude with a randomly chosen template
     from a randomly chosen other client's style bank.
 
     Index layout: indices [i*M .. i*M+M-1] all correspond to sample i.
-      aug_idx == 0  → original (no augmentation, always included)
-      aug_idx >= 1  → synthetic (FFT style swap from a random other client)
+      aug_idx == 0  → original + spatial augmentation
+      aug_idx >= 1  → FFT style swap + spatial augmentation
 
-    FIX: T.Resize removed from self.transform — images are already resized
-    to img_side in _load_np(), so applying Resize again is redundant.
+    Notes
+    ─────
+    • T.Resize is absent from self.transform — _load_np already resizes.
+    • Spatial augmentation is applied to ALL samples (original and synthetic)
+      so both augmentation modes are on equal footing.
+    • After FFT reconstruction, the background (originally zero-padded) gains
+      small non-zero residuals from floating-point arithmetic. The foreground
+      mask is saved before FFT and re-applied afterwards so that NormSingleROI
+      computes correct per-ROI statistics on foreground pixels only.
     """
 
     def __init__(self, samples, style_bank, client_id, M, beta, img_side):
@@ -423,8 +429,22 @@ class FFTAugmentedDataset(Dataset):
         self.img_side   = img_side
         # a client never borrows its own style (no domain shift otherwise)
         self.other_ids  = [cid for cid in style_bank if cid != client_id]
-        # no T.Resize here — _load_np already resizes
-        self.transform  = T.Compose([
+
+        # spatial augmentation applied to every sample after FFT processing
+        self.spatial_aug = T.RandomChoice([
+            T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+            T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+            T.RandomPerspective(distortion_scale=0.15, p=1.0),
+            T.RandomChoice([
+                T.RandomRotation(10, expand=False,
+                                 center=(int(0.5 * img_side), 0)),
+                T.RandomRotation(10, expand=False,
+                                 center=(0, int(0.5 * img_side))),
+            ]),
+        ])
+
+        # no T.Resize — _load_np already resizes to img_side
+        self.to_tensor = T.Compose([
             T.ToTensor(),
             NormSingleROI(outchannels=1),
         ])
@@ -439,8 +459,10 @@ class FFTAugmentedDataset(Dataset):
         return np.array(img, dtype=np.float32) / 255.0
 
     def _to_tensor(self, img_np):
+        """Convert numpy array → spatially augmented PIL → normalised tensor."""
         pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
-        return self.transform(pil)
+        pil = self.spatial_aug(pil)   # spatial augmentation applied here
+        return self.to_tensor(pil)
 
     def __getitem__(self, idx):
         sample_idx = idx // self.M   # which original sample
@@ -450,12 +472,22 @@ class FFTAugmentedDataset(Dataset):
         img_np = self._load_np(path)
 
         if aug_idx == 0 or not self.other_ids:
+            # original sample with spatial augmentation only
             return self._to_tensor(img_np), label
 
-        # pick a random client (not self) and a random template from it
+        # save foreground mask before FFT — background must stay zero
+        # so NormSingleROI computes statistics on palm ROI pixels only
+        fg_mask = img_np > 0
+
+        # FFT style swap: replace low-freq amplitude with donor template
         rand_client   = random.choice(self.other_ids)
         rand_template = random.choice(self.style_bank[rand_client])
         img_syn       = apply_style_template(img_np, rand_template, self.beta)
+
+        # re-apply foreground mask — inverse FFT leaves small non-zero
+        # residuals in background pixels which corrupt NormSingleROI
+        img_syn[~fg_mask] = 0.0
+
         return self._to_tensor(img_syn), label
 
 
