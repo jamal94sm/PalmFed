@@ -86,13 +86,22 @@ class PalmDataset(Dataset):
 class AugmentedDataset(Dataset):
     """
     Training dataset with standard spatial/photometric augmentation.
-    Used as the baseline (use_fft_aug=False) for CompNet training so
-    that the baseline is not disadvantaged by unaugmented data.
-    Returns a single (augmented_image, label) per sample.
+    Used as the baseline (use_fft_aug=False) for all models so that
+    the baseline is not disadvantaged by unaugmented data.
+
+    Parameters
+    ----------
+    grayscale : bool
+        True  → grayscale NormSingleROI normalisation (CompNet, CCNet)
+        False → RGB 3-channel ImageNet normalisation (DINOv2)
+                Images are loaded as grayscale and replicated to 3 channels,
+                which is correct since palmprint ROIs are single-channel.
     """
-    def __init__(self, samples, img_side=128):
-        self.samples = samples
-        self.transform = T.Compose([
+    def __init__(self, samples, img_side=128, grayscale=True):
+        self.samples   = samples
+        self.grayscale = grayscale
+
+        self.aug_transform = T.Compose([
             T.Resize((img_side, img_side)),
             T.RandomChoice([
                 T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
@@ -105,15 +114,27 @@ class AugmentedDataset(Dataset):
                                      center=(0, int(0.5*img_side))),
                 ]),
             ]),
-            T.ToTensor(),
-            NormSingleROI(outchannels=1),
         ])
+
+        # normalisation differs by model family
+        if grayscale:
+            self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
+        else:
+            self.norm = T.Compose([
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std =[0.229, 0.224, 0.225]),
+            ])
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        return self.transform(Image.open(path).convert("L")), label
+        img = Image.open(path).convert("L")   # always augment on grayscale
+        img = self.aug_transform(img)
+        if not self.grayscale:
+            img = img.convert("RGB")           # replicate channel for DINOv2
+        return self.norm(img), label
 
 
 class PairedDataset(Dataset):
@@ -239,13 +260,15 @@ class FFTAugmentedDataset(Dataset):
       (inverse FFT leaves small non-zero residuals in background).
     """
 
-    def __init__(self, samples, style_bank, client_id, M, beta, img_side):
+    def __init__(self, samples, style_bank, client_id, M, beta, img_side,
+                 grayscale=True):
         self.samples    = samples
         self.style_bank = style_bank   # {client_id: [amp_array, ...]}
         self.client_id  = client_id
         self.M          = M
         self.beta       = beta
         self.img_side   = img_side
+        self.grayscale  = grayscale
         # a client never borrows its own style (no domain shift otherwise)
         self.other_ids  = [cid for cid in style_bank if cid != client_id]
 
@@ -263,10 +286,15 @@ class FFTAugmentedDataset(Dataset):
         ])
 
         # no T.Resize — _load_np already resizes to img_side
-        self.to_tensor = T.Compose([
-            T.ToTensor(),
-            NormSingleROI(outchannels=1),
-        ])
+        # normalisation differs by model family
+        if grayscale:
+            self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
+        else:
+            self.norm = T.Compose([
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std =[0.229, 0.224, 0.225]),
+            ])
 
     def __len__(self):
         return len(self.samples) * self.M
@@ -278,10 +306,13 @@ class FFTAugmentedDataset(Dataset):
         return np.array(img, dtype=np.float32) / 255.0
 
     def _to_tensor(self, img_np):
-        """numpy → spatially augmented PIL → normalised tensor."""
+        """numpy (grayscale) → spatially augmented PIL → normalised tensor.
+        Converts to RGB for DINOv2 (grayscale channel replicated to 3)."""
         pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
         pil = self.spatial_aug(pil)
-        return self.to_tensor(pil)
+        if not self.grayscale:
+            pil = pil.convert("RGB")   # replicate channel for DINOv2
+        return self.norm(pil)
 
     def __getitem__(self, idx):
         sample_idx = idx // self.M   # which original sample
@@ -615,3 +646,40 @@ def get_federated_splits(cfg, seed=42):
         raise ValueError(
             f"Unknown dataset: '{cfg['dataset']}'. "
             f"Choose 'casiams' or 'xjtu'.")
+
+
+
+# ══════════════════════════════════════════════════════════════
+#  DINOV2 EVALUATION DATASET  (RGB + ImageNet normalisation)
+# ══════════════════════════════════════════════════════════════
+# DINOv2 training uses AugmentedDataset / FFTAugmentedDataset with
+# grayscale=False — same augmentation policy as CompNet.  Only the
+# gallery/probe evaluation loader needs a dedicated class because it
+# must convert the grayscale palmprint to RGB and apply ImageNet norm.
+
+def _dino_eval_transform(img_side=224):
+    """Eval transform for DINOv2: resize + RGB + ImageNet norm."""
+    return T.Compose([
+        T.Resize((img_side, img_side)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std =[0.229, 0.224, 0.225]),
+    ])
+
+
+class EvalDatasetDINO(Dataset):
+    """
+    Evaluation dataset for DINOv2 gallery/probe sets.
+    No augmentation — resize + ImageNet norm only.
+    Grayscale palmprint images are replicated to 3 channels via
+    convert("RGB") to match the ImageNet-pretrained backbone's input.
+    """
+    def __init__(self, samples, img_side=224):
+        self.samples   = samples
+        self.transform = _dino_eval_transform(img_side)
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        return self.transform(Image.open(path).convert("RGB")), label
