@@ -37,7 +37,7 @@ CONFIG = {
     "init_weights_path": "./rst_fedavg_{dataset}/init_weights_{model}.pth",
 
     # ── Dataset ────────────────────────────────────────────────
-    "n_ids"            : 192,    # number of identities to sample
+    "n_ids"            : 200,    # number of identities to sample
     "k_test"           : 0.20,   # fraction of IDs allocated to test set
     "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
