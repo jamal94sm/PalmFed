@@ -22,9 +22,21 @@ from configs  import CONFIG
 from models   import build_model
 from datasets import (PalmDataset, AugmentedDataset,
                       PairedDataset, FFTAugmentedDataset,
+                      EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
                       train_compnet_epoch, train_ccnet_epoch)
+
+
+def make_eval_dataset(samples, cfg):
+    """
+    Return the correct evaluation dataset for the configured model.
+    DINOv2 uses RGB 224×224 with ImageNet normalisation.
+    CompNet and CCNet use grayscale 128×128 with NormSingleROI.
+    """
+    if cfg["model"].strip().lower() == "dinov2":
+        return EvalDatasetDINO(samples, cfg.get("dino_img_side", 224))
+    return PalmDataset(samples, cfg["img_side"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -33,28 +45,31 @@ from utils    import (extract_style_template, evaluate_model,
 
 class FLClient:
     """
-    One federated learning client — owns one spectral domain with
+    One federated learning client — owns one spectral/domain domain with
     a disjoint subset of training identities.
 
     Model selection
     ───────────────
       cfg["model"] == "compnet" → CompNet, trained with train_compnet_epoch
+                                  (grayscale 128×128, ArcFace + CE)
       cfg["model"] == "ccnet"   → CCNet,   trained with train_ccnet_epoch
-                                  (uses PairedDataset; returns paired images)
+                                  (grayscale 128×128, ArcFace + CE + SupCon)
+      cfg["model"] == "dinov2"  → DINOv2,  trained with train_compnet_epoch
+                                  (same single-image forward interface)
+                                  (RGB 224×224, 4-view, ArcFace + CE + SupCon)
+                                  FFT augmentation not applied — grayscale
+                                  style templates are incompatible with the
+                                  RGB ImageNet-normalised backbone.
 
     Weight sharing
     ──────────────
-      Only backbone parameters are shared via FedAvg.
-      The ArcFace head (arc.*) is kept local — it encodes client-specific
-      identity prototypes that are semantically different across clients
-      even though the weight shapes are identical.
+      Backbone and projection head parameters are shared via FedAvg.
+      arc.* is kept local — client-specific identity prototypes.
 
     Optimiser
     ─────────
-      Adam with constant lr — recreated each round since the model
-      resets to the global backbone checkpoint at the start of every round.
-      Carrying over momentum from a previous starting point would be
-      meaningless and potentially harmful.
+      Adam (CompNet/CCNet) or AdamW (DINOv2) with constant lr — recreated
+      each round since the model resets to the global backbone each round.
     """
 
     def __init__(self, client_id, spectrum, train_samples, label_map,
@@ -100,16 +115,23 @@ class FLClient:
         Train local model for local_epochs epochs using the appropriate
         dataset and training function for the configured model.
 
-        CompNet: AugmentedDataset or FFTAugmentedDataset + train_compnet_epoch
-        CCNet  : PairedDataset                           + train_ccnet_epoch
+        CompNet and DINOv2:
+          Same augmentation policy — AugmentedDataset (spatial) or
+          FFTAugmentedDataset (FFT + spatial). DINOv2 passes grayscale=False
+          so images are converted to RGB with ImageNet norm after augmentation.
+        CCNet:
+          PairedDataset (two same-identity views) with optional FFT per view.
 
         DataLoader workers are seeded deterministically per (round, client_id)
         so that shuffling order is identical between augmented and baseline runs.
         """
         model_name = self.cfg["model"].strip().lower()
-        img_side   = self.cfg["img_side"]
+        # DINOv2 uses 224×224 RGB; CompNet/CCNet use 128×128 grayscale
+        is_dino   = model_name == "dinov2"
+        img_side  = self.cfg.get("dino_img_side", 224) if is_dino else self.cfg["img_side"]
+        grayscale = not is_dino
 
-        if model_name == "compnet":
+        if model_name in ("compnet", "dinov2"):
             if self.cfg["use_fft_aug"] and style_bank and M > 1:
                 dataset = FFTAugmentedDataset(
                     samples    = self.train_samples,
@@ -118,15 +140,17 @@ class FLClient:
                     M          = M,
                     beta       = self.cfg["fft_beta"],
                     img_side   = img_side,
+                    grayscale  = grayscale,
                 )
             else:
-                dataset = AugmentedDataset(self.train_samples, img_side)
+                dataset = AugmentedDataset(self.train_samples, img_side,
+                                           grayscale=grayscale)
 
         elif model_name == "ccnet":
             # CCNet uses paired images for SupConLoss.
             # When use_fft_aug=True, FFT style swap is applied independently
             # to each of the two paired views; spatial aug is always applied.
-            # When use_fft_aug=False, spatial aug only (same as before).
+            # When use_fft_aug=False, spatial aug only.
             dataset = PairedDataset(
                 samples    = self.train_samples,
                 img_side   = img_side,
@@ -153,13 +177,19 @@ class FLClient:
             ),
         )
 
-        # constant lr — no scheduler (model resets to global weights each round)
-        optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
         criterion = nn.CrossEntropyLoss()
+        # DINOv2 uses AdamW (better for transformer fine-tuning); others use Adam
+        if is_dino:
+            optimizer = optim.AdamW(
+                self.model.parameters(), lr=self.cfg["lr"],
+                weight_decay=self.cfg.get("dino_weight_decay", 1e-4))
+        else:
+            optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
 
         avg_loss, accuracy = 0.0, 0.0
         for _ in range(local_epochs):
-            if model_name == "compnet":
+            if model_name in ("compnet", "dinov2"):
+                # DINOv2Model.forward() returns just logits — same as CompNet
                 avg_loss, accuracy = train_compnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device)
             elif model_name == "ccnet":
@@ -180,8 +210,15 @@ class FLClient:
         Safe to share — captures only global style/illumination, not identity info.
         Always called regardless of use_fft_aug to keep random state identical
         between augmented and baseline runs.
+        Returns one amplitude array per training sample, or empty list for DINOv2
+        (grayscale FFT templates are incompatible with RGB DINOv2 inputs).
         Returns one amplitude array per training sample.
         """
+        if self.cfg["model"].strip().lower() == "dinov2":
+            print(f"  Client {self.client_id} [{self.spectrum}] "
+                  f"— DINOv2: skipping FFT template extraction (RGB model)")
+            return []
+
         templates = []
         img_side  = self.cfg["img_side"]
         for path, _ in self.train_samples:
@@ -216,14 +253,14 @@ class FLServer:
         self.global_model = build_model(cfg, num_classes).to(device)
 
         self.gallery_loader = DataLoader(
-            PalmDataset(gallery_samples, cfg["img_side"]),
+            make_eval_dataset(gallery_samples, cfg),
             batch_size  = cfg["batch_size"],
             shuffle     = False,
             num_workers = cfg["num_workers"],
             pin_memory  = True,
         )
         self.probe_loader = DataLoader(
-            PalmDataset(probe_samples, cfg["img_side"]),
+            make_eval_dataset(probe_samples, cfg),
             batch_size  = cfg["batch_size"],
             shuffle     = False,
             num_workers = cfg["num_workers"],
@@ -382,21 +419,28 @@ def main():
     # ── Step 0e: extract style templates (always, both runs) ──────────────
     # Always extracted regardless of use_fft_aug — ensures identical random
     # state consumption in both runs. Passed to local_train only when enabled.
+    # DINOv2 skips extraction (incompatible RGB/grayscale) and uses empty bank.
     print("\nExtracting style templates from all clients …")
     style_bank_full = {
         client.client_id: client.extract_style_templates()
         for client in clients
     }
     total = sum(len(v) for v in style_bank_full.values())
-    print(f"  Style bank ready — {total} templates "
-          f"across {len(style_bank_full)} clients")
-
-    style_bank = style_bank_full if cfg["use_fft_aug"] else {}
-    if cfg["use_fft_aug"]:
+    is_dinov2 = cfg["model"].strip().lower() == "dinov2"
+    if total > 0:
+        print(f"  Style bank ready — {total} templates "
+              f"across {len(style_bank_full)} clients")
+    if cfg["use_fft_aug"] and not is_dinov2:
+        style_bank = style_bank_full
         print("  FFT augmentation ENABLED — style bank will be used.\n")
     else:
-        print("  FFT augmentation DISABLED — style bank extracted "
-              "but not used during training.\n")
+        style_bank = {}
+        if is_dinov2:
+            print("  DINOv2: FFT augmentation not supported — "
+                  "using 4-view RGB training instead.\n")
+        else:
+            print("  FFT augmentation DISABLED — style bank extracted "
+                  "but not used during training.\n")
 
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
