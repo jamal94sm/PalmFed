@@ -17,7 +17,7 @@ CONFIG = {
     "dataset"          : "casiams",
 
     # ── Model selection ────────────────────────────────────────
-    "model"            : "ccnet",  # "compnet" | "ccnet"
+    "model"            : "compnet",  # "compnet" | "ccnet"
 
     # ── Paths ──────────────────────────────────────────────────
     # CASIA-MS
@@ -42,12 +42,12 @@ CONFIG = {
     "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
     # ── FFT style augmentation ─────────────────────────────────
-    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
+    "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
-    "use_fft_aug"      : True,  # True → FFT style augmentation | False → standard training
+    "use_fft_aug"      : False,  # True → FFT style augmentation | False → standard training
 
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 15,    # R: total communication rounds
+    "n_rounds"         : 100,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── CompNet hyperparameters ────────────────────────────────
@@ -63,6 +63,16 @@ CONFIG = {
     "ce_weight"        : 0.8,    # CrossEntropy loss weight
     "con_weight"       : 0.2,    # SupConLoss weight
     "temperature"      : 0.07,   # SupConLoss temperature
+
+    # ── DINOv2-specific hyperparameters ───────────────────────
+    # (only used when model="dinov2")
+    # DINOv2 uses RGB 224×224 with ImageNet normalisation.
+    # Blocks 10 and 11 of ViT-S/14 are unfrozen; the rest are frozen.
+    "dino_img_side"    : 224,    # DINOv2 input resolution
+    "dino_lamb"        : 0.2,    # SupConLoss weight (arc + lamb*supcon)
+    "dino_weight_decay": 1e-4,   # AdamW weight decay
+    "dino_margin"      : 0.3,    # ArcFace angular margin
+    "dino_scale"       : 16,     # ArcFace scale (lower than CompNet — RGB embeds)
 
     # ── Training ───────────────────────────────────────────────
     "batch_size"       : 32,
