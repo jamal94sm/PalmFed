@@ -42,7 +42,7 @@ CONFIG = {
     "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
     # ── FFT style augmentation ─────────────────────────────────
-    "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
+    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
     "use_fft_aug"      : False,  # True → FFT style augmentation | False → standard training
 
