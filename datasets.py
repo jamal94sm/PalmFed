@@ -11,9 +11,16 @@
 #    PairedDataset        — paired same-class images (CCNet training)
 #    FFTAugmentedDataset  — FFT style swap + spatial aug (CompNet FFT run)
 #
-#  Data loading:
+#  Data loading — CASIA-MS:
 #    parse_casia_ms
-#    build_federated_splits
+#    build_federated_splits          (6 clients, one per spectrum)
+#
+#  Data loading — XJTU:
+#    parse_xjtu_domains
+#    build_federated_splits_xjtu     (4 clients, one per device+lighting)
+#
+#  Dispatcher:
+#    get_federated_splits            (calls correct builder from cfg["dataset"])
 # ==============================================================
 
 import os
@@ -27,6 +34,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms as T
 
 from utils import extract_style_template, apply_style_template
+from configs import XJTU_VARIATIONS
 
 
 # ══════════════════════════════════════════════════════════════
@@ -363,3 +371,191 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
     print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
     return (client_data, gallery_samples, probe_samples,
             test_label_map, spectra)
+
+# ══════════════════════════════════════════════════════════════
+#  XJTU DATA LOADING & PARTITIONING
+# ══════════════════════════════════════════════════════════════
+
+def parse_xjtu_domains(data_root, seed=42):
+    """
+    Scan data_root for XJTU-UP images organised by (device, condition) domain.
+
+    Directory layout:
+      data_root/
+        {device}/
+          {condition}/
+            {L|R}_{subjectID}/
+              *.jpg
+
+    Domain keys: (device, condition) tuples from XJTU_VARIATIONS, e.g.
+      ("iPhone", "Flash"), ("iPhone", "Nature"),
+      ("huawei", "Flash"), ("huawei", "Nature")
+
+    Identity key: the folder name, e.g. "L_001" or "R_002".
+
+    Returns
+    -------
+    data : dict  (device, condition) → identity → [path, ...]
+           Same structure as parse_casia_ms (spectrum → identity → paths)
+           so build_federated_splits_xjtu mirrors build_federated_splits.
+    """
+    IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
+    data     = defaultdict(lambda: defaultdict(list))
+
+    for device, condition in XJTU_VARIATIONS:
+        var_dir = os.path.join(data_root, device, condition)
+        if not os.path.isdir(var_dir):
+            print(f"  [XJTU] WARNING: {var_dir} not found")
+            continue
+        for id_folder in sorted(os.listdir(var_dir)):
+            id_dir = os.path.join(var_dir, id_folder)
+            if not os.path.isdir(id_dir):
+                continue
+            parts = id_folder.split("_")
+            if len(parts) < 2 or parts[0].upper() not in ("L", "R"):
+                continue
+            for fname in sorted(os.listdir(id_dir)):
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+                    continue
+                data[(device, condition)][id_folder].append(
+                    os.path.join(id_dir, fname))
+
+    for domain in XJTU_VARIATIONS:
+        n_ids  = len(data[domain])
+        n_imgs = sum(len(v) for v in data[domain].values())
+        print(f"  [XJTU] {domain[0]}/{domain[1]:6s}  "
+              f"IDs={n_ids}  images={n_imgs}")
+    return data
+
+
+def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42):
+    """
+    Build per-client training sets and a fixed shared gallery/probe test set
+    for the XJTU dataset.
+
+    Protocol: Open-Set, Non-Shared-ID, Cross-Domain.
+      - 4 clients, one per (device, condition) domain.
+      - n_ids identities are sampled from those common to all 4 domains.
+      - k_test fraction → test IDs; remainder → train IDs (fully disjoint).
+      - Train IDs are partitioned round-robin across clients (no overlap).
+      - All clients are trimmed to min partition size (equalised).
+      - Test IDs across all 4 domains form the gallery/probe split.
+
+    Returns
+    -------
+    client_data     : list of dicts {domain_label, train_samples,
+                                     label_map, num_classes}
+    gallery_samples : list of (path, label)
+    probe_samples   : list of (path, label)
+    test_label_map  : {identity: int}
+    domain_labels   : list of "{device}/{condition}" strings (client names)
+    """
+    rng  = random.Random(seed)
+    data = parse_xjtu_domains(data_root, seed=seed)
+
+    domains       = XJTU_VARIATIONS          # 4 (device, condition) tuples
+    n_clients     = len(domains)
+    domain_labels = [f"{d}/{c}" for d, c in domains]
+
+    # identities present in ALL 4 domains
+    common_ids = set(data[domains[0]].keys())
+    for dom in domains[1:]:
+        common_ids &= set(data[dom].keys())
+    common_ids = sorted(common_ids)
+    print(f"  Identities common to all {n_clients} domains: {len(common_ids)}")
+
+    if len(common_ids) < n_ids:
+        raise ValueError(
+            f"Requested {n_ids} IDs but only {len(common_ids)} "
+            f"are present in all {n_clients} XJTU domains.")
+
+    # sample n_ids, shuffle, split into test / train ID sets
+    selected_ids   = sorted(rng.sample(common_ids, n_ids))
+    rng.shuffle(selected_ids)
+    n_test_ids     = max(1, round(n_ids * k_test))
+    test_ids       = sorted(selected_ids[:n_test_ids])
+    train_ids      = sorted(selected_ids[n_test_ids:])
+    test_label_map = {ident: i for i, ident in enumerate(test_ids)}
+
+    print(f"  Total train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
+
+    # round-robin partition — no two clients share a train ID
+    rng.shuffle(train_ids)
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(train_ids):
+        client_id_splits[i % n_clients].append(ident)
+
+    # equalise by trimming to smallest partition
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+    n_dropped = len(train_ids) - min_ids * n_clients
+    print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
+
+    # build per-client local train sets — each has its own label space
+    client_data = []
+    for i, dom in enumerate(domains):
+        c_ids       = client_id_splits[i]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+        local_train = [
+            (p, c_label_map[ident])
+            for ident in c_ids
+            for p in data[dom][ident]
+        ]
+        client_data.append({
+            "spectrum"      : domain_labels[i],   # reuse "spectrum" key for compatibility
+            "domain"        : dom,                # (device, condition) tuple
+            "train_samples" : local_train,
+            "label_map"     : c_label_map,
+            "num_classes"   : min_ids,
+        })
+        print(f"    Client {i} [{domain_labels[i]:>14}]  "
+              f"train IDs={min_ids}  samples={len(local_train)}")
+
+    # fixed global test set — split within each (domain, identity) pair
+    gallery_samples, probe_samples = [], []
+    for dom in domains:
+        for ident in test_ids:
+            paths = list(data[dom][ident])
+            rng.shuffle(paths)
+            label = test_label_map[ident]
+            n_gal = max(1, round(len(paths) * gallery_ratio))
+            for p in paths[:n_gal]:
+                gallery_samples.append((p, label))
+            for p in paths[n_gal:]:
+                probe_samples.append((p, label))
+
+    print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, domain_labels)
+
+
+# ══════════════════════════════════════════════════════════════
+#  DISPATCHER
+# ══════════════════════════════════════════════════════════════
+
+def get_federated_splits(cfg, seed=42):
+    """
+    Call the correct split builder based on cfg["dataset"].
+
+    Returns the same 5-tuple for both datasets:
+      (client_data, gallery_samples, probe_samples, test_label_map, domain_names)
+
+    This uniform interface means main.py needs no dataset-specific branching
+    beyond this single call.
+    """
+    dataset = cfg["dataset"].strip().lower()
+
+    if dataset == "casiams":
+        return build_federated_splits(
+            cfg["data_root"], cfg["n_ids"], cfg["k_test"],
+            cfg["gallery_ratio"], seed=seed)
+
+    elif dataset == "xjtu":
+        return build_federated_splits_xjtu(
+            cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
+            cfg["gallery_ratio"], seed=seed)
+
+    else:
+        raise ValueError(
+            f"Unknown dataset: '{cfg['dataset']}'. "
+            f"Choose 'casiams' or 'xjtu'.")
