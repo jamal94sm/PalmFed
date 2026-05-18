@@ -337,10 +337,9 @@ def main():
         ))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
-    # Both runs start from identical weights so any performance difference
-    # is solely attributable to the augmentation strategy.
-    init_weights_path = cfg["init_weights_path"]
-
+    # Path is model-specific — CompNet and CCNet never share weight files.
+    init_weights_path = cfg["init_weights_path"].format(model=cfg["model"])
+    
     if os.path.exists(init_weights_path):
         print(f"\nLoading existing initial weights from: {init_weights_path}")
         init_state = torch.load(init_weights_path, map_location=device)
