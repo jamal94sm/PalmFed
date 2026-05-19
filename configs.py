@@ -45,7 +45,7 @@ CONFIG = {
     "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
     "use_fft_aug"      : True,  # True → FFT style augmentation | False → normal augmentation 
-    "use_mixed_aug"  : True,   # True → spatial first, FFT second (overrides use_fft_aug)
+    "use_mixed_aug"  : False,   # True → spatial first, FFT second (overrides use_fft_aug)
     "mixed_aug_round": 15,     # round at which to switch from spatial → FFT
     
     # ── FL hyperparameters ─────────────────────────────────────
