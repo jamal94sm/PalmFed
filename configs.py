@@ -44,8 +44,8 @@ CONFIG = {
     # ── FFT style augmentation ─────────────────────────────────
     "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
-    "use_fft_aug"      : False,  # True → FFT style augmentation | False → normal augmentation 
-    "use_mixed_aug"    : False,   # True → spatial first, FFT second (overrides use_fft_aug)
+    "use_fft_aug"      : True,  # True → FFT style augmentation | False → normal augmentation 
+    "use_mixed_aug"    : True,   # True → spatial first, FFT second (overrides use_fft_aug)
     "mixed_aug_round"  : 15,     # round at which to switch from spatial → FFT
     
     # ── FL hyperparameters ─────────────────────────────────────
@@ -56,8 +56,8 @@ CONFIG = {
     # Minimises distance between embeddings and their class centres,
     # enforcing intra-class compactness. Centres are kept local per
     # client and carried over across rounds.
-    "use_center_loss"    : False,  # True → add CenterLoss to training
-    "center_loss_weight" : 0.003,  # λ — small so CE/ArcFace still dominates
+    "use_center_loss"    : True,  # True → add CenterLoss to training
+    "center_loss_weight" : 0.03,  # λ — small so CE/ArcFace still dominates
     "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
 
     
