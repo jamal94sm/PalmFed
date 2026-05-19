@@ -52,6 +52,15 @@ CONFIG = {
     "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
+    # ── Center Loss ────────────────────────────────────────────
+    # Minimises distance between embeddings and their class centres,
+    # enforcing intra-class compactness. Centres are kept local per
+    # client and carried over across rounds.
+    "use_center_loss"    : False,  # True → add CenterLoss to training
+    "center_loss_weight" : 0.003,  # λ — small so CE/ArcFace still dominates
+    "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
+
+    
     # ── CompNet hyperparameters ────────────────────────────────
     "img_side"         : 128,
     "embedding_dim"    : 512,    # CompNet FC output dim
