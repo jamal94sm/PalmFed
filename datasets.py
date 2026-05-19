@@ -130,10 +130,11 @@ class AugmentedDataset(Dataset):
 
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        img = Image.open(path).convert("L")   # always augment on grayscale
+        if self.grayscale:
+            img = Image.open(path).convert("L")   # grayscale for CompNet/CCNet
+        else:
+            img = Image.open(path).convert("RGB") # RGB for DINOv2 — augment in RGB
         img = self.aug_transform(img)
-        if not self.grayscale:
-            img = img.convert("RGB")           # replicate channel for DINOv2
         return self.norm(img), label
 
 
@@ -300,18 +301,22 @@ class FFTAugmentedDataset(Dataset):
         return len(self.samples) * self.M
 
     def _load_np(self, path):
-        """Load, resize, return float32 in [0, 1]."""
-        img = Image.open(path).convert("L").resize(
+        """Load and resize. Returns float32 in [0, 1].
+        Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2."""
+        mode = "L" if self.grayscale else "RGB"
+        img  = Image.open(path).convert(mode).resize(
             (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
     def _to_tensor(self, img_np):
-        """numpy (grayscale) → spatially augmented PIL → normalised tensor.
-        Converts to RGB for DINOv2 (grayscale channel replicated to 3)."""
-        pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
+        """numpy array → PIL → spatial aug → normalised tensor.
+        For grayscale (H, W): mode="L", NormSingleROI.
+        For RGB (H, W, 3): mode="RGB", ImageNet norm — no conversion needed."""
+        if self.grayscale:
+            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
+        else:
+            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="RGB")
         pil = self.spatial_aug(pil)
-        if not self.grayscale:
-            pil = pil.convert("RGB")   # replicate channel for DINOv2
         return self.norm(pil)
 
     def __getitem__(self, idx):
@@ -324,15 +329,11 @@ class FFTAugmentedDataset(Dataset):
         if aug_idx == 0 or not self.other_ids:
             return self._to_tensor(img_np), label
 
-        # save foreground mask before FFT
-        fg_mask = img_np > 0
-
+        # FFT style swap — foreground mask and per-channel handling are
+        # both dealt with inside apply_style_template based on img_np.ndim
         rand_client   = random.choice(self.other_ids)
         rand_template = random.choice(self.style_bank[rand_client])
         img_syn       = apply_style_template(img_np, rand_template, self.beta)
-
-        # re-apply foreground mask
-        img_syn[~fg_mask] = 0.0
         return self._to_tensor(img_syn), label
 
 
