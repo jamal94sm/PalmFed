@@ -49,7 +49,7 @@ CONFIG = {
     "mixed_aug_round"  : 15,     # round at which to switch from spatial → FFT
     
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 30,    # R: total communication rounds
+    "n_rounds"         : 50,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── Center Loss ────────────────────────────────────────────
