@@ -25,7 +25,8 @@ from datasets import (PalmDataset, AugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
-                      train_compnet_epoch, train_ccnet_epoch)
+                      train_compnet_epoch, train_ccnet_epoch,
+                      CenterLoss)
 
 
 def make_eval_dataset(samples, cfg):
@@ -64,11 +65,15 @@ class FLClient:
     ──────────────
       Backbone parameters are shared via FedAvg.
       arc.* is kept local — client-specific identity prototypes.
+      center_loss.centres is kept local — per-client class centres
+      that are carried over across rounds (never sent to server).
 
     Optimiser
     ─────────
       Adam (CompNet/CCNet) or AdamW (DINOv2) with constant lr — recreated
       each round since the model resets to the global backbone each round.
+      CenterLoss has its own SGD optimiser (center_loss_lr) that persists
+      across rounds so centres accumulate knowledge across FL rounds.
 
     Augmentation modes (controlled by active_style_bank passed per round)
     ──────────────────────────────────────────────────────────────────────
@@ -83,7 +88,7 @@ class FLClient:
                  num_classes, cfg, device):
         self.client_id     = client_id
         self.spectrum      = spectrum
-        self.train_samples = train_samples   # raw list of (path, label)
+        self.train_samples = train_samples
         self.label_map     = label_map
         self.num_classes   = num_classes
         self.cfg           = cfg
@@ -92,8 +97,28 @@ class FLClient:
         # local model — backbone overwritten each round from global weights
         self.model = build_model(cfg, num_classes).to(device)
 
+        # center loss — kept local, never shared, persists across rounds
+        # embed_dim depends on model: 512 (CompNet), 2048 (CCNet), 384 (DINOv2)
+        model_name = cfg["model"].strip().lower()
+        if cfg.get("use_center_loss", False):
+            if model_name == "compnet":
+                embed_dim = cfg["embedding_dim"]
+            elif model_name == "ccnet":
+                embed_dim = 2048
+            else:  # dinov2
+                embed_dim = 384
+            self.center_loss = CenterLoss(num_classes, embed_dim, device)
+            self.center_optimizer = optim.SGD(
+                self.center_loss.parameters(),
+                lr=cfg.get("center_loss_lr", 0.5))
+        else:
+            self.center_loss      = None
+            self.center_optimizer = None
+
         print(f"  Client {client_id} [{spectrum}] [{cfg['model']}] — "
-              f"train IDs: {num_classes}  samples: {len(train_samples)}")
+              f"train IDs: {num_classes}  samples: {len(train_samples)}"
+              + (f"  [CenterLoss λ={cfg.get('center_loss_weight', 0.003)}]"
+                 if cfg.get("use_center_loss", False) else ""))
 
     # ── weight management ───────────────────────────────────────────────────
 
@@ -183,17 +208,27 @@ class FLClient:
         else:
             optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
 
+        lambda_c = self.cfg.get("center_loss_weight", 0.0) \
+                   if self.cfg.get("use_center_loss", False) else 0.0
+
         avg_loss, accuracy = 0.0, 0.0
         for _ in range(local_epochs):
             if model_name in ("compnet", "dinov2"):
                 avg_loss, accuracy = train_compnet_epoch(
-                    self.model, train_loader, criterion, optimizer, self.device)
+                    self.model, train_loader, criterion, optimizer, self.device,
+                    center_loss      = self.center_loss,
+                    center_optimizer = self.center_optimizer,
+                    lambda_center    = lambda_c,
+                )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device,
-                    ce_weight   = self.cfg.get("ce_weight",   0.8),
-                    con_weight  = self.cfg.get("con_weight",  0.2),
-                    temperature = self.cfg.get("temperature", 0.07),
+                    ce_weight        = self.cfg.get("ce_weight",   0.8),
+                    con_weight       = self.cfg.get("con_weight",  0.2),
+                    temperature      = self.cfg.get("temperature", 0.07),
+                    center_loss      = self.center_loss,
+                    center_optimizer = self.center_optimizer,
+                    lambda_center    = lambda_c,
                 )
 
         return avg_loss, accuracy
