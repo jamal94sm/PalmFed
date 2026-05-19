@@ -45,7 +45,7 @@ def make_eval_dataset(samples, cfg):
 
 class FLClient:
     """
-    One federated learning client — owns one spectral/domain domain with
+    One federated learning client — owns one spectral/domain with
     a disjoint subset of training identities.
 
     Model selection
@@ -56,20 +56,27 @@ class FLClient:
                                   (grayscale 128×128, ArcFace + CE + SupCon)
       cfg["model"] == "dinov2"  → DINOv2,  trained with train_compnet_epoch
                                   (same single-image forward interface)
-                                  (RGB 224×224, 4-view, ArcFace + CE + SupCon)
                                   FFT augmentation not applied — grayscale
                                   style templates are incompatible with the
                                   RGB ImageNet-normalised backbone.
 
     Weight sharing
     ──────────────
-      Backbone and projection head parameters are shared via FedAvg.
+      Backbone parameters are shared via FedAvg.
       arc.* is kept local — client-specific identity prototypes.
 
     Optimiser
     ─────────
       Adam (CompNet/CCNet) or AdamW (DINOv2) with constant lr — recreated
       each round since the model resets to the global backbone each round.
+
+    Augmentation modes (controlled by active_style_bank passed per round)
+    ──────────────────────────────────────────────────────────────────────
+      active_style_bank empty  → AugmentedDataset (spatial aug only)
+      active_style_bank filled → FFTAugmentedDataset (FFT + spatial aug)
+      Mixed mode is handled in main() by passing an empty bank for the
+      first mixed_aug_round rounds and a full bank thereafter — local_train
+      needs no special logic for it.
     """
 
     def __init__(self, client_id, spectrum, train_samples, label_map,
@@ -110,32 +117,26 @@ class FLClient:
 
     # ── local training ──────────────────────────────────────────────────────
 
-    def local_train(self, local_epochs, style_bank, M, rnd):
+    def local_train(self, local_epochs, active_style_bank, M, rnd):
         """
-        Train local model for local_epochs epochs using the appropriate
-        dataset and training function for the configured model.
+        Train local model for local_epochs epochs.
 
-        CompNet and DINOv2:
-          Same augmentation policy — AugmentedDataset (spatial) or
-          FFTAugmentedDataset (FFT + spatial). DINOv2 passes grayscale=False
-          so images are converted to RGB with ImageNet norm after augmentation.
-        CCNet:
-          PairedDataset (two same-identity views) with optional FFT per view.
-
-        DataLoader workers are seeded deterministically per (round, client_id)
-        so that shuffling order is identical between augmented and baseline runs.
+        active_style_bank controls augmentation mode this round:
+          {}       → AugmentedDataset  (spatial aug only)
+          non-empty → FFTAugmentedDataset (FFT + spatial aug)
+        This means mixed-mode is transparent here — main() simply passes
+        an empty bank for spatial rounds and a full bank for FFT rounds.
         """
         model_name = self.cfg["model"].strip().lower()
-        # DINOv2 uses 224×224 RGB; CompNet/CCNet use 128×128 grayscale
-        is_dino   = model_name == "dinov2"
-        img_side  = self.cfg.get("dino_img_side", 224) if is_dino else self.cfg["img_side"]
-        grayscale = not is_dino
+        is_dino    = model_name == "dinov2"
+        img_side   = self.cfg.get("dino_img_side", 224) if is_dino else self.cfg["img_side"]
+        grayscale  = not is_dino
 
         if model_name in ("compnet", "dinov2"):
-            if self.cfg["use_fft_aug"] and style_bank and M > 1:
+            if active_style_bank and M > 1:
                 dataset = FFTAugmentedDataset(
                     samples    = self.train_samples,
-                    style_bank = style_bank,
+                    style_bank = active_style_bank,
                     client_id  = self.client_id,
                     M          = M,
                     beta       = self.cfg["fft_beta"],
@@ -147,14 +148,11 @@ class FLClient:
                                            grayscale=grayscale)
 
         elif model_name == "ccnet":
-            # CCNet uses paired images for SupConLoss.
-            # When use_fft_aug=True, FFT style swap is applied independently
-            # to each of the two paired views; spatial aug is always applied.
-            # When use_fft_aug=False, spatial aug only.
+            # For CCNet, active_style_bank controls FFT on paired views too.
             dataset = PairedDataset(
                 samples    = self.train_samples,
                 img_side   = img_side,
-                style_bank = style_bank if self.cfg["use_fft_aug"] else {},
+                style_bank = active_style_bank,
                 client_id  = self.client_id,
                 beta       = self.cfg["fft_beta"],
             )
@@ -162,7 +160,7 @@ class FLClient:
         else:
             raise ValueError(f"Unknown model: '{self.cfg['model']}'")
 
-        # deterministic seed per (round, client) — same across both runs
+        # deterministic seed per (round, client) — same across all aug runs
         round_seed = self.cfg["random_seed"] + rnd * 1000 + self.client_id
         train_loader = DataLoader(
             dataset,
@@ -178,7 +176,6 @@ class FLClient:
         )
 
         criterion = nn.CrossEntropyLoss()
-        # DINOv2 uses AdamW (better for transformer fine-tuning); others use Adam
         if is_dino:
             optimizer = optim.AdamW(
                 self.model.parameters(), lr=self.cfg["lr"],
@@ -189,7 +186,6 @@ class FLClient:
         avg_loss, accuracy = 0.0, 0.0
         for _ in range(local_epochs):
             if model_name in ("compnet", "dinov2"):
-                # DINOv2Model.forward() returns just logits — same as CompNet
                 avg_loss, accuracy = train_compnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device)
             elif model_name == "ccnet":
@@ -207,12 +203,9 @@ class FLClient:
     def extract_style_templates(self):
         """
         Extract low-frequency amplitude templates from all local training samples.
-        Safe to share — captures only global style/illumination, not identity info.
-        Always called regardless of use_fft_aug to keep random state identical
-        between augmented and baseline runs.
-        Returns one amplitude array per training sample, or empty list for DINOv2
-        (grayscale FFT templates are incompatible with RGB DINOv2 inputs).
-        Returns one amplitude array per training sample.
+        Always called regardless of augmentation mode to keep random state
+        identical across all three runs (spatial, FFT, mixed).
+        Returns empty list for DINOv2 (grayscale templates incompatible with RGB).
         """
         if self.cfg["model"].strip().lower() == "dinov2":
             print(f"  Client {self.client_id} [{self.spectrum}] "
@@ -241,9 +234,6 @@ class FLServer:
       - maintains the global model
       - performs FedAvg aggregation on backbone weights only
       - evaluates the global model on the shared gallery/probe test sets
-
-    The global model's ArcFace head is never used during evaluation
-    (get_embedding() bypasses it). Its weights are a placeholder only.
     """
 
     def __init__(self, num_classes, gallery_samples, probe_samples, cfg, device):
@@ -271,20 +261,13 @@ class FLServer:
               f"gallery: {len(gallery_samples)}  probe: {len(probe_samples)}")
 
     def get_global_weights(self):
-        """
-        Return backbone weights only (arc.* excluded).
-        Clients only load backbone keys, so sending arc.* is unnecessary.
-        """
+        """Return backbone weights only (arc.* excluded)."""
         return {k: v.cpu().clone()
                 for k, v in self.global_model.state_dict().items()
                 if not k.startswith("arc.")}
 
     def aggregate(self, client_weight_dicts):
-        """
-        FedAvg on backbone parameters only.
-        ArcFace head is client-specific (different identity prototypes per client)
-        and must never be shared or averaged.
-        """
+        """FedAvg on backbone parameters only — arc.* never aggregated."""
         n        = len(client_weight_dicts)
         avg_dict = {}
         for key in client_weight_dicts[0].keys():
@@ -305,6 +288,63 @@ class FLServer:
 
 
 # ══════════════════════════════════════════════════════════════
+#  AUGMENTATION MODE HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def resolve_aug_mode(cfg):
+    """
+    Determine the augmentation mode from config flags.
+
+    Priority: use_mixed_aug > use_fft_aug > spatial-only (default).
+
+    Returns
+    -------
+    mode : str   "spatial" | "fft" | "mixed"
+    """
+    if cfg.get("use_mixed_aug", False):
+        return "mixed"
+    if cfg.get("use_fft_aug", False):
+        return "fft"
+    return "spatial"
+
+
+def get_active_style_bank(style_bank_full, rnd, cfg, is_dinov2):
+    """
+    Return the style bank to pass to local_train for this round.
+
+    spatial → always {}
+    fft     → always style_bank_full
+    mixed   → {} for rounds 1..mixed_aug_round
+               style_bank_full for rounds mixed_aug_round+1..n_rounds
+
+    DINOv2 always gets {} regardless of mode.
+    """
+    if is_dinov2:
+        return {}
+    mode = resolve_aug_mode(cfg)
+    if mode == "spatial":
+        return {}
+    if mode == "fft":
+        return style_bank_full
+    # mixed
+    switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
+    return style_bank_full if rnd > switch else {}
+
+
+def aug_mode_label(rnd, cfg, is_dinov2):
+    """Short label for console log — shows which mode is active this round."""
+    if is_dinov2:
+        return "Spatial(RGB)"
+    mode = resolve_aug_mode(cfg)
+    if mode == "spatial":
+        return "Spatial"
+    if mode == "fft":
+        return "FFT"
+    switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
+    return "FFT" if rnd > switch else "Spatial"
+
+
+# ══════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 
@@ -314,10 +354,13 @@ def main():
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-    device   = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    base_dir = cfg["base_results_dir"]
+    device     = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    base_dir   = cfg["base_results_dir"]
+    is_dinov2  = cfg["model"].strip().lower() == "dinov2"
+    aug_mode   = resolve_aug_mode(cfg)
     os.makedirs(base_dir, exist_ok=True)
 
+    # ── header ───────────────────────────────────────────────────────────────
     print(f"\n{'='*62}")
     print(f"  Federated Learning — Palmprint")
     print(f"  Dataset  : {cfg['dataset'].upper()}")
@@ -329,24 +372,26 @@ def main():
     print(f"  IDs : {cfg['n_ids']}   "
           f"Test ID ratio : {cfg['k_test']*100:.0f}%   "
           f"Gallery ratio : {cfg['gallery_ratio']*100:.0f}%")
-    print(f"  FFT Aug  : {cfg['use_fft_aug']}   "
-          f"M={cfg['M']}   beta={cfg['fft_beta']}")
+    if aug_mode == "mixed":
+        switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
+        print(f"  Aug mode : MIXED  "
+              f"(Spatial rounds 1–{switch}, FFT rounds {switch+1}–{cfg['n_rounds']})"
+              f"  M={cfg['M']}  beta={cfg['fft_beta']}")
+    else:
+        print(f"  Aug mode : {aug_mode.upper()}   "
+              f"M={cfg['M']}   beta={cfg['fft_beta']}")
     print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
     print(f"{'='*62}\n")
 
-    # resolve dataset- and model-specific paths
-    dataset   = cfg["dataset"].strip().lower()
-    model_name = cfg["model"].strip().lower()
-    splits_path       = cfg["splits_path"].format(dataset=dataset)
+    # ── resolve dataset- and model-specific paths ─────────────────────────
+    dataset_key   = cfg["dataset"].strip().lower()
+    model_key     = cfg["model"].strip().lower()
+    splits_path       = cfg["splits_path"].format(dataset=dataset_key)
     init_weights_path = cfg["init_weights_path"].format(
-                            dataset=dataset, model=model_name)
+                            dataset=dataset_key, model=model_key)
 
     # ── Step 0a: load or build data splits ────────────────────────────────
-    # Saved on first run and reloaded on subsequent runs so that both
-    # augmented and baseline experiments use identical splits.
-    # Path is dataset-specific so CASIA-MS and XJTU never share splits.
     os.makedirs(os.path.dirname(splits_path), exist_ok=True)
-
     if os.path.exists(splits_path):
         print(f"Loading existing data splits from: {splits_path}")
         with open(splits_path, "rb") as f:
@@ -361,7 +406,7 @@ def main():
         print(f"  Splits saved to: {splits_path}")
         client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
 
-    num_classes = client_data[0]["num_classes"]   # same for all clients (min_ids)
+    num_classes = client_data[0]["num_classes"]
     n_clients   = len(client_data)
     print(f"\n  Clients        : {n_clients}  ({domain_names})")
     print(f"  IDs per client : {num_classes}")
@@ -388,9 +433,6 @@ def main():
         ))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
-    # Both runs start from identical weights so any performance difference
-    # is solely attributable to the augmentation strategy.
-    # Path is dataset- and model-specific — they never share weight files.
     if os.path.exists(init_weights_path):
         print(f"\nLoading existing initial weights from: {init_weights_path}")
         init_state = torch.load(init_weights_path, map_location=device)
@@ -414,62 +456,67 @@ def main():
     client_header = "\t".join(
         f"Client{i}_EER(%)\tClient{i}_Rank1(%)" for i in range(n_clients))
     with open(results_path, "w") as f:
-        f.write(f"Round\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
+        f.write(f"Round\tAug_Mode\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
 
-    # ── Step 0e: extract style templates (always, both runs) ──────────────
-    # Always extracted regardless of use_fft_aug — ensures identical random
-    # state consumption in both runs. Passed to local_train only when enabled.
-    # DINOv2 skips extraction (incompatible RGB/grayscale) and uses empty bank.
+    # ── Step 0e: extract style templates (always, all runs) ───────────────
+    # Always extracted regardless of aug mode so that the random state
+    # consumed by extraction is identical across spatial, FFT, and mixed runs.
+    # DINOv2 returns empty lists — templates are incompatible with RGB input.
     print("\nExtracting style templates from all clients …")
     style_bank_full = {
         client.client_id: client.extract_style_templates()
         for client in clients
     }
     total = sum(len(v) for v in style_bank_full.values())
-    is_dinov2 = cfg["model"].strip().lower() == "dinov2"
     if total > 0:
         print(f"  Style bank ready — {total} templates "
               f"across {len(style_bank_full)} clients")
-    if cfg["use_fft_aug"] and not is_dinov2:
-        style_bank = style_bank_full
+    if aug_mode == "mixed" and not is_dinov2:
+        switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
+        print(f"  Mixed augmentation: Spatial rounds 1–{switch}, "
+              f"FFT rounds {switch+1}–{cfg['n_rounds']}.\n")
+    elif aug_mode == "fft" and not is_dinov2:
         print("  FFT augmentation ENABLED — style bank will be used.\n")
+    elif is_dinov2:
+        print("  DINOv2: FFT augmentation not supported — "
+              "spatial aug (RGB) used throughout.\n")
     else:
-        style_bank = {}
-        if is_dinov2:
-            print("  DINOv2: FFT augmentation not supported — "
-                  "using 4-view RGB training instead.\n")
-        else:
-            print("  FFT augmentation DISABLED — style bank extracted "
-                  "but not used during training.\n")
+        print("  Spatial augmentation only — style bank extracted "
+              "but not used during training.\n")
 
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
     g_eer_0, g_rank1_0 = server.evaluate()
     print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
     with open(results_path, "a") as f:
-        f.write(f"0\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
+        f.write(f"0\tInit\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
                 + "\t".join("-1\t-1" for _ in range(n_clients)) + "\n")
 
-    # pre-initialise so final print is defined even if n_rounds=0
     g_eer, g_rank1 = g_eer_0, g_rank1_0
 
     # ── FL rounds ─────────────────────────────────────────────────────────
     for rnd in range(1, cfg["n_rounds"] + 1):
-        t_start        = time.time()
-        global_weights = server.get_global_weights()   # backbone only
+        t_start = time.time()
+
+        # determine which style bank to pass this round
+        active_style_bank = get_active_style_bank(
+            style_bank_full, rnd, cfg, is_dinov2)
+        mode_label = aug_mode_label(rnd, cfg, is_dinov2)
+
+        global_weights = server.get_global_weights()
         client_weights = []
         client_metrics = []
 
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
-            client.set_weights(global_weights)   # load backbone; keep local arc
+            client.set_weights(global_weights)
             loss, acc = client.local_train(
-                cfg["local_epochs"], style_bank, cfg["M"], rnd)
+                cfg["local_epochs"], active_style_bank, cfg["M"], rnd)
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
                 device)
-            client_weights.append(client.get_weights())   # backbone only
+            client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
                 "spectrum"  : client.spectrum,
@@ -485,11 +532,11 @@ def main():
         elapsed = time.time() - t_start
 
         ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} | "
+        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} [{mode_label}] | "
               f"Global EER={g_eer*100:.4f}%  Rank-1={g_rank1:.2f}%  "
               f"({elapsed:.1f}s)")
         for cm in client_metrics:
-            print(f"  Client {cm['client_id']} [{cm['spectrum']:>6}] | "
+            print(f"  Client {cm['client_id']} [{cm['spectrum']:>14}] | "
                   f"loss={cm['train_loss']:.4f}  acc={cm['train_acc']:.1f}%  "
                   f"EER={cm['eer']*100:.3f}%  R1={cm['rank1']:.1f}%")
 
@@ -497,13 +544,15 @@ def main():
             f"{cm['eer']*100:.4f}\t{cm['rank1']:.2f}"
             for cm in client_metrics)
         with open(results_path, "a") as f:
-            f.write(f"{rnd}\t{g_eer*100:.4f}\t{g_rank1:.2f}\t{client_cols}\n")
+            f.write(f"{rnd}\t{mode_label}\t{g_eer*100:.4f}\t{g_rank1:.2f}"
+                    f"\t{client_cols}\n")
 
     # ── Final reporting ───────────────────────────────────────────────────
     print(f"\n{'='*62}")
     print(f"  FL COMPLETE — {cfg['n_rounds']} rounds")
     print(f"  Dataset            : {cfg['dataset'].upper()}")
     print(f"  Model              : {cfg['model'].upper()}")
+    print(f"  Aug mode           : {aug_mode.upper()}")
     print(f"  Final Global EER   : {g_eer*100:.4f}%")
     print(f"  Final Global Rank-1: {g_rank1:.2f}%")
     print(f"  Results saved to   : {results_path}")
