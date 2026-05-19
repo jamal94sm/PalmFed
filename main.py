@@ -57,9 +57,8 @@ class FLClient:
                                   (grayscale 128×128, ArcFace + CE + SupCon)
       cfg["model"] == "dinov2"  → DINOv2,  trained with train_compnet_epoch
                                   (same single-image forward interface)
-                                  FFT augmentation not applied — grayscale
-                                  style templates are incompatible with the
-                                  RGB ImageNet-normalised backbone.
+                                  Images loaded and augmented as RGB.
+                                  FFT augmentation works per-channel on RGB.
 
     Weight sharing
     ──────────────
@@ -237,25 +236,29 @@ class FLClient:
 
     def extract_style_templates(self):
         """
-        Extract low-frequency amplitude templates from all local training samples.
-        Always called regardless of augmentation mode to keep random state
-        identical across all three runs (spatial, FFT, mixed).
-        Returns empty list for DINOv2 (grayscale templates incompatible with RGB).
+        Extract FFT amplitude templates from all local training samples.
+        Always called regardless of aug mode so random state is identical
+        across spatial, FFT, and mixed runs.
+
+        Grayscale models (CompNet, CCNet): load as L → (H, W) template.
+        DINOv2: load as RGB → (H, W, 3) per-channel template.
+        Both formats are handled by extract_style_template() in utils.py.
         """
-        if self.cfg["model"].strip().lower() == "dinov2":
-            print(f"  Client {self.client_id} [{self.spectrum}] "
-                  f"— DINOv2: skipping FFT template extraction (RGB model)")
-            return []
+        model_name = self.cfg["model"].strip().lower()
+        is_dino    = model_name == "dinov2"
+        img_side   = self.cfg.get("dino_img_side", 224) if is_dino \
+                     else self.cfg["img_side"]
+        mode       = "RGB" if is_dino else "L"
 
         templates = []
-        img_side  = self.cfg["img_side"]
         for path, _ in self.train_samples:
-            img = Image.open(path).convert("L").resize(
+            img    = Image.open(path).convert(mode).resize(
                 (img_side, img_side), Image.BILINEAR)
             img_np = np.array(img, dtype=np.float32) / 255.0
             templates.append(extract_style_template(img_np))
         print(f"  Client {self.client_id} [{self.spectrum}] "
-              f"— extracted {len(templates)} style templates")
+              f"— extracted {len(templates)} {'RGB' if is_dino else 'grayscale'} "
+              f"style templates")
         return templates
 
 
@@ -352,10 +355,9 @@ def get_active_style_bank(style_bank_full, rnd, cfg, is_dinov2):
     mixed   → {} for rounds 1..mixed_aug_round
                style_bank_full for rounds mixed_aug_round+1..n_rounds
 
-    DINOv2 always gets {} regardless of mode.
+    DINOv2 now supports FFT augmentation on RGB images (per-channel FFT),
+    so no special case is needed.
     """
-    if is_dinov2:
-        return {}
     mode = resolve_aug_mode(cfg)
     if mode == "spatial":
         return {}
@@ -368,8 +370,6 @@ def get_active_style_bank(style_bank_full, rnd, cfg, is_dinov2):
 
 def aug_mode_label(rnd, cfg, is_dinov2):
     """Short label for console log — shows which mode is active this round."""
-    if is_dinov2:
-        return "Spatial(RGB)"
     mode = resolve_aug_mode(cfg)
     if mode == "spatial":
         return "Spatial"
@@ -506,15 +506,12 @@ def main():
     if total > 0:
         print(f"  Style bank ready — {total} templates "
               f"across {len(style_bank_full)} clients")
-    if aug_mode == "mixed" and not is_dinov2:
+    if aug_mode == "mixed":
         switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
         print(f"  Mixed augmentation: Spatial rounds 1–{switch}, "
               f"FFT rounds {switch+1}–{cfg['n_rounds']}.\n")
-    elif aug_mode == "fft" and not is_dinov2:
+    elif aug_mode == "fft":
         print("  FFT augmentation ENABLED — style bank will be used.\n")
-    elif is_dinov2:
-        print("  DINOv2: FFT augmentation not supported — "
-              "spatial aug (RGB) used throughout.\n")
     else:
         print("  Spatial augmentation only — style bank extracted "
               "but not used during training.\n")
