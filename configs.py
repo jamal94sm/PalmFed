@@ -56,7 +56,7 @@ CONFIG = {
     # Minimises distance between embeddings and their class centres,
     # enforcing intra-class compactness. Centres are kept local per
     # client and carried over across rounds.
-    "use_center_loss"    : True,  # True → add CenterLoss to training
+    "use_center_loss"    : False,  # True → add CenterLoss to training
     "center_loss_weight" : 1,  # λ — small so CE/ArcFace still dominates
     "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
 
