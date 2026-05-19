@@ -17,7 +17,7 @@ CONFIG = {
     "dataset"          : "casiams",
 
     # ── Model selection ────────────────────────────────────────
-    "model"            : "compnet",  # "compnet" | "ccnet"
+    "model"            : "dinov2",  # "compnet" | "ccnet" | "dinov2"
 
     # ── Paths ──────────────────────────────────────────────────
     # CASIA-MS
