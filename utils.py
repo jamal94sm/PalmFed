@@ -42,64 +42,74 @@ def gaussian_mask(H, W, beta):
 
 def extract_style_template(img_np):
     """
-    Extract the full fftshifted amplitude spectrum of a grayscale image.
-    Shareable style descriptor — captures global illumination and spectral
-    tone but no fine-grained texture or identity information.
-    The full spectrum is always extracted; the Gaussian mask is applied
-    only during augmentation in apply_style_template().
+    Extract fftshifted amplitude spectrum from a grayscale or RGB image.
 
-    Parameters
-    ----------
-    img_np : np.ndarray  (H, W)  float32 in [0, 1]
+    Grayscale (H, W)   → returns (H, W)      amplitude array
+    RGB       (H, W, 3) → returns (H, W, 3)   per-channel amplitude arrays
 
-    Returns
-    -------
-    amp_shifted : np.ndarray  (H, W)  fftshifted amplitude
+    For CompNet/CCNet the input is always (H, W) grayscale.
+    For DINOv2 the input is (H, W, 3) RGB — each channel is processed
+    independently so the style template preserves per-channel illumination.
     """
-    amp = np.abs(np.fft.fft2(img_np))
-    return np.fft.fftshift(amp).astype(np.float32)
+    if img_np.ndim == 2:
+        return np.fft.fftshift(
+            np.abs(np.fft.fft2(img_np))).astype(np.float32)
+    # RGB: process each channel independently
+    return np.stack([
+        np.fft.fftshift(np.abs(np.fft.fft2(img_np[..., c])))
+        for c in range(img_np.shape[2])
+    ], axis=-1).astype(np.float32)
 
 
 def apply_style_template(img_np, amp_template, beta):
     """
-    Swap the low-frequency amplitude of img_np with amp_template using a
+    Swap low-frequency amplitude of img_np with amp_template using a
     Gaussian soft mask. Phase (identity-specific texture) is preserved.
 
-    The foreground mask (img_np > 0) is saved before FFT and re-applied
-    after reconstruction so that NormSingleROI always operates on the
-    correct palm ROI pixels — inverse FFT leaves small non-zero residuals
-    in the background which would corrupt the per-ROI statistics.
+    Grayscale (H, W):
+      Foreground mask (> 0) is saved and restored after synthesis so
+      NormSingleROI always operates on palm ROI pixels only.
+
+    RGB (H, W, 3):
+      Each channel is processed independently. No foreground mask —
+      RGB palmprint images (e.g. XJTU smartphone) have no zero-padded
+      background so masking is not needed.
 
     Parameters
     ----------
-    img_np       : np.ndarray  (H, W)  float32 in [0, 1]
-    amp_template : np.ndarray  (H, W)  fftshifted amplitude from another client
+    img_np       : np.ndarray  (H, W) or (H, W, 3)  float32 in [0, 1]
+    amp_template : np.ndarray  same shape as img_np  fftshifted amplitude
     beta         : float       Gaussian sigma as fraction of min(H, W)
 
     Returns
     -------
-    img_syn : np.ndarray  (H, W)  float32 in [0, 1]
+    img_syn : np.ndarray  same shape as img_np  float32 in [0, 1]
     """
-    H, W  = img_np.shape[:2]
-    mask  = gaussian_mask(H, W, beta)
+    H, W = img_np.shape[:2]
+    mask = gaussian_mask(H, W, beta)
 
-    # preserve foreground mask before FFT — background stays zero after synthesis
-    fg_mask = img_np > 0
+    def _swap_channel(ch, amp_tpl_ch):
+        fft     = np.fft.fft2(ch)
+        amp_s   = np.fft.fftshift(np.abs(fft))
+        pha     = np.angle(fft)
+        amp_syn = (1.0 - mask) * amp_s + mask * amp_tpl_ch
+        amp_syn = np.fft.ifftshift(amp_syn)
+        return np.clip(
+            np.fft.ifft2(amp_syn * np.exp(1j * pha)).real,
+            0.0, 1.0).astype(np.float32)
 
-    fft   = np.fft.fft2(img_np)
-    amp_s = np.fft.fftshift(np.abs(fft))
-    pha   = np.angle(fft)
+    if img_np.ndim == 2:
+        # grayscale — restore foreground mask so NormSingleROI is correct
+        fg_mask = img_np > 0
+        result  = _swap_channel(img_np, amp_template)
+        result[~fg_mask] = 0.0
+        return result
 
-    # soft blend: low-freq from template, high-freq from original
-    amp_syn = (1.0 - mask) * amp_s + mask * amp_template
-    amp_syn = np.fft.ifftshift(amp_syn)
-
-    img_syn = np.fft.ifft2(amp_syn * np.exp(1j * pha)).real
-    img_syn = np.clip(img_syn, 0.0, 1.0).astype(np.float32)
-
-    # re-apply foreground mask so NormSingleROI gets correct per-ROI statistics
-    img_syn[~fg_mask] = 0.0
-    return img_syn
+    # RGB — process per channel, no foreground mask
+    return np.stack([
+        _swap_channel(img_np[..., c], amp_template[..., c])
+        for c in range(img_np.shape[2])
+    ], axis=-1).astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════
