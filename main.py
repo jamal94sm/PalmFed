@@ -162,7 +162,6 @@ class FLClient:
                     samples    = self.train_samples,
                     style_bank = active_style_bank,
                     client_id  = self.client_id,
-                    M          = M,
                     beta       = self.cfg["fft_beta"],
                     img_side   = img_side,
                     grayscale  = grayscale,
@@ -218,6 +217,8 @@ class FLClient:
                     center_loss      = self.center_loss,
                     center_optimizer = self.center_optimizer,
                     lambda_center    = lambda_c,
+                    lambda_con       = self.cfg.get("con_weight",   0.2),
+                    temperature      = self.cfg.get("temperature",  0.07),
                 )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
