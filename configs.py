@@ -54,6 +54,14 @@ CONFIG = {
     "use_mixed_aug"    : True,  # True → spatial first, then FFT (overrides use_fft_aug)
     "mixed_aug_round"  : 15,     # round at which to switch spatial → FFT (mixed mode only)
 
+    # ── Domain distance-aware mixing ───────────────────────────
+    # Only used when use_fft_aug=True or use_mixed_aug=True.
+    "domain_aware_mixing" : True,  # True → distance-based donor selection
+    "prefer_distant_domain": True,  # True → most different domain (max L2)
+                                     # False → most similar domain (min L2)
+    "use_mean_template"   : False,  # True → use donor's mean template
+                                     # False → random sample from donor's bank
+        
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
@@ -79,8 +87,6 @@ CONFIG = {
     "use_center_loss"    : False,  # True → add CenterLoss to training
     "center_loss_weight" : 0.003,  # λ — small so CE/ArcFace still dominates
     "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
-
-    "lambda_style"     : 0.0,    # StyleConsistencyLoss weight (0.0 = disabled)
 
     
     # ── DINOv2-specific hyperparameters ───────────────────────
