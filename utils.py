@@ -273,30 +273,44 @@ class CenterLoss(nn.Module):
 
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
-                        lambda_center=0.0):
+                        lambda_center=0.0, lambda_style=0.0):
     """
     Train CompNet (or DINOv2) for one epoch.
 
-    Loss : CrossEntropyLoss(ArcFace logits)
-         + lambda_center × CenterLoss  (optional)
+    Loss : CrossEntropy(ArcFace, emb_orig)
+         + lambda_style  × StyleConsistencyLoss   (optional)
+         + lambda_center × CenterLoss(emb_orig)   (optional)
 
-    Dataset returns (img, label) — single image per sample.
+    StyleConsistencyLoss:
+      1 - mean_cosine_similarity(emb_orig, emb_aug)
+      Directly enforces that augmented (FFT-styled or spatially-augmented)
+      embeddings stay close to their original counterparts in embedding
+      space. This makes the backbone domain-invariant without requiring
+      positive pairs from the same class in the batch — no NaN risk.
+
+    Dataset returns ([orig, aug], label):
+      AugmentedDataset    → (original, spatially_augmented)
+      FFTAugmentedDataset → (original, fft_augmented)
+
+    ArcFace classification and CenterLoss use orig only.
+    StyleConsistencyLoss uses both orig and aug.
 
     Parameters
     ----------
     model            : CompNet or DINOv2Model
-    loader           : DataLoader yielding (img_tensor, label_tensor)
+    loader           : DataLoader yielding ([orig, aug], label)
     criterion        : nn.CrossEntropyLoss
     optimizer        : torch.optim.Optimizer
     device           : torch.device
     center_loss      : CenterLoss | None
     center_optimizer : torch.optim.SGD | None
-    lambda_center    : float  CenterLoss weight (0 → disabled)
+    lambda_center    : float  CenterLoss weight         (0 → disabled)
+    lambda_style     : float  StyleConsistencyLoss weight (0 → disabled)
 
     Returns
     -------
     avg_loss : float
-    accuracy : float  (classification accuracy in %)
+    accuracy : float  (classification accuracy on orig in %)
     """
     model.train()
     if center_loss is not None:
@@ -305,26 +319,44 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     use_center = (center_loss is not None and
                   center_optimizer is not None and
                   lambda_center > 0.0)
+    use_style  = lambda_style > 0.0
+
+    def _get_emb(imgs):
+        return model._backbone(imgs) if hasattr(model, "_backbone") \
+               else model.backbone(imgs)
+
+    def _get_logits(emb, labels):
+        if hasattr(model, "drop"):
+            return model.arc(model.drop(emb), labels)
+        return model.arc(emb, labels)
 
     running_loss = 0.0; correct = 0; total = 0
 
-    for imgs, labels in loader:
-        imgs, labels = imgs.to(device), labels.to(device)
+    for data, labels in loader:
+        orig   = data[0].to(device)
+        aug    = data[1].to(device)
+        labels = labels.to(device)
 
         optimizer.zero_grad()
         if use_center:
             center_optimizer.zero_grad()
 
+        emb_orig = _get_emb(orig)
+        logits   = _get_logits(emb_orig, labels)
+        loss     = criterion(logits, labels)
+
+        if use_style:
+            emb_aug    = _get_emb(aug)
+            # cosine similarity between orig and augmented embeddings
+            # ranges in [-1, 1]; 1 - sim pushes them together
+            sim  = F.cosine_similarity(
+                F.normalize(emb_orig, p=2, dim=1),
+                F.normalize(emb_aug,  p=2, dim=1),
+                dim=1)
+            loss = loss + lambda_style * (1.0 - sim.mean())
+
         if use_center:
-            emb    = model._backbone(imgs) if hasattr(model, "_backbone") \
-                     else model.backbone(imgs)
-            logits = model.arc(model.drop(emb), labels) if hasattr(model, "drop") \
-                     else model.arc(emb, labels)
-            loss   = criterion(logits, labels) + \
-                     lambda_center * center_loss(emb.detach(), labels)
-        else:
-            logits = model(imgs, labels)
-            loss   = criterion(logits, labels)
+            loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
 
         loss.backward()
         optimizer.step()
@@ -335,9 +367,9 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                     p.grad.data *= 1.0 / (lambda_center + 1e-8)
             center_optimizer.step()
 
-        running_loss += loss.item() * imgs.size(0)
+        running_loss += loss.item() * orig.size(0)
         correct      += logits.argmax(1).eq(labels).sum().item()
-        total        += imgs.size(0)
+        total        += orig.size(0)
 
     return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
 
