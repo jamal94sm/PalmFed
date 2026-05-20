@@ -233,13 +233,14 @@ class FFTAugmentedDataset(Dataset):
     • Foreground mask and per-channel logic live in apply_style_template.
     """
 
-    def __init__(self, samples, style_bank, client_id, beta, img_side,
+    def __init__(self, samples, style_bank, client_id, beta, M, img_side,
              grayscale=True, mean_bank=None,
              prefer_distant=True, use_mean_template=False):
         self.samples    = samples
         self.style_bank = style_bank
         self.client_id  = client_id
         self.beta       = beta
+        self.M          = M 
         self.img_side   = img_side
         self.grayscale  = grayscale
         self.other_ids  = [cid for cid in style_bank if cid != client_id]
@@ -274,7 +275,7 @@ class FFTAugmentedDataset(Dataset):
             ])
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) * self.M
 
     def _load_np(self, path):
         """Load and resize. Returns float32 in [0, 1].
