@@ -255,15 +255,28 @@ class CenterLoss(nn.Module):
 
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
-                        lambda_center=0.0):
+                        lambda_center=0.0, lambda_con=0.0, temperature=0.07):
     """
     Train CompNet (or DINOv2) for one epoch.
 
     Loss : CrossEntropyLoss(ArcFace logits)
+         + lambda_con    × SupConLoss  (optional)
          + lambda_center × CenterLoss  (optional)
 
     Dataset returns (img, label) — single image per sample.
-    ArcFace classification is the sole training signal for the backbone.
+
+    SupConLoss is applied over the full batch using labels to identify
+    positive pairs — no explicit pairing structure required. This works
+    naturally with both dataset modes:
+      AugmentedDataset    : same-identity spatial augmentations are pulled
+                            together across the batch.
+      FFTAugmentedDataset : with M≥2, each batch contains both original and
+                            FFT-augmented copies of the same identity (due to
+                            the M multiplier expanding the dataset); SupConLoss
+                            pulls them together without any special pairing.
+
+    The backbone embedding (before ArcFace) is used for SupConLoss and
+    CenterLoss. ArcFace logits are used for CrossEntropy only.
 
     Parameters
     ----------
@@ -274,7 +287,9 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     device           : torch.device
     center_loss      : CenterLoss | None
     center_optimizer : torch.optim.SGD | None
-    lambda_center    : float  center loss weight (0 → disabled)
+    lambda_center    : float  CenterLoss weight   (0 → disabled)
+    lambda_con       : float  SupConLoss weight   (0 → disabled)
+    temperature      : float  SupConLoss temperature
 
     Returns
     -------
@@ -288,6 +303,21 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     use_center = (center_loss is not None and
                   center_optimizer is not None and
                   lambda_center > 0.0)
+    use_supcon = lambda_con > 0.0
+    if use_supcon:
+        supcon = SupConLoss(temperature=temperature,
+                            base_temperature=temperature)
+
+    # extract backbone embedding — works for both CompNet and DINOv2
+    def _get_emb(imgs):
+        return model._backbone(imgs) if hasattr(model, "_backbone") \
+               else model.backbone(imgs)
+
+    # ArcFace logits from raw embedding
+    def _get_logits(emb, labels):
+        if hasattr(model, "drop"):
+            return model.arc(model.drop(emb), labels)  # CompNet
+        return model.arc(emb, labels)                  # DINOv2
 
     running_loss = 0.0; correct = 0; total = 0
 
@@ -298,13 +328,18 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         if use_center:
             center_optimizer.zero_grad()
 
-        if use_center:
-            emb    = model._backbone(imgs) if hasattr(model, "_backbone") \
-                     else model.backbone(imgs)
-            logits = model.arc(model.drop(emb), labels) if hasattr(model, "drop") \
-                     else model.arc(emb, labels)
-            loss   = criterion(logits, labels) + \
-                     lambda_center * center_loss(emb.detach(), labels)
+        # always extract raw embedding when any auxiliary loss is active
+        if use_supcon or use_center:
+            emb    = _get_emb(imgs)
+            logits = _get_logits(emb, labels)
+            loss   = criterion(logits, labels)
+            if use_supcon:
+                # reshape to [B, 1, D] — SupConLoss uses labels for positives
+                # same-label embeddings (originals + augmented) attract each other
+                emb_n = F.normalize(emb, p=2, dim=1).unsqueeze(1)  # [B, 1, D]
+                loss  = loss + lambda_con * supcon(emb_n, labels)
+            if use_center:
+                loss = loss + lambda_center * center_loss(emb.detach(), labels)
         else:
             logits = model(imgs, labels)
             loss   = criterion(logits, labels)
