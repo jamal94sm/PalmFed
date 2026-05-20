@@ -59,7 +59,7 @@ CONFIG = {
     "domain_aware_mixing" : True,  # True → distance-based donor selection
     "prefer_distant_domain": False,  # True → most different domain (max L2)
                                      # False → most similar domain (min L2)
-    "use_mean_template"   : False,  # True → use donor's mean template
+    "use_mean_template"   : True,  # True → use donor's mean template
                                      # False → random sample from donor's bank
         
     # ── FL hyperparameters ─────────────────────────────────────
