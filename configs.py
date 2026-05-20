@@ -69,7 +69,7 @@ CONFIG = {
     # (only used when model="ccnet")
     "comp_weight"      : 0.8,    # channel vs spatial competition weight
     "ce_weight"        : 0.9,    # CrossEntropy loss weight
-    "con_weight"       : 0.0,    # SupConLoss weight  (CCNet, CompNet, DINOv2)
+    "con_weight"       : 0.1,    # SupConLoss weight  (CCNet, CompNet, DINOv2)
     "temperature"      : 0.07,   # SupConLoss temperature (all models)
 
     # ── Center Loss ────────────────────────────────────────────
@@ -91,7 +91,7 @@ CONFIG = {
     "dino_scale"       : 16,     # ArcFace scale (lower than CompNet — RGB embeds)
 
     # ── Training ───────────────────────────────────────────────
-    "batch_size"       : 32,
+    "batch_size"       : 64,
     "lr"               : 0.001,  # constant lr across all rounds (no scheduler)
 
     # ── Misc ───────────────────────────────────────────────────
