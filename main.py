@@ -162,6 +162,7 @@ class FLClient:
                     samples    = self.train_samples,
                     style_bank = active_style_bank,
                     client_id  = self.client_id,
+                    M          = M,
                     beta       = self.cfg["fft_beta"],
                     img_side   = img_side,
                     grayscale  = grayscale,
