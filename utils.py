@@ -270,31 +270,28 @@ class CenterLoss(nn.Module):
 
 # ══════════════════════════════════════════════════════════════
 #  TRAINING FUNCTIONS  (one epoch per call)
+
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
                         lambda_center=0.0, lambda_con=0.0, temperature=0.07):
     """
     Train CompNet (or DINOv2) for one epoch.
 
-    Loss : CrossEntropy(ArcFace, orig_emb)
-         + lambda_con    × SupConLoss([orig_emb, aug_emb])  (optional)
-         + lambda_center × CenterLoss(orig_emb)             (optional)
+    Loss : CrossEntropyLoss(ArcFace logits)
+         + lambda_con    × SupConLoss  (optional, batch-level)
+         + lambda_center × CenterLoss  (optional)
 
-    Dataset returns ([orig, aug], label):
-      AugmentedDataset    → (original, spatially_augmented)
-      FFTAugmentedDataset → (original, fft_augmented)
+    Dataset returns (img, label) — single image per sample.
 
-    SupConLoss uses the (orig, aug) pair as guaranteed positive views —
-    every sample always has exactly one positive pair so NaN from empty
-    positive sets cannot occur regardless of batch size or class count.
-    SupConLoss input shape: [B, 2, embed_dim].
-
-    ArcFace classification and CenterLoss are applied to orig only.
+    SupConLoss is applied over the full batch using labels to identify
+    positive pairs. A per-batch guard skips the loss when no class has
+    ≥2 samples in the batch (which is common when batch_size < 2 ×
+    num_classes), preventing NaN from empty positive sets.
 
     Parameters
     ----------
     model            : CompNet or DINOv2Model
-    loader           : DataLoader yielding ([orig, aug], label)
+    loader           : DataLoader yielding (img_tensor, label_tensor)
     criterion        : nn.CrossEntropyLoss
     optimizer        : torch.optim.Optimizer
     device           : torch.device
@@ -307,7 +304,7 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     Returns
     -------
     avg_loss : float
-    accuracy : float  (classification accuracy on orig in %)
+    accuracy : float  (classification accuracy in %)
     """
     model.train()
     if center_loss is not None:
@@ -332,27 +329,31 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
 
     running_loss = 0.0; correct = 0; total = 0
 
-    for data, labels in loader:
-        orig   = data[0].to(device)
-        aug    = data[1].to(device)
-        labels = labels.to(device)
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
 
         optimizer.zero_grad()
         if use_center:
             center_optimizer.zero_grad()
 
-        emb_orig = _get_emb(orig)
-        logits   = _get_logits(emb_orig, labels)
-        loss     = criterion(logits, labels)
-
-        if use_supcon:
-            emb_aug = _get_emb(aug)
-            views   = torch.stack([F.normalize(emb_orig, p=2, dim=1),
-                                    F.normalize(emb_aug,  p=2, dim=1)], dim=1)
-            loss    = loss + lambda_con * supcon(views, labels)
-
-        if use_center:
-            loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
+        if use_supcon or use_center:
+            emb    = _get_emb(imgs)
+            logits = _get_logits(emb, labels)
+            loss   = criterion(logits, labels)
+            if use_supcon:
+                # guard: skip if no class has ≥2 samples in this batch
+                # (prevents NaN from mask.sum(1) == 0 in SupConLoss)
+                label_counts  = torch.bincount(
+                    labels, minlength=labels.max().item() + 1)
+                has_positives = (label_counts >= 2).any()
+                if has_positives:
+                    emb_n = F.normalize(emb, p=2, dim=1).unsqueeze(1)  # [B,1,D]
+                    loss  = loss + lambda_con * supcon(emb_n, labels)
+            if use_center:
+                loss = loss + lambda_center * center_loss(emb.detach(), labels)
+        else:
+            logits = model(imgs, labels)
+            loss   = criterion(logits, labels)
 
         loss.backward()
         optimizer.step()
@@ -363,13 +364,11 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                     p.grad.data *= 1.0 / (lambda_center + 1e-8)
             center_optimizer.step()
 
-        running_loss += loss.item() * orig.size(0)
+        running_loss += loss.item() * imgs.size(0)
         correct      += logits.argmax(1).eq(labels).sum().item()
-        total        += orig.size(0)
+        total        += imgs.size(0)
 
     return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
-
-
 
 def train_ccnet_epoch(model, loader, criterion, optimizer, device,
                       ce_weight=0.8, con_weight=0.2, temperature=0.07,
