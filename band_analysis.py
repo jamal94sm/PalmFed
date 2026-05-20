@@ -283,8 +283,7 @@ def analyse_logreg(domain_amps, n_bins, img_side, C=0.1, seed=42):
 
     clf = LogisticRegression(
         C=C, penalty="l1", solver="saga",
-        max_iter=2000, random_state=seed,
-        multi_class="ovr")
+        max_iter=2000, random_state=seed)
     clf.fit(X_scaled, y)
     acc = clf.score(X_scaled, y)
     print(f"  Training accuracy: {acc*100:.1f}%")
