@@ -121,17 +121,28 @@ def apply_style_template(img_np, amp_template, beta):
 def extract_features(model, loader, device):
     """
     Extract L2-normalised embeddings from a DataLoader using model.get_embedding().
-    Compatible with both CompNet and CCNet (both expose get_embedding).
+    Compatible with CompNet, CCNet, and DINOv2 (all expose get_embedding).
+
+    NaN guard: a randomly-initialised model can produce near-zero embedding
+    vectors; after L2 normalisation these become 0/0 = NaN. Any NaN row is
+    replaced with a zero vector so downstream evaluation remains numerically
+    stable (zero vectors produce a cosine similarity of 0 with all gallery
+    entries, which is a safe neutral score).
 
     Returns
     -------
-    feats  : np.ndarray  [N, embed_dim]
+    feats  : np.ndarray  [N, embed_dim]  — NaN-free
     labels : np.ndarray  [N]
     """
     model.eval()
     feats, labels = [], []
     for imgs, labs in loader:
-        feats.append(model.get_embedding(imgs.to(device)).cpu().numpy())
+        batch_feats = model.get_embedding(imgs.to(device)).cpu().numpy()
+        # replace any NaN row (zero-norm embedding after L2 norm) with zeros
+        nan_rows = np.isnan(batch_feats).any(axis=1)
+        if nan_rows.any():
+            batch_feats[nan_rows] = 0.0
+        feats.append(batch_feats)
         labels.append(labs.numpy())
     return np.concatenate(feats), np.concatenate(labels)
 
@@ -141,6 +152,7 @@ def compute_eer(scores_array):
     EER from an Nx2 array of [cosine_score, label(+1/-1)].
     Higher cosine score = more similar (genuine pairs score near +1).
     Returns EER as a float in [0, 1].
+    Returns 1.0 (worst case) if scores contain NaN or classes are missing.
     """
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
@@ -148,14 +160,19 @@ def compute_eer(scores_array):
         return 1.0
     y = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
     s = np.concatenate([ins, outs])
-    fpr, tpr, _ = roc_curve(y, s, pos_label=1)
-    return float(brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0))
+    if not np.isfinite(s).all():
+        return 1.0
+    try:
+        fpr, tpr, _ = roc_curve(y, s, pos_label=1)
+        return float(brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0))
+    except Exception:
+        return 1.0
 
 
 def evaluate_model(model, gallery_loader, probe_loader, device):
     """
     Cosine-similarity evaluation on pre-split gallery and probe loaders.
-    Uses model.get_embedding() — compatible with both CompNet and CCNet.
+    Uses model.get_embedding() — compatible with all models.
 
     Returns
     -------
@@ -166,7 +183,9 @@ def evaluate_model(model, gallery_loader, probe_loader, device):
     prb_feats, prb_labels = extract_features(model, probe_loader,   device)
 
     # cosine similarity matrix (embeddings are L2-normalised)
-    sim_matrix  = prb_feats @ gal_feats.T
+    sim_matrix = prb_feats @ gal_feats.T
+    # guard against any residual NaN in similarity matrix
+    sim_matrix = np.nan_to_num(sim_matrix, nan=0.0)
 
     scores_list, labels_list = [], []
     for i in range(len(prb_feats)):
