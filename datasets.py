@@ -1,597 +1,653 @@
 # ==============================================================
-#  main.py — FLClient, FLServer, and federated training loop
+#  datasets.py — dataset classes and federated data partitioning
+# ==============================================================
+#
+#  Normalisation:
+#    NormSingleROI
+#
+#  Dataset classes:
+#    PalmDataset          — gallery/probe evaluation (no augmentation)
+#    AugmentedDataset     — standard spatial aug (CompNet baseline)
+#    PairedDataset        — paired same-class images (CCNet training)
+#    FFTAugmentedDataset  — FFT style swap + spatial aug (CompNet FFT run)
+#
+#  Data loading — CASIA-MS:
+#    parse_casia_ms
+#    build_federated_splits          (6 clients, one per spectrum)
+#
+#  Data loading — XJTU:
+#    parse_xjtu_domains
+#    build_federated_splits_xjtu     (4 clients, one per device+lighting)
+#
+#  Dispatcher:
+#    get_federated_splits            (calls correct builder from cfg["dataset"])
 # ==============================================================
 
 import os
-import copy
-import time
 import random
-import pickle
-import warnings
 import numpy as np
+from collections import defaultdict
 from PIL import Image
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torchvision import transforms as T
 
-warnings.filterwarnings("ignore")
-
-from configs  import CONFIG
-from models   import build_model
-from datasets import (PalmDataset, AugmentedDataset,
-                      PairedDataset, FFTAugmentedDataset,
-                      EvalDatasetDINO,
-                      get_federated_splits)
-from utils    import (extract_style_template, evaluate_model,
-                      train_compnet_epoch, train_ccnet_epoch,
-                      CenterLoss)
-
-
-def make_eval_dataset(samples, cfg):
-    """
-    Return the correct evaluation dataset for the configured model.
-    DINOv2 uses RGB 224×224 with ImageNet normalisation.
-    CompNet and CCNet use grayscale 128×128 with NormSingleROI.
-    """
-    if cfg["model"].strip().lower() == "dinov2":
-        return EvalDatasetDINO(samples, cfg.get("dino_img_side", 224))
-    return PalmDataset(samples, cfg["img_side"])
+from utils import extract_style_template, apply_style_template
+from configs import XJTU_VARIATIONS
 
 
 # ══════════════════════════════════════════════════════════════
-#  FL CLIENT
+#  NORMALISATION
 # ══════════════════════════════════════════════════════════════
 
-class FLClient:
+class NormSingleROI:
     """
-    One federated learning client — owns one spectral/domain with
-    a disjoint subset of training identities.
-
-    Model selection
-    ───────────────
-      cfg["model"] == "compnet" → CompNet, trained with train_compnet_epoch
-                                  (grayscale 128×128, ArcFace + CE)
-      cfg["model"] == "ccnet"   → CCNet,   trained with train_ccnet_epoch
-                                  (grayscale 128×128, ArcFace + CE + SupCon)
-      cfg["model"] == "dinov2"  → DINOv2,  trained with train_compnet_epoch
-                                  (same single-image forward interface)
-                                  Images loaded and augmented as RGB.
-                                  FFT augmentation works per-channel on RGB.
-
-    Weight sharing
-    ──────────────
-      Backbone parameters are shared via FedAvg.
-      arc.* is kept local — client-specific identity prototypes.
-      center_loss.centres is kept local — per-client class centres
-      that are carried over across rounds (never sent to server).
-
-    Optimiser
-    ─────────
-      Adam (CompNet/CCNet) or AdamW (DINOv2) with constant lr — recreated
-      each round since the model resets to the global backbone each round.
-      CenterLoss has its own SGD optimiser (center_loss_lr) that persists
-      across rounds so centres accumulate knowledge across FL rounds.
-
-    Augmentation modes (controlled by active_style_bank passed per round)
-    ──────────────────────────────────────────────────────────────────────
-      active_style_bank empty  → AugmentedDataset (spatial aug only)
-      active_style_bank filled → FFTAugmentedDataset (FFT + spatial aug)
-      Mixed mode is handled in main() by passing an empty bank for the
-      first mixed_aug_round rounds and a full bank thereafter — local_train
-      needs no special logic for it.
+    Per-image normalisation over foreground pixels only (value > 0).
+    Background zero-padding is excluded so it does not distort the
+    mean/std of the actual palm ROI region.
     """
+    def __init__(self, outchannels=1): self.outchannels = outchannels
 
-    def __init__(self, client_id, spectrum, train_samples, label_map,
-                 num_classes, cfg, device):
-        self.client_id     = client_id
-        self.spectrum      = spectrum
-        self.train_samples = train_samples
-        self.label_map     = label_map
-        self.num_classes   = num_classes
-        self.cfg           = cfg
-        self.device        = device
+    def __call__(self, tensor):
+        c, h, w = tensor.size(); tensor = tensor.view(c, h * w)
+        idx = tensor > 0; t = tensor[idx]
+        tensor[idx] = t.sub_(t.mean()).div_(t.std() + 1e-6)
+        tensor = tensor.view(c, h, w)
+        if self.outchannels > 1:
+            tensor = torch.repeat_interleave(tensor, self.outchannels, dim=0)
+        return tensor
 
-        # local model — backbone overwritten each round from global weights
-        self.model = build_model(cfg, num_classes).to(device)
 
-        # center loss — kept local, never shared, persists across rounds
-        # embed_dim depends on model: 512 (CompNet), 2048 (CCNet), 384 (DINOv2)
-        model_name = cfg["model"].strip().lower()
-        if cfg.get("use_center_loss", False):
-            if model_name == "compnet":
-                embed_dim = cfg["embedding_dim"]
-            elif model_name == "ccnet":
-                embed_dim = 2048
-            else:  # dinov2
-                embed_dim = 384
-            self.center_loss = CenterLoss(num_classes, embed_dim, device)
-            self.center_optimizer = optim.SGD(
-                self.center_loss.parameters(),
-                lr=cfg.get("center_loss_lr", 0.5))
+# ══════════════════════════════════════════════════════════════
+#  DATASET CLASSES
+# ══════════════════════════════════════════════════════════════
+
+class PalmDataset(Dataset):
+    """
+    Plain dataset for gallery/probe evaluation — no augmentation.
+    Used by FLServer gallery/probe loaders and evaluate_model().
+    """
+    def __init__(self, samples, img_side=128):
+        self.samples   = samples
+        self.transform = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        return self.transform(Image.open(path).convert("L")), label
+
+
+class AugmentedDataset(Dataset):
+    """
+    Training dataset with standard spatial/photometric augmentation.
+    Used as the baseline (use_fft_aug=False) for all models so that
+    the baseline is not disadvantaged by unaugmented data.
+    Returns a single (augmented_image, label) per sample.
+
+    Parameters
+    ----------
+    grayscale : bool
+        True  → grayscale NormSingleROI normalisation (CompNet, CCNet)
+        False → RGB 3-channel ImageNet normalisation (DINOv2)
+    """
+    def __init__(self, samples, img_side=128, grayscale=True):
+        self.samples   = samples
+        self.grayscale = grayscale
+
+        self.transform = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.RandomChoice([
+                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+                T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+                T.RandomPerspective(distortion_scale=0.15, p=1.0),
+                T.RandomChoice([
+                    T.RandomRotation(10, expand=False,
+                                     center=(int(0.5*img_side), 0)),
+                    T.RandomRotation(10, expand=False,
+                                     center=(0, int(0.5*img_side))),
+                ]),
+            ]),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1) if grayscale else
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        mode = "L" if self.grayscale else "RGB"
+        return self.transform(Image.open(path).convert(mode)), label
+
+
+class PairedDataset(Dataset):
+    """
+    Paired same-class dataset for CCNet contrastive training.
+
+    Returns ([img1, img2], label) where img2 is a different sample of the
+    same identity — required to form the two views for SupConLoss.
+
+    Augmentation modes (controlled by style_bank argument):
+      style_bank empty → standard spatial augmentation on both views
+      style_bank filled → FFT style swap + spatial aug on both views
+                          (each view independently gets a random template
+                           from a random other client)
+    """
+    def __init__(self, samples, img_side=128,
+                 style_bank=None, client_id=None, beta=0.15):
+        self.samples    = samples
+        self.img_side   = img_side
+        self.style_bank = style_bank or {}
+        self.client_id  = client_id
+        self.beta       = beta
+        self.other_ids  = [cid for cid in self.style_bank
+                           if cid != client_id] if self.style_bank else []
+        self.use_fft    = bool(self.other_ids)
+
+        self.label2idxs = defaultdict(list)
+        for i, (_, lab) in enumerate(samples):
+            self.label2idxs[lab].append(i)
+
+        self.spatial_aug = T.RandomChoice([
+            T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+            T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+            T.RandomPerspective(distortion_scale=0.15, p=1.0),
+            T.RandomChoice([
+                T.RandomRotation(10, expand=False,
+                                 center=(int(0.5*img_side), 0)),
+                T.RandomRotation(10, expand=False,
+                                 center=(0, int(0.5*img_side))),
+            ]),
+        ])
+
+        self.to_tensor = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+        # no T.Resize — _load_np already resizes
+        self.to_tensor_fft = T.Compose([
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+
+    def __len__(self): return len(self.samples)
+
+    def _load_np(self, path):
+        """Load, resize, return grayscale float32 in [0, 1]."""
+        img = Image.open(path).convert("L").resize(
+            (self.img_side, self.img_side), Image.BILINEAR)
+        return np.array(img, dtype=np.float32) / 255.0
+
+    def _augment_image(self, path):
+        """
+        Load one image and apply the configured augmentation.
+        FFT mode: FFT style swap from random other client + spatial aug.
+        Spatial mode: spatial augmentation only.
+        """
+        if self.use_fft:
+            img_np        = self._load_np(path)
+            rand_client   = random.choice(self.other_ids)
+            rand_template = random.choice(self.style_bank[rand_client])
+            img_np        = apply_style_template(img_np, rand_template, self.beta)
+            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
+            pil = self.spatial_aug(pil)
+            return self.to_tensor_fft(pil)
         else:
-            self.center_loss      = None
-            self.center_optimizer = None
+            img = Image.open(path).convert("L")
+            img = self.spatial_aug(img)
+            return self.to_tensor(img)
 
-        print(f"  Client {client_id} [{spectrum}] [{cfg['model']}] — "
-              f"train IDs: {num_classes}  samples: {len(train_samples)}"
-              + (f"  [CenterLoss λ={cfg.get('center_loss_weight', 0.003)}]"
-                 if cfg.get("use_center_loss", False) else ""))
+    def __getitem__(self, idx):
+        path1, label = self.samples[idx]
+        idxs = self.label2idxs[label]
+        idx2 = idx
+        while idx2 == idx and len(idxs) > 1:
+            idx2 = random.choice(idxs)
+        path2, _ = self.samples[idx2]
+        img1 = self._augment_image(path1)
+        img2 = self._augment_image(path2)
+        return [img1, img2], label
 
-    # ── weight management ───────────────────────────────────────────────────
 
-    def set_weights(self, backbone_state_dict):
-        """
-        Load global backbone weights into local model.
-        ArcFace head (arc.*) is never in backbone_state_dict and is
-        therefore preserved unchanged — local identity prototypes are kept.
-        """
-        local_state = self.model.state_dict()
-        for key, val in backbone_state_dict.items():
-            if key in local_state and local_state[key].shape == val.shape:
-                local_state[key] = val.clone()
-        self.model.load_state_dict(local_state)
+class FFTAugmentedDataset(Dataset):
+    """
+    Training dataset with FFT style augmentation + spatial augmentation.
+    Used for CompNet and DINOv2 when use_fft_aug=True.
 
-    def get_weights(self):
-        """Return backbone weights only — ArcFace head excluded."""
-        return {k: v.cpu().clone()
-                for k, v in self.model.state_dict().items()
-                if not k.startswith("arc.")}
+    For each original sample x_i, M-1 synthetic copies are produced by
+    replacing its low-frequency amplitude with a randomly chosen template
+    from a randomly chosen other client's style bank.
 
-    # ── local training ──────────────────────────────────────────────────────
+    Index layout: indices [i*M .. i*M+M-1] map to sample i.
+      aug_idx == 0  → original   + spatial augmentation
+      aug_idx >= 1  → FFT styled + spatial augmentation
 
-    def local_train(self, local_epochs, active_style_bank, M, rnd):
-        """
-        Train local model for local_epochs epochs.
+    Notes
+    ─────
+    • Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2.
+    • Foreground mask and per-channel logic live in apply_style_template.
+    """
 
-        active_style_bank controls augmentation mode this round:
-          {}       → AugmentedDataset  (spatial aug only)
-          non-empty → FFTAugmentedDataset (FFT + spatial aug)
-        This means mixed-mode is transparent here — main() simply passes
-        an empty bank for spatial rounds and a full bank for FFT rounds.
-        """
-        model_name = self.cfg["model"].strip().lower()
-        is_dino    = model_name == "dinov2"
-        img_side   = self.cfg.get("dino_img_side", 224) if is_dino else self.cfg["img_side"]
-        grayscale  = not is_dino
+    def __init__(self, samples, style_bank, client_id, M, beta, img_side,
+                 grayscale=True):
+        self.samples    = samples
+        self.style_bank = style_bank
+        self.client_id  = client_id
+        self.M          = M
+        self.beta       = beta
+        self.img_side   = img_side
+        self.grayscale  = grayscale
+        self.other_ids  = [cid for cid in style_bank if cid != client_id]
 
-        if model_name in ("compnet", "dinov2"):
-            if active_style_bank and M > 1:
-                dataset = FFTAugmentedDataset(
-                    samples    = self.train_samples,
-                    style_bank = active_style_bank,
-                    client_id  = self.client_id,
-                    M          = M,
-                    beta       = self.cfg["fft_beta"],
-                    img_side   = img_side,
-                    grayscale  = grayscale,
-                )
-            else:
-                dataset = AugmentedDataset(self.train_samples, img_side,
-                                           grayscale=grayscale)
+        self.spatial_aug = T.RandomChoice([
+            T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+            T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+            T.RandomPerspective(distortion_scale=0.15, p=1.0),
+            T.RandomChoice([
+                T.RandomRotation(10, expand=False,
+                                 center=(int(0.5 * img_side), 0)),
+                T.RandomRotation(10, expand=False,
+                                 center=(0, int(0.5 * img_side))),
+            ]),
+        ])
 
-        elif model_name == "ccnet":
-            # For CCNet, active_style_bank controls FFT on paired views too.
-            dataset = PairedDataset(
-                samples    = self.train_samples,
-                img_side   = img_side,
-                style_bank = active_style_bank,
-                client_id  = self.client_id,
-                beta       = self.cfg["fft_beta"],
-            )
-
+        # no T.Resize — _load_np already resizes
+        if grayscale:
+            self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
         else:
-            raise ValueError(f"Unknown model: '{self.cfg['model']}'")
+            self.norm = T.Compose([
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std =[0.229, 0.224, 0.225]),
+            ])
 
-        # deterministic seed per (round, client) — same across all aug runs
-        round_seed = self.cfg["random_seed"] + rnd * 1000 + self.client_id
-        train_loader = DataLoader(
-            dataset,
-            batch_size     = self.cfg["batch_size"],
-            shuffle        = True,
-            num_workers    = self.cfg["num_workers"],
-            pin_memory     = True,
-            worker_init_fn = lambda wid, s=round_seed: (
-                np.random.seed(s + wid),
-                random.seed(s + wid),
-                torch.manual_seed(s + wid),
-            ),
-        )
+    def __len__(self):
+        return len(self.samples) * self.M
 
-        criterion = nn.CrossEntropyLoss()
-        if is_dino:
-            optimizer = optim.AdamW(
-                self.model.parameters(), lr=self.cfg["lr"],
-                weight_decay=self.cfg.get("dino_weight_decay", 1e-4))
+    def _load_np(self, path):
+        """Load and resize. Returns float32 in [0, 1].
+        Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2."""
+        mode = "L" if self.grayscale else "RGB"
+        img  = Image.open(path).convert(mode).resize(
+            (self.img_side, self.img_side), Image.BILINEAR)
+        return np.array(img, dtype=np.float32) / 255.0
+
+    def _to_tensor(self, img_np):
+        """numpy array → PIL (correct mode) → spatial aug → normalised tensor."""
+        if self.grayscale:
+            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
         else:
-            optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
+            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="RGB")
+        pil = self.spatial_aug(pil)
+        return self.norm(pil)
 
-        lambda_c = self.cfg.get("center_loss_weight", 0.0) \
-                   if self.cfg.get("use_center_loss", False) else 0.0
+    def __getitem__(self, idx):
+        sample_idx = idx // self.M   # which original sample
+        aug_idx    = idx  % self.M   # 0 = original, 1..M-1 = synthetic
 
-        avg_loss, accuracy = 0.0, 0.0
-        for _ in range(local_epochs):
-            if model_name in ("compnet", "dinov2"):
-                avg_loss, accuracy = train_compnet_epoch(
-                    self.model, train_loader, criterion, optimizer, self.device,
-                    center_loss      = self.center_loss,
-                    center_optimizer = self.center_optimizer,
-                    lambda_center    = lambda_c,
-                    lambda_con       = self.cfg.get("con_weight",  0.2),
-                    temperature      = self.cfg.get("temperature", 0.07),
-                )
-            elif model_name == "ccnet":
-                avg_loss, accuracy = train_ccnet_epoch(
-                    self.model, train_loader, criterion, optimizer, self.device,
-                    ce_weight        = self.cfg.get("ce_weight",   0.8),
-                    con_weight       = self.cfg.get("con_weight",  0.2),
-                    temperature      = self.cfg.get("temperature", 0.07),
-                    center_loss      = self.center_loss,
-                    center_optimizer = self.center_optimizer,
-                    lambda_center    = lambda_c,
-                )
+        path, label = self.samples[sample_idx]
+        img_np = self._load_np(path)
 
-        return avg_loss, accuracy
+        if aug_idx == 0 or not self.other_ids:
+            return self._to_tensor(img_np), label
 
-    # ── style template extraction ───────────────────────────────────────────
-
-    def extract_style_templates(self):
-        """
-        Extract FFT amplitude templates from all local training samples.
-        Always called regardless of aug mode so random state is identical
-        across spatial, FFT, and mixed runs.
-
-        Grayscale models (CompNet, CCNet): load as L → (H, W) template.
-        DINOv2: load as RGB → (H, W, 3) per-channel template.
-        Both formats are handled by extract_style_template() in utils.py.
-        """
-        model_name = self.cfg["model"].strip().lower()
-        is_dino    = model_name == "dinov2"
-        img_side   = self.cfg.get("dino_img_side", 224) if is_dino \
-                     else self.cfg["img_side"]
-        mode       = "RGB" if is_dino else "L"
-
-        templates = []
-        for path, _ in self.train_samples:
-            img    = Image.open(path).convert(mode).resize(
-                (img_side, img_side), Image.BILINEAR)
-            img_np = np.array(img, dtype=np.float32) / 255.0
-            templates.append(extract_style_template(img_np))
-        print(f"  Client {self.client_id} [{self.spectrum}] "
-              f"— extracted {len(templates)} {'RGB' if is_dino else 'grayscale'} "
-              f"style templates")
-        return templates
+        rand_client   = random.choice(self.other_ids)
+        rand_template = random.choice(self.style_bank[rand_client])
+        img_syn       = apply_style_template(img_np, rand_template, self.beta)
+        return self._to_tensor(img_syn), label
 
 
 # ══════════════════════════════════════════════════════════════
-#  FL SERVER
+#  DATA LOADING & PARTITIONING
 # ══════════════════════════════════════════════════════════════
 
-class FLServer:
+def parse_casia_ms(data_root):
     """
-    Central server:
-      - maintains the global model
-      - performs FedAvg aggregation on backbone weights only
-      - evaluates the global model on the shared gallery/probe test sets
-    """
-
-    def __init__(self, num_classes, gallery_samples, probe_samples, cfg, device):
-        self.cfg    = cfg
-        self.device = device
-
-        self.global_model = build_model(cfg, num_classes).to(device)
-
-        self.gallery_loader = DataLoader(
-            make_eval_dataset(gallery_samples, cfg),
-            batch_size  = cfg["batch_size"],
-            shuffle     = False,
-            num_workers = cfg["num_workers"],
-            pin_memory  = True,
-        )
-        self.probe_loader = DataLoader(
-            make_eval_dataset(probe_samples, cfg),
-            batch_size  = cfg["batch_size"],
-            shuffle     = False,
-            num_workers = cfg["num_workers"],
-            pin_memory  = True,
-        )
-
-        print(f"  Server [{cfg['model']}] — "
-              f"gallery: {len(gallery_samples)}  probe: {len(probe_samples)}")
-
-    def get_global_weights(self):
-        """Return backbone weights only (arc.* excluded)."""
-        return {k: v.cpu().clone()
-                for k, v in self.global_model.state_dict().items()
-                if not k.startswith("arc.")}
-
-    def aggregate(self, client_weight_dicts):
-        """FedAvg on backbone parameters only — arc.* never aggregated."""
-        n        = len(client_weight_dicts)
-        avg_dict = {}
-        for key in client_weight_dicts[0].keys():
-            stacked      = torch.stack(
-                [client_weight_dicts[i][key].float() for i in range(n)], dim=0)
-            avg_dict[key] = stacked.mean(dim=0)
-        global_state = self.global_model.state_dict()
-        global_state.update(avg_dict)
-        self.global_model.load_state_dict(global_state)
-
-    def evaluate(self):
-        """Evaluate global model on the shared gallery and probe sets."""
-        return evaluate_model(
-            self.global_model,
-            self.gallery_loader,
-            self.probe_loader,
-            self.device)
-
-
-# ══════════════════════════════════════════════════════════════
-#  AUGMENTATION MODE HELPERS
-# ══════════════════════════════════════════════════════════════
-
-def resolve_aug_mode(cfg):
-    """
-    Determine the augmentation mode from config flags.
-
-    Priority: use_mixed_aug > use_fft_aug > spatial-only (default).
+    Scan data_root for CASIA-MS ROI images.
+    Filename format: {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
 
     Returns
     -------
-    mode : str   "spatial" | "fft" | "mixed"
+    data : dict  spectrum → identity → [path, ...]
     """
-    if cfg.get("use_mixed_aug", False):
-        return "mixed"
-    if cfg.get("use_fft_aug", False):
-        return "fft"
-    return "spatial"
+    data     = defaultdict(lambda: defaultdict(list))
+    img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    for fname in sorted(os.listdir(data_root)):
+        if os.path.splitext(fname)[1].lower() not in img_exts:
+            continue
+        parts = os.path.splitext(fname)[0].split("_")
+        if len(parts) < 4:
+            continue
+        identity = f"{parts[0]}_{parts[1]}"   # e.g. "001_L"
+        spectrum = parts[2]
+        data[spectrum][identity].append(os.path.join(data_root, fname))
+    return data
 
 
-def get_active_style_bank(style_bank_full, rnd, cfg, is_dinov2):
+def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
     """
-    Return the style bank to pass to local_train for this round.
+    Build per-client training sets and a fixed shared gallery/probe test set.
 
-    spatial → always {}
-    fft     → always style_bank_full
-    mixed   → {} for rounds 1..mixed_aug_round
-               style_bank_full for rounds mixed_aug_round+1..n_rounds
+    Protocol: Open-Set, Non-Shared-ID, Cross-Domain.
+      - n_ids identities are sampled from those common to all spectra.
+      - k_test fraction → test IDs; remainder → train IDs (disjoint).
+      - Train IDs are partitioned round-robin across clients (no overlap).
+      - All clients are trimmed to min partition size (equalised).
+      - Test IDs across all spectra form the gallery/probe split.
 
-    DINOv2 now supports FFT augmentation on RGB images (per-channel FFT),
-    so no special case is needed.
+    Returns
+    -------
+    client_data     : list of dicts {spectrum, train_samples, label_map, num_classes}
+    gallery_samples : list of (path, label)
+    probe_samples   : list of (path, label)
+    test_label_map  : {identity: int}
+    spectra         : list of spectrum strings
     """
-    mode = resolve_aug_mode(cfg)
-    if mode == "spatial":
-        return {}
-    if mode == "fft":
-        return style_bank_full
-    # mixed
-    switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
-    return style_bank_full if rnd > switch else {}
+    rng  = random.Random(seed)
+    data = parse_casia_ms(data_root)
+
+    spectra   = sorted(data.keys())
+    n_clients = len(spectra)
+    print(f"  Spectra found ({n_clients}): {spectra}")
+
+    # identities present in ALL spectra
+    common_ids = set(data[spectra[0]].keys())
+    for sp in spectra[1:]:
+        common_ids &= set(data[sp].keys())
+    common_ids = sorted(common_ids)
+    print(f"  Identities common to all spectra: {len(common_ids)}")
+
+    if len(common_ids) < n_ids:
+        raise ValueError(
+            f"Requested {n_ids} IDs but only {len(common_ids)} "
+            f"are present in all spectra.")
+
+    # sample n_ids, shuffle, split into test / train ID sets
+    selected_ids = sorted(rng.sample(common_ids, n_ids))
+    rng.shuffle(selected_ids)
+    n_test_ids     = max(1, round(n_ids * k_test))
+    test_ids       = sorted(selected_ids[:n_test_ids])
+    train_ids      = sorted(selected_ids[n_test_ids:])
+    test_label_map = {ident: i for i, ident in enumerate(test_ids)}
+
+    print(f"  Total train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
+
+    # round-robin partition — no two clients share a train ID
+    rng.shuffle(train_ids)
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(train_ids):
+        client_id_splits[i % n_clients].append(ident)
+
+    # equalise by trimming to smallest partition
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+    n_dropped = len(train_ids) - min_ids * n_clients
+    print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
+
+    # build per-client local train sets — each has its own label space
+    client_data = []
+    for i, sp in enumerate(spectra):
+        c_ids       = client_id_splits[i]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+        local_train = [
+            (p, c_label_map[ident])
+            for ident in c_ids
+            for p in data[sp][ident]
+        ]
+        client_data.append({
+            "spectrum"      : sp,
+            "train_samples" : local_train,
+            "label_map"     : c_label_map,
+            "num_classes"   : min_ids,
+        })
+        print(f"    Client {i} [{sp:>6}]  "
+              f"train IDs={min_ids}  samples={len(local_train)}")
+
+    # fixed global test set — split within each (spectrum, identity) pair
+    gallery_samples, probe_samples = [], []
+    for sp in spectra:
+        for ident in test_ids:
+            paths = list(data[sp][ident])
+            rng.shuffle(paths)
+            label = test_label_map[ident]
+            n_gal = max(1, round(len(paths) * gallery_ratio))
+            for p in paths[:n_gal]:
+                gallery_samples.append((p, label))
+            for p in paths[n_gal:]:
+                probe_samples.append((p, label))
+
+    print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, spectra)
+
+# ══════════════════════════════════════════════════════════════
+#  XJTU DATA LOADING & PARTITIONING
+# ══════════════════════════════════════════════════════════════
+
+def parse_xjtu_domains(data_root, seed=42):
+    """
+    Scan data_root for XJTU-UP images organised by (device, condition) domain.
+
+    Directory layout:
+      data_root/
+        {device}/
+          {condition}/
+            {L|R}_{subjectID}/
+              *.jpg
+
+    Domain keys: (device, condition) tuples from XJTU_VARIATIONS, e.g.
+      ("iPhone", "Flash"), ("iPhone", "Nature"),
+      ("huawei", "Flash"), ("huawei", "Nature")
+
+    Identity key: the folder name, e.g. "L_001" or "R_002".
+
+    Returns
+    -------
+    data : dict  (device, condition) → identity → [path, ...]
+           Same structure as parse_casia_ms (spectrum → identity → paths)
+           so build_federated_splits_xjtu mirrors build_federated_splits.
+    """
+    IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
+    data     = defaultdict(lambda: defaultdict(list))
+
+    for device, condition in XJTU_VARIATIONS:
+        var_dir = os.path.join(data_root, device, condition)
+        if not os.path.isdir(var_dir):
+            print(f"  [XJTU] WARNING: {var_dir} not found")
+            continue
+        for id_folder in sorted(os.listdir(var_dir)):
+            id_dir = os.path.join(var_dir, id_folder)
+            if not os.path.isdir(id_dir):
+                continue
+            parts = id_folder.split("_")
+            if len(parts) < 2 or parts[0].upper() not in ("L", "R"):
+                continue
+            for fname in sorted(os.listdir(id_dir)):
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+                    continue
+                data[(device, condition)][id_folder].append(
+                    os.path.join(id_dir, fname))
+
+    for domain in XJTU_VARIATIONS:
+        n_ids  = len(data[domain])
+        n_imgs = sum(len(v) for v in data[domain].values())
+        print(f"  [XJTU] {domain[0]}/{domain[1]:6s}  "
+              f"IDs={n_ids}  images={n_imgs}")
+    return data
 
 
-def aug_mode_label(rnd, cfg, is_dinov2):
-    """Short label for console log — shows which mode is active this round."""
-    mode = resolve_aug_mode(cfg)
-    if mode == "spatial":
-        return "Spatial"
-    if mode == "fft":
-        return "FFT"
-    switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
-    return "FFT" if rnd > switch else "Spatial"
+def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42):
+    """
+    Build per-client training sets and a fixed shared gallery/probe test set
+    for the XJTU dataset.
+
+    Protocol: Open-Set, Non-Shared-ID, Cross-Domain.
+      - 4 clients, one per (device, condition) domain.
+      - n_ids identities are sampled from those common to all 4 domains.
+      - k_test fraction → test IDs; remainder → train IDs (fully disjoint).
+      - Train IDs are partitioned round-robin across clients (no overlap).
+      - All clients are trimmed to min partition size (equalised).
+      - Test IDs across all 4 domains form the gallery/probe split.
+
+    Returns
+    -------
+    client_data     : list of dicts {domain_label, train_samples,
+                                     label_map, num_classes}
+    gallery_samples : list of (path, label)
+    probe_samples   : list of (path, label)
+    test_label_map  : {identity: int}
+    domain_labels   : list of "{device}/{condition}" strings (client names)
+    """
+    rng  = random.Random(seed)
+    data = parse_xjtu_domains(data_root, seed=seed)
+
+    domains       = XJTU_VARIATIONS          # 4 (device, condition) tuples
+    n_clients     = len(domains)
+    domain_labels = [f"{d}/{c}" for d, c in domains]
+
+    # identities present in ALL 4 domains
+    common_ids = set(data[domains[0]].keys())
+    for dom in domains[1:]:
+        common_ids &= set(data[dom].keys())
+    common_ids = sorted(common_ids)
+    print(f"  Identities common to all {n_clients} domains: {len(common_ids)}")
+
+    if len(common_ids) < n_ids:
+        raise ValueError(
+            f"Requested {n_ids} IDs but only {len(common_ids)} "
+            f"are present in all {n_clients} XJTU domains.")
+
+    # sample n_ids, shuffle, split into test / train ID sets
+    selected_ids   = sorted(rng.sample(common_ids, n_ids))
+    rng.shuffle(selected_ids)
+    n_test_ids     = max(1, round(n_ids * k_test))
+    test_ids       = sorted(selected_ids[:n_test_ids])
+    train_ids      = sorted(selected_ids[n_test_ids:])
+    test_label_map = {ident: i for i, ident in enumerate(test_ids)}
+
+    print(f"  Total train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
+
+    # round-robin partition — no two clients share a train ID
+    rng.shuffle(train_ids)
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(train_ids):
+        client_id_splits[i % n_clients].append(ident)
+
+    # equalise by trimming to smallest partition
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+    n_dropped = len(train_ids) - min_ids * n_clients
+    print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
+
+    # build per-client local train sets — each has its own label space
+    client_data = []
+    for i, dom in enumerate(domains):
+        c_ids       = client_id_splits[i]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+        local_train = [
+            (p, c_label_map[ident])
+            for ident in c_ids
+            for p in data[dom][ident]
+        ]
+        client_data.append({
+            "spectrum"      : domain_labels[i],   # reuse "spectrum" key for compatibility
+            "domain"        : dom,                # (device, condition) tuple
+            "train_samples" : local_train,
+            "label_map"     : c_label_map,
+            "num_classes"   : min_ids,
+        })
+        print(f"    Client {i} [{domain_labels[i]:>14}]  "
+              f"train IDs={min_ids}  samples={len(local_train)}")
+
+    # fixed global test set — split within each (domain, identity) pair
+    gallery_samples, probe_samples = [], []
+    for dom in domains:
+        for ident in test_ids:
+            paths = list(data[dom][ident])
+            rng.shuffle(paths)
+            label = test_label_map[ident]
+            n_gal = max(1, round(len(paths) * gallery_ratio))
+            for p in paths[:n_gal]:
+                gallery_samples.append((p, label))
+            for p in paths[n_gal:]:
+                probe_samples.append((p, label))
+
+    print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, domain_labels)
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN
+#  DISPATCHER
 # ══════════════════════════════════════════════════════════════
 
-def main():
-    cfg  = CONFIG
-    seed = cfg["random_seed"]
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+def get_federated_splits(cfg, seed=42):
+    """
+    Call the correct split builder based on cfg["dataset"].
 
-    device     = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    base_dir   = cfg["base_results_dir"]
-    is_dinov2  = cfg["model"].strip().lower() == "dinov2"
-    aug_mode   = resolve_aug_mode(cfg)
-    os.makedirs(base_dir, exist_ok=True)
+    Returns the same 5-tuple for both datasets:
+      (client_data, gallery_samples, probe_samples, test_label_map, domain_names)
 
-    # ── header ───────────────────────────────────────────────────────────────
-    print(f"\n{'='*62}")
-    print(f"  Federated Learning — Palmprint")
-    print(f"  Dataset  : {cfg['dataset'].upper()}")
-    print(f"  Protocol : Open-Set, Non-Shared-ID, Cross-Domain")
-    print(f"  Model    : {cfg['model'].upper()}")
-    print(f"  Device   : {device}")
-    print(f"  Rounds   : {cfg['n_rounds']}   "
-          f"Local epochs/round : {cfg['local_epochs']}")
-    print(f"  IDs : {cfg['n_ids']}   "
-          f"Test ID ratio : {cfg['k_test']*100:.0f}%   "
-          f"Gallery ratio : {cfg['gallery_ratio']*100:.0f}%")
-    if aug_mode == "mixed":
-        switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
-        print(f"  Aug mode : MIXED  "
-              f"(Spatial rounds 1–{switch}, FFT rounds {switch+1}–{cfg['n_rounds']})"
-              f"  M={cfg['M']}  beta={cfg['fft_beta']}")
+    This uniform interface means main.py needs no dataset-specific branching
+    beyond this single call.
+    """
+    dataset = cfg["dataset"].strip().lower()
+
+    if dataset == "casiams":
+        return build_federated_splits(
+            cfg["data_root"], cfg["n_ids"], cfg["k_test"],
+            cfg["gallery_ratio"], seed=seed)
+
+    elif dataset == "xjtu":
+        return build_federated_splits_xjtu(
+            cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
+            cfg["gallery_ratio"], seed=seed)
+
     else:
-        print(f"  Aug mode : {aug_mode.upper()}   "
-              f"M={cfg['M']}   beta={cfg['fft_beta']}")
-    print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
-    print(f"{'='*62}\n")
-
-    # ── resolve dataset- and model-specific paths ─────────────────────────
-    dataset_key   = cfg["dataset"].strip().lower()
-    model_key     = cfg["model"].strip().lower()
-    splits_path       = cfg["splits_path"].format(dataset=dataset_key)
-    init_weights_path = cfg["init_weights_path"].format(
-                            dataset=dataset_key, model=model_key)
-
-    # ── Step 0a: load or build data splits ────────────────────────────────
-    os.makedirs(os.path.dirname(splits_path), exist_ok=True)
-    if os.path.exists(splits_path):
-        print(f"Loading existing data splits from: {splits_path}")
-        with open(splits_path, "rb") as f:
-            splits = pickle.load(f)
-        client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
-        print("  Splits loaded.")
-    else:
-        print(f"Building federated data splits for {cfg['dataset'].upper()} …")
-        splits = get_federated_splits(cfg, seed=seed)
-        with open(splits_path, "wb") as f:
-            pickle.dump(splits, f)
-        print(f"  Splits saved to: {splits_path}")
-        client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
-
-    num_classes = client_data[0]["num_classes"]
-    n_clients   = len(client_data)
-    print(f"\n  Clients        : {n_clients}  ({domain_names})")
-    print(f"  IDs per client : {num_classes}")
-    print(f"  Test  classes  : {len(test_label_map)}")
-    print(f"  Gallery        : {len(gallery_samples)}  "
-          f"Probe : {len(probe_samples)}\n")
-
-    # ── Step 0b: initialise server ────────────────────────────────────────
-    print("Initialising server …")
-    server = FLServer(num_classes, gallery_samples, probe_samples, cfg, device)
-
-    # ── Step 0c: initialise clients ───────────────────────────────────────
-    print("Initialising clients …")
-    clients = []
-    for i, cd in enumerate(client_data):
-        clients.append(FLClient(
-            client_id     = i,
-            spectrum      = cd["spectrum"],
-            train_samples = cd["train_samples"],
-            label_map     = cd["label_map"],
-            num_classes   = cd["num_classes"],
-            cfg           = cfg,
-            device        = device,
-        ))
-
-    # ── Step 0d: load or save initial model weights ───────────────────────
-    if os.path.exists(init_weights_path):
-        print(f"\nLoading existing initial weights from: {init_weights_path}")
-        init_state = torch.load(init_weights_path, map_location=device)
-        server.global_model.load_state_dict(init_state)
-        backbone_init = {k: v for k, v in init_state.items()
-                         if not k.startswith("arc.")}
-        for client in clients:
-            client.set_weights(backbone_init)
-        print("  Initial weights loaded.")
-    else:
-        print(f"\nSaving initial weights to: {init_weights_path}")
-        torch.save(server.global_model.state_dict(), init_weights_path)
-        backbone_init = {k: v for k, v in server.global_model.state_dict().items()
-                         if not k.startswith("arc.")}
-        for client in clients:
-            client.set_weights(backbone_init)
-        print("  Initial weights saved.")
-
-    # ── results file ──────────────────────────────────────────────────────
-    results_path  = os.path.join(base_dir, "results.txt")
-    client_header = "\t".join(
-        f"Client{i}_EER(%)\tClient{i}_Rank1(%)" for i in range(n_clients))
-    with open(results_path, "w") as f:
-        f.write(f"Round\tAug_Mode\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
-
-    # ── Step 0e: extract style templates (always, all runs) ───────────────
-    # Always extracted regardless of aug mode so that the random state
-    # consumed by extraction is identical across spatial, FFT, and mixed runs.
-    # DINOv2 returns empty lists — templates are incompatible with RGB input.
-    print("\nExtracting style templates from all clients …")
-    style_bank_full = {
-        client.client_id: client.extract_style_templates()
-        for client in clients
-    }
-    total = sum(len(v) for v in style_bank_full.values())
-    if total > 0:
-        print(f"  Style bank ready — {total} templates "
-              f"across {len(style_bank_full)} clients")
-    if aug_mode == "mixed":
-        switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
-        print(f"  Mixed augmentation: Spatial rounds 1–{switch}, "
-              f"FFT rounds {switch+1}–{cfg['n_rounds']}.\n")
-    elif aug_mode == "fft":
-        print("  FFT augmentation ENABLED — style bank will be used.\n")
-    else:
-        print("  Spatial augmentation only — style bank extracted "
-              "but not used during training.\n")
-
-    # ── Round 0: random init evaluation ──────────────────────────────────
-    print("\n--- Round 0 (random init) ---")
-    g_eer_0, g_rank1_0 = server.evaluate()
-    print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
-    with open(results_path, "a") as f:
-        f.write(f"0\tInit\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
-                + "\t".join("-1\t-1" for _ in range(n_clients)) + "\n")
-
-    g_eer, g_rank1 = g_eer_0, g_rank1_0
-
-    # ── FL rounds ─────────────────────────────────────────────────────────
-    for rnd in range(1, cfg["n_rounds"] + 1):
-        t_start = time.time()
-
-        # determine which style bank to pass this round
-        active_style_bank = get_active_style_bank(
-            style_bank_full, rnd, cfg, is_dinov2)
-        mode_label = aug_mode_label(rnd, cfg, is_dinov2)
-
-        global_weights = server.get_global_weights()
-        client_weights = []
-        client_metrics = []
-
-        # ── Step 1: local training ────────────────────────────────────────
-        for client in clients:
-            client.set_weights(global_weights)
-            loss, acc = client.local_train(
-                cfg["local_epochs"], active_style_bank, cfg["M"], rnd)
-            c_eer, c_rank1 = evaluate_model(
-                client.model,
-                server.gallery_loader, server.probe_loader,
-                device)
-            client_weights.append(client.get_weights())
-            client_metrics.append({
-                "client_id" : client.client_id,
-                "spectrum"  : client.spectrum,
-                "train_loss": round(loss, 6),
-                "train_acc" : round(acc, 3),
-                "eer"       : round(c_eer, 6),
-                "rank1"     : round(c_rank1, 3),
-            })
-
-        # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
-        server.aggregate(client_weights)
-        g_eer, g_rank1 = server.evaluate()
-        elapsed = time.time() - t_start
-
-        ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} [{mode_label}] | "
-              f"Global EER={g_eer*100:.4f}%  Rank-1={g_rank1:.2f}%  "
-              f"({elapsed:.1f}s)")
-        for cm in client_metrics:
-            print(f"  Client {cm['client_id']} [{cm['spectrum']:>14}] | "
-                  f"loss={cm['train_loss']:.4f}  acc={cm['train_acc']:.1f}%  "
-                  f"EER={cm['eer']*100:.3f}%  R1={cm['rank1']:.1f}%")
-
-        client_cols = "\t".join(
-            f"{cm['eer']*100:.4f}\t{cm['rank1']:.2f}"
-            for cm in client_metrics)
-        with open(results_path, "a") as f:
-            f.write(f"{rnd}\t{mode_label}\t{g_eer*100:.4f}\t{g_rank1:.2f}"
-                    f"\t{client_cols}\n")
-
-    # ── Final reporting ───────────────────────────────────────────────────
-    print(f"\n{'='*62}")
-    print(f"  FL COMPLETE — {cfg['n_rounds']} rounds")
-    print(f"  Dataset            : {cfg['dataset'].upper()}")
-    print(f"  Model              : {cfg['model'].upper()}")
-    print(f"  Aug mode           : {aug_mode.upper()}")
-    print(f"  Final Global EER   : {g_eer*100:.4f}%")
-    print(f"  Final Global Rank-1: {g_rank1:.2f}%")
-    print(f"  Results saved to   : {results_path}")
-    print(f"{'='*62}")
+        raise ValueError(
+            f"Unknown dataset: '{cfg['dataset']}'. "
+            f"Choose 'casiams' or 'xjtu'.")
 
 
-if __name__ == "__main__":
-    main()
+
+# ══════════════════════════════════════════════════════════════
+#  DINOV2 EVALUATION DATASET  (RGB + ImageNet normalisation)
+# ══════════════════════════════════════════════════════════════
+# DINOv2 training uses AugmentedDataset / FFTAugmentedDataset with
+# grayscale=False — same augmentation policy as CompNet.  Only the
+# gallery/probe evaluation loader needs a dedicated class because it
+# must convert the grayscale palmprint to RGB and apply ImageNet norm.
+
+def _dino_eval_transform(img_side=224):
+    """Eval transform for DINOv2: resize + RGB + ImageNet norm."""
+    return T.Compose([
+        T.Resize((img_side, img_side)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std =[0.229, 0.224, 0.225]),
+    ])
+
+
+class EvalDatasetDINO(Dataset):
+    """
+    Evaluation dataset for DINOv2 gallery/probe sets.
+    No augmentation — resize + ImageNet norm only.
+    Grayscale palmprint images are replicated to 3 channels via
+    convert("RGB") to match the ImageNet-pretrained backbone's input.
+    """
+    def __init__(self, samples, img_side=224):
+        self.samples   = samples
+        self.transform = _dino_eval_transform(img_side)
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        return self.transform(Image.open(path).convert("RGB")), label
