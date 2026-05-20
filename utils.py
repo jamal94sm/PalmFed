@@ -254,34 +254,40 @@ class CenterLoss(nn.Module):
 
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
-                        lambda_center=0.0):
+                        lambda_center=0.0, lambda_con=0.0, temperature=0.07):
     """
     Train CompNet (or DINOv2) for one epoch.
 
-    Loss : CrossEntropyLoss(ArcFace)  +  lambda_center × CenterLoss
-           Center loss is optional — pass center_loss=None to disable.
+    Loss : CrossEntropy(ArcFace, view1)
+         + lambda_con    × SupConLoss([view1_emb, view2_emb])
+         + lambda_center × CenterLoss(view1_emb)
 
-    Center loss update follows the standard two-step procedure:
-      1. Backprop the combined loss through the backbone.
-      2. Scale centre gradients by 1/lambda_center before stepping the
-         centre optimiser — this decouples the centre update speed from
-         the backbone lr and keeps centre movement stable.
+    Dataset always returns ([view1, view2], label):
+      AugmentedDataset    → (spatial_aug1, spatial_aug2)
+      FFTAugmentedDataset → (view_spatial, view_fft)
+
+    SupConLoss enforces that both views of the same identity cluster
+    together in embedding space — directly improving intra-class
+    compactness across domains. ArcFace classification is computed
+    on view1 only.
 
     Parameters
     ----------
     model            : CompNet or DINOv2Model
-    loader           : DataLoader yielding (img_tensor, label_tensor)
+    loader           : DataLoader yielding ([view1, view2], label)
     criterion        : nn.CrossEntropyLoss
-    optimizer        : torch.optim.Optimizer  (backbone + ArcFace)
+    optimizer        : torch.optim.Optimizer
     device           : torch.device
     center_loss      : CenterLoss | None
-    center_optimizer : torch.optim.SGD | None  (centres only)
-    lambda_center    : float  center loss weight (0 → disabled)
+    center_optimizer : torch.optim.SGD | None
+    lambda_center    : float  center loss weight  (0 → disabled)
+    lambda_con       : float  SupConLoss weight   (0 → disabled)
+    temperature      : float  SupConLoss temperature
 
     Returns
     -------
     avg_loss : float
-    accuracy : float  (classification accuracy in %)
+    accuracy : float  (classification accuracy on view1 in %)
     """
     model.train()
     if center_loss is not None:
@@ -290,42 +296,58 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     use_center = (center_loss is not None and
                   center_optimizer is not None and
                   lambda_center > 0.0)
+    use_supcon = lambda_con > 0.0
+    supcon     = SupConLoss(temperature=temperature,
+                            base_temperature=temperature) if use_supcon else None
+
+    # backbone embedding before ArcFace — works for both CompNet and DINOv2
+    def _get_embedding(imgs):
+        if hasattr(model, "_backbone"):
+            return model._backbone(imgs)    # CompNet
+        return model.backbone(imgs)         # DINOv2
+
+    # ArcFace logits from raw embedding
+    def _get_logits(emb, labels):
+        if hasattr(model, "drop"):
+            return model.arc(model.drop(emb), labels)  # CompNet
+        return model.arc(emb, labels)                  # DINOv2
 
     running_loss = 0.0; correct = 0; total = 0
 
-    for imgs, labels in loader:
-        imgs, labels = imgs.to(device), labels.to(device)
+    for data, labels in loader:
+        view1  = data[0].to(device)
+        view2  = data[1].to(device)
+        labels = labels.to(device)
 
         optimizer.zero_grad()
         if use_center:
             center_optimizer.zero_grad()
 
+        emb1   = _get_embedding(view1)
+        emb2   = _get_embedding(view2)
+        logits = _get_logits(emb1, labels)
+        loss   = criterion(logits, labels)
+
+        if use_supcon:
+            views = torch.stack([F.normalize(emb1, p=2, dim=1),
+                                  F.normalize(emb2, p=2, dim=1)], dim=1)
+            loss  = loss + lambda_con * supcon(views, labels)
+
         if use_center:
-            # need raw embedding for centre loss — call backbone directly
-            emb     = model._backbone(imgs) if hasattr(model, "_backbone") \
-                      else model.backbone(imgs)
-            logits  = model.arc(model.drop(emb), labels) if hasattr(model, "drop") \
-                      else model.arc(emb, labels)
-            ce_loss = criterion(logits, labels)
-            cl_loss = center_loss(emb.detach(), labels)
-            loss    = ce_loss + lambda_center * cl_loss
-        else:
-            logits = model(imgs, labels)
-            loss   = criterion(logits, labels)
+            loss = loss + lambda_center * center_loss(emb1.detach(), labels)
 
         loss.backward()
         optimizer.step()
 
         if use_center:
-            # scale centre gradients before stepping (paper Eq. 4)
             for p in center_loss.parameters():
                 if p.grad is not None:
                     p.grad.data *= 1.0 / (lambda_center + 1e-8)
             center_optimizer.step()
 
-        running_loss += loss.item() * imgs.size(0)
+        running_loss += loss.item() * view1.size(0)
         correct      += logits.argmax(1).eq(labels).sum().item()
-        total        += imgs.size(0)
+        total        += view1.size(0)
 
     return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
 
