@@ -270,50 +270,44 @@ class CenterLoss(nn.Module):
 
 # ══════════════════════════════════════════════════════════════
 #  TRAINING FUNCTIONS  (one epoch per call)
-# ══════════════════════════════════════════════════════════════
-
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
                         lambda_center=0.0, lambda_con=0.0, temperature=0.07):
     """
     Train CompNet (or DINOv2) for one epoch.
 
-    Loss : CrossEntropyLoss(ArcFace logits)
-         + lambda_con    × SupConLoss  (optional)
-         + lambda_center × CenterLoss  (optional)
+    Loss : CrossEntropy(ArcFace, orig_emb)
+         + lambda_con    × SupConLoss([orig_emb, aug_emb])  (optional)
+         + lambda_center × CenterLoss(orig_emb)             (optional)
 
-    Dataset returns (img, label) — single image per sample.
+    Dataset returns ([orig, aug], label):
+      AugmentedDataset    → (original, spatially_augmented)
+      FFTAugmentedDataset → (original, fft_augmented)
 
-    SupConLoss is applied over the full batch using labels to identify
-    positive pairs — no explicit pairing structure required. This works
-    naturally with both dataset modes:
-      AugmentedDataset    : same-identity spatial augmentations are pulled
-                            together across the batch.
-      FFTAugmentedDataset : with M≥2, each batch contains both original and
-                            FFT-augmented copies of the same identity (due to
-                            the M multiplier expanding the dataset); SupConLoss
-                            pulls them together without any special pairing.
+    SupConLoss uses the (orig, aug) pair as guaranteed positive views —
+    every sample always has exactly one positive pair so NaN from empty
+    positive sets cannot occur regardless of batch size or class count.
+    SupConLoss input shape: [B, 2, embed_dim].
 
-    The backbone embedding (before ArcFace) is used for SupConLoss and
-    CenterLoss. ArcFace logits are used for CrossEntropy only.
+    ArcFace classification and CenterLoss are applied to orig only.
 
     Parameters
     ----------
     model            : CompNet or DINOv2Model
-    loader           : DataLoader yielding (img_tensor, label_tensor)
+    loader           : DataLoader yielding ([orig, aug], label)
     criterion        : nn.CrossEntropyLoss
     optimizer        : torch.optim.Optimizer
     device           : torch.device
     center_loss      : CenterLoss | None
     center_optimizer : torch.optim.SGD | None
-    lambda_center    : float  CenterLoss weight   (0 → disabled)
-    lambda_con       : float  SupConLoss weight   (0 → disabled)
+    lambda_center    : float  CenterLoss weight  (0 → disabled)
+    lambda_con       : float  SupConLoss weight  (0 → disabled)
     temperature      : float  SupConLoss temperature
 
     Returns
     -------
     avg_loss : float
-    accuracy : float  (classification accuracy in %)
+    accuracy : float  (classification accuracy on orig in %)
     """
     model.train()
     if center_loss is not None:
@@ -327,41 +321,38 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         supcon = SupConLoss(temperature=temperature,
                             base_temperature=temperature)
 
-    # extract backbone embedding — works for both CompNet and DINOv2
     def _get_emb(imgs):
         return model._backbone(imgs) if hasattr(model, "_backbone") \
                else model.backbone(imgs)
 
-    # ArcFace logits from raw embedding
     def _get_logits(emb, labels):
         if hasattr(model, "drop"):
-            return model.arc(model.drop(emb), labels)  # CompNet
-        return model.arc(emb, labels)                  # DINOv2
+            return model.arc(model.drop(emb), labels)
+        return model.arc(emb, labels)
 
     running_loss = 0.0; correct = 0; total = 0
 
-    for imgs, labels in loader:
-        imgs, labels = imgs.to(device), labels.to(device)
+    for data, labels in loader:
+        orig   = data[0].to(device)
+        aug    = data[1].to(device)
+        labels = labels.to(device)
 
         optimizer.zero_grad()
         if use_center:
             center_optimizer.zero_grad()
 
-        # always extract raw embedding when any auxiliary loss is active
-        if use_supcon or use_center:
-            emb    = _get_emb(imgs)
-            logits = _get_logits(emb, labels)
-            loss   = criterion(logits, labels)
-            if use_supcon:
-                # reshape to [B, 1, D] — SupConLoss uses labels for positives
-                # same-label embeddings (originals + augmented) attract each other
-                emb_n = F.normalize(emb, p=2, dim=1).unsqueeze(1)  # [B, 1, D]
-                loss  = loss + lambda_con * supcon(emb_n, labels)
-            if use_center:
-                loss = loss + lambda_center * center_loss(emb.detach(), labels)
-        else:
-            logits = model(imgs, labels)
-            loss   = criterion(logits, labels)
+        emb_orig = _get_emb(orig)
+        logits   = _get_logits(emb_orig, labels)
+        loss     = criterion(logits, labels)
+
+        if use_supcon:
+            emb_aug = _get_emb(aug)
+            views   = torch.stack([F.normalize(emb_orig, p=2, dim=1),
+                                    F.normalize(emb_aug,  p=2, dim=1)], dim=1)
+            loss    = loss + lambda_con * supcon(views, labels)
+
+        if use_center:
+            loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
 
         loss.backward()
         optimizer.step()
@@ -372,11 +363,12 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                     p.grad.data *= 1.0 / (lambda_center + 1e-8)
             center_optimizer.step()
 
-        running_loss += loss.item() * imgs.size(0)
+        running_loss += loss.item() * orig.size(0)
         correct      += logits.argmax(1).eq(labels).sum().item()
-        total        += imgs.size(0)
+        total        += orig.size(0)
 
     return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
+
 
 
 def train_ccnet_epoch(model, loader, criterion, optimizer, device,
