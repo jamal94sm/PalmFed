@@ -163,6 +163,7 @@ class FLClient:
                     style_bank = active_style_bank,
                     client_id  = self.client_id,
                     beta       = self.cfg["fft_beta"],
+                    M          = M,
                     img_side   = img_side,
                     grayscale  = grayscale,
                     mean_bank       = mean_bank,
