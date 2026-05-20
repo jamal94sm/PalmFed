@@ -19,6 +19,7 @@ import torch.nn as nn
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
+import torch.nn.functional as F
 
 from models import SupConLoss
 
