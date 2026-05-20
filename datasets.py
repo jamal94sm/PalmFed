@@ -233,8 +233,9 @@ class FFTAugmentedDataset(Dataset):
     • Foreground mask and per-channel logic live in apply_style_template.
     """
 
-    def __init__(self, samples, style_bank, client_id, M, beta, img_side,
-                 grayscale=True):
+    def __init__(self, samples, style_bank, client_id, beta, img_side,
+             grayscale=True, mean_bank=None,
+             prefer_distant=True, use_mean_template=False):
         self.samples    = samples
         self.style_bank = style_bank
         self.client_id  = client_id
@@ -243,6 +244,13 @@ class FFTAugmentedDataset(Dataset):
         self.img_side   = img_side
         self.grayscale  = grayscale
         self.other_ids  = [cid for cid in style_bank if cid != client_id]
+        self.mean_bank         = mean_bank
+        self.prefer_distant    = prefer_distant
+        self.use_mean_template = use_mean_template
+    
+        # pre-compute donor order by L2 distance of low-frequency mean templates
+        # done once at dataset construction — not repeated per sample
+        self.donor_order = self._rank_donors()
 
         self.spatial_aug = T.RandomChoice([
             T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
@@ -286,19 +294,73 @@ class FFTAugmentedDataset(Dataset):
         pil = self.spatial_aug(pil)
         return self.norm(pil)
 
+    def _rank_donors(self):
+        """
+        Rank other clients by L2 distance of their mean template to this
+        client's mean template. Uses only the low-frequency region (centre
+        patch of the fftshifted amplitude — same region the Gaussian mask
+        targets) to measure domain distance.
+    
+        Returns sorted list of client IDs:
+          prefer_distant=True  → most different first
+          prefer_distant=False → most similar first
+        Falls back to random order if mean_bank is unavailable.
+        """
+        if not self.mean_bank or self.client_id not in self.mean_bank:
+            return list(self.other_ids)   # fallback: random order
+    
+        own_mean = self.mean_bank[self.client_id]
+        H, W     = own_mean.shape[:2]
+    
+        # extract centre low-frequency patch (inner 25% of H and W)
+        ch, cw   = H // 2, W // 2
+        ph, pw   = H // 8, W // 8          # patch half-size
+        def _lf_patch(arr):
+            patch = arr[ch-ph:ch+ph, cw-pw:cw+pw]
+            return patch.flatten()
+    
+        own_lf = _lf_patch(own_mean)
+    
+        distances = {}
+        for cid in self.other_ids:
+            if cid in self.mean_bank:
+                other_lf     = _lf_patch(self.mean_bank[cid])
+                distances[cid] = np.linalg.norm(own_lf - other_lf)
+            else:
+                distances[cid] = 0.0
+    
+        # sort: largest distance first if prefer_distant, else smallest first
+        return sorted(self.other_ids,
+                      key=lambda c: distances[c],
+                      reverse=self.prefer_distant)
+        
     def __getitem__(self, idx):
         sample_idx = idx // self.M
         aug_idx    = idx  % self.M
-
+    
         path, label = self.samples[sample_idx]
         img_np = self._load_np(path)
-
+    
         if aug_idx == 0 or not self.other_ids:
             return self._to_tensor(img_np), label
-
-        rand_client   = random.choice(self.other_ids)
-        rand_template = random.choice(self.style_bank[rand_client])
-        img_syn       = apply_style_template(img_np, rand_template, self.beta)
+    
+        # donor client selection
+        if self.donor_order and self.mean_bank:
+            # domain-aware: pre-ranked by L2 distance of mean low-freq templates
+            rand_client = self.donor_order[0]
+        else:
+            # default: uniform random — original behaviour
+            rand_client = random.choice(self.other_ids)
+    
+        # template selection from chosen donor
+        if self.use_mean_template and self.mean_bank and rand_client in self.mean_bank:
+            # domain-aware: use the donor's mean amplitude template
+            rand_template = self.mean_bank[rand_client]
+        else:
+            # default: random sample from donor's bank — original behaviour
+            rand_template = random.choice(self.style_bank[rand_client])
+    
+        img_syn = apply_style_template(img_np, rand_template, self.beta)
         return self._to_tensor(img_syn), label
 
 
