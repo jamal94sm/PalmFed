@@ -68,8 +68,8 @@ CONFIG = {
     # ── CCNet-specific hyperparameters ─────────────────────────
     # (only used when model="ccnet")
     "comp_weight"      : 0.8,    # channel vs spatial competition weight
-    "ce_weight"        : 0.8,    # CrossEntropy loss weight
-    "con_weight"       : 0.2,    # SupConLoss weight  (CCNet, CompNet, DINOv2)
+    "ce_weight"        : 0.9,    # CrossEntropy loss weight
+    "con_weight"       : 0.1,    # SupConLoss weight  (CCNet, CompNet, DINOv2)
     "temperature"      : 0.07,   # SupConLoss temperature (all models)
 
     # ── Center Loss ────────────────────────────────────────────
