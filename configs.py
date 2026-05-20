@@ -57,7 +57,7 @@ CONFIG = {
     # ── Domain distance-aware mixing ───────────────────────────
     # Only used when use_fft_aug=True or use_mixed_aug=True.
     "domain_aware_mixing" : True,  # True → distance-based donor selection
-    "prefer_distant_domain": True,  # True → most different domain (max L2)
+    "prefer_distant_domain": False,  # True → most different domain (max L2)
                                      # False → most similar domain (min L2)
     "use_mean_template"   : False,  # True → use donor's mean template
                                      # False → random sample from donor's bank
