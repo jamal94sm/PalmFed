@@ -44,23 +44,20 @@ CONFIG = {
     # ── FFT style augmentation ─────────────────────────────────
     "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
-    "use_fft_aug"      : False,  # True → FFT style augmentation | False → normal augmentation 
-    "use_mixed_aug"    : False,   # True → spatial first, FFT second (overrides use_fft_aug)
-    "mixed_aug_round"  : 25,     # round at which to switch from spatial → FFT
-    
+
+    # Augmentation mode — exactly one should be True (or both False for spatial-only):
+    #   use_fft_aug=False, use_mixed_aug=False → spatial augmentation only
+    #   use_fft_aug=True,  use_mixed_aug=False → FFT + spatial all rounds
+    #   use_fft_aug=False, use_mixed_aug=True  → spatial first, FFT second
+    #   (use_mixed_aug takes priority over use_fft_aug when both are True)
+    "use_fft_aug"      : False,  # True → FFT aug for all rounds
+    "use_mixed_aug"    : False,  # True → spatial first, then FFT (overrides use_fft_aug)
+    "mixed_aug_round"  : 25,     # round at which to switch spatial → FFT (mixed mode only)
+
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 50,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
-    # ── Center Loss ────────────────────────────────────────────
-    # Minimises distance between embeddings and their class centres,
-    # enforcing intra-class compactness. Centres are kept local per
-    # client and carried over across rounds.
-    "use_center_loss"    : False,  # True → add CenterLoss to training
-    "center_loss_weight" : 1,  # λ — small so CE/ArcFace still dominates
-    "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
-
-    
     # ── CompNet hyperparameters ────────────────────────────────
     "img_side"         : 128,
     "embedding_dim"    : 512,    # CompNet FC output dim
@@ -72,8 +69,16 @@ CONFIG = {
     # (only used when model="ccnet")
     "comp_weight"      : 0.8,    # channel vs spatial competition weight
     "ce_weight"        : 0.8,    # CrossEntropy loss weight
-    "con_weight"       : 0.2,    # SupConLoss weight
-    "temperature"      : 0.07,   # SupConLoss temperature
+    "con_weight"       : 0.2,    # SupConLoss weight  (CCNet, CompNet, DINOv2)
+    "temperature"      : 0.07,   # SupConLoss temperature (all models)
+
+    # ── Center Loss ────────────────────────────────────────────
+    # Minimises distance between embeddings and their class centres,
+    # enforcing intra-class compactness. Centres are kept local per
+    # client and carried over across rounds.
+    "use_center_loss"    : False,  # True → add CenterLoss to training
+    "center_loss_weight" : 0.003,  # λ — small so CE/ArcFace still dominates
+    "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
 
     # ── DINOv2-specific hyperparameters ───────────────────────
     # (only used when model="dinov2")
