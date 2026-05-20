@@ -21,7 +21,7 @@ Outputs
 # ==============================================================
 CONFIG = {
     # ── Dataset ────────────────────────────────────────────────
-    "dataset"        : "xjtu",   # "casiams" | "xjtu"
+    "dataset"        : "casiams",   # "casiams" | "xjtu"
     "casiams_root"   : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "xjtu_root"      : "/home/pai-ng/Jamal/XJTU-UP",
     "img_side"       : 128,
@@ -29,7 +29,7 @@ CONFIG = {
     "n_imgs_per_id"  : 5,       # images per identity per domain to sample
 
     # ── Analysis ───────────────────────────────────────────────
-    "method"         : "anova",   # "anova" | "logreg"
+    "method"         : "logreg",   # "anova" | "logreg"
     "n_bins"         : 20,        # number of radial frequency bands to analyse
     "logreg_C"       : 0.1,       # regularisation for logistic regression
     "random_seed"    : 42,
