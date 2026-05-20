@@ -141,7 +141,7 @@ class FLClient:
 
     # ── local training ──────────────────────────────────────────────────────
 
-    def local_train(self, local_epochs, active_style_bank, M, rnd):
+    def local_train(self, local_epochs, active_style_bank, M, rnd, mean_bank=None):
         """
         Train local model for local_epochs epochs.
 
@@ -162,10 +162,12 @@ class FLClient:
                     samples    = self.train_samples,
                     style_bank = active_style_bank,
                     client_id  = self.client_id,
-                    M          = M,
                     beta       = self.cfg["fft_beta"],
                     img_side   = img_side,
                     grayscale  = grayscale,
+                    mean_bank       = mean_bank,
+                    prefer_distant  = self.cfg.get("prefer_distant_domain", True),
+                    use_mean_template = self.cfg.get("use_mean_template", False),
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
@@ -516,6 +518,15 @@ def main():
         print("  Spatial augmentation only — style bank extracted "
               "but not used during training.\n")
 
+    # compute per-client mean template for domain distance-aware mixing
+    # mean_bank: {client_id: mean_amplitude_array}  same shape as one template
+    mean_bank = {
+        cid: np.mean(templates, axis=0)
+        for cid, templates in style_bank_full.items()
+        if len(templates) > 0
+    }
+    print(f"  Mean bank ready — {len(mean_bank)} domain mean templates")
+
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
     g_eer_0, g_rank1_0 = server.evaluate()
@@ -543,7 +554,9 @@ def main():
         for client in clients:
             client.set_weights(global_weights)
             loss, acc = client.local_train(
-                cfg["local_epochs"], active_style_bank, cfg["M"], rnd)
+                cfg["local_epochs"], active_style_bank, cfg["M"], rnd,
+                mean_bank = mean_bank if cfg.get("domain_aware_mixing", False) else None,
+            )
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
