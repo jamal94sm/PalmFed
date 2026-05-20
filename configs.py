@@ -14,7 +14,7 @@ CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # "casiams" : 6 clients, one per spectral band
     # "xjtu"    : 4 clients, one per (smartphone, lighting) domain
-    "dataset"          : "xjtu",
+    "dataset"          : "casiams",
 
     # ── Model selection ────────────────────────────────────────
     "model"            : "compnet",  # "compnet" | "ccnet" | "dinov2"
