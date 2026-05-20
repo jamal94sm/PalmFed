@@ -80,7 +80,7 @@ CONFIG = {
     "center_loss_weight" : 0.003,  # λ — small so CE/ArcFace still dominates
     "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
 
-    "lambda_style"     : 0.1,    # StyleConsistencyLoss weight (0.0 = disabled)
+    "lambda_style"     : 0.0,    # StyleConsistencyLoss weight (0.0 = disabled)
 
     
     # ── DINOv2-specific hyperparameters ───────────────────────
