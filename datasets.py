@@ -86,15 +86,13 @@ class PalmDataset(Dataset):
 class AugmentedDataset(Dataset):
     """
     Training dataset with standard spatial/photometric augmentation.
-    Used as the baseline (use_fft_aug=False) for all models so that
-    the baseline is not disadvantaged by unaugmented data.
     Returns a single (augmented_image, label) per sample.
 
     Parameters
     ----------
     grayscale : bool
-        True  → grayscale NormSingleROI normalisation (CompNet, CCNet)
-        False → RGB 3-channel ImageNet normalisation (DINOv2)
+        True  → grayscale + NormSingleROI  (CompNet, CCNet)
+        False → RGB + ImageNet norm        (DINOv2)
     """
     def __init__(self, samples, img_side=128, grayscale=True):
         self.samples   = samples
@@ -289,8 +287,8 @@ class FFTAugmentedDataset(Dataset):
         return self.norm(pil)
 
     def __getitem__(self, idx):
-        sample_idx = idx // self.M   # which original sample
-        aug_idx    = idx  % self.M   # 0 = original, 1..M-1 = synthetic
+        sample_idx = idx // self.M
+        aug_idx    = idx  % self.M
 
         path, label = self.samples[sample_idx]
         img_np = self._load_np(path)
