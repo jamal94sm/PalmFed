@@ -51,12 +51,12 @@ CONFIG = {
     #   use_fft_aug=False, use_mixed_aug=True  → spatial first, FFT second
     #   (use_mixed_aug takes priority over use_fft_aug when both are True)
     "use_fft_aug"      : True,  # True → FFT aug for all rounds
-    "use_mixed_aug"    : True,  # True → spatial first, then FFT (overrides use_fft_aug)
+    "use_mixed_aug"    : False,  # True → spatial first, then FFT (overrides use_fft_aug)
     "mixed_aug_round"  : 15,     # round at which to switch spatial → FFT (mixed mode only)
 
     # ── Domain distance-aware mixing ───────────────────────────
     # Only used when use_fft_aug=True or use_mixed_aug=True.
-    "domain_aware_mixing" : True,  # True → distance-based donor selection
+    "domain_aware_mixing" : False,  # True → distance-based donor selection
     "prefer_distant_domain": False,  # True → most different domain (max L2)
                                      # False → most similar domain (min L2)
     "use_mean_template"   : True,  # True → use donor's mean template
