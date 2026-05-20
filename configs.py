@@ -80,6 +80,9 @@ CONFIG = {
     "center_loss_weight" : 0.003,  # λ — small so CE/ArcFace still dominates
     "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
 
+    "lambda_style"     : 0.5,    # StyleConsistencyLoss weight (0.0 = disabled)
+
+    
     # ── DINOv2-specific hyperparameters ───────────────────────
     # (only used when model="dinov2")
     # DINOv2 uses RGB 224×224 with ImageNet normalisation.
