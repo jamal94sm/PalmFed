@@ -52,7 +52,7 @@ CONFIG = {
     #   (use_mixed_aug takes priority over use_fft_aug when both are True)
     "use_fft_aug"      : True,  # True → FFT aug for all rounds
     "use_mixed_aug"    : True,  # True → spatial first, then FFT (overrides use_fft_aug)
-    "mixed_aug_round"  : 10,     # round at which to switch spatial → FFT (mixed mode only)
+    "mixed_aug_round"  : 15,     # round at which to switch spatial → FFT (mixed mode only)
 
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 30,    # R: total communication rounds
@@ -69,7 +69,7 @@ CONFIG = {
     # (only used when model="ccnet")
     "comp_weight"      : 0.8,    # channel vs spatial competition weight
     "ce_weight"        : 0.8,    # CrossEntropy loss weight
-    "con_weight"       : 0.0,    # SupConLoss weight  (CCNet, CompNet, DINOv2)
+    "con_weight"       : 0.2,    # SupConLoss weight  (CCNet, CompNet, DINOv2)
     "temperature"      : 0.07,   # SupConLoss temperature (all models)
 
     # ── Center Loss ────────────────────────────────────────────
