@@ -14,7 +14,7 @@ CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # "casiams" : 6 clients, one per spectral band
     # "xjtu"    : 4 clients, one per (smartphone, lighting) domain
-    "dataset"          : "casiams",
+    "dataset"          : "xjtu",
 
     # ── Model selection ────────────────────────────────────────
     "model"            : "dinov2",  # "compnet" | "ccnet" | "dinov2"
@@ -46,7 +46,7 @@ CONFIG = {
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
     "use_fft_aug"      : True,  # True → FFT style augmentation | False → normal augmentation 
     "use_mixed_aug"    : False,   # True → spatial first, FFT second (overrides use_fft_aug)
-    "mixed_aug_round"  : 15,     # round at which to switch from spatial → FFT
+    "mixed_aug_round"  : 25,     # round at which to switch from spatial → FFT
     
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 50,    # R: total communication rounds
