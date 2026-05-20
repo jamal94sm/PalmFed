@@ -86,20 +86,26 @@ class PalmDataset(Dataset):
 class AugmentedDataset(Dataset):
     """
     Training dataset with standard spatial/photometric augmentation.
-    Used as the baseline (use_fft_aug=False) for all models so that
-    the baseline is not disadvantaged by unaugmented data.
+    Returns ([orig, aug], label):
+      orig — original image, normalised but NOT augmented.
+             Anchors SupConLoss to the real data distribution.
+      aug  — spatially augmented version of the same image.
+
+    This (original, augmented) pairing directly enforces intra-class
+    compactness between each sample and its augmented counterpart,
+    rather than between two independently augmented copies.
 
     Parameters
     ----------
     grayscale : bool
         True  → grayscale NormSingleROI normalisation (CompNet, CCNet)
         False → RGB 3-channel ImageNet normalisation (DINOv2)
-                Images are loaded as grayscale and replicated to 3 channels,
-                which is correct since palmprint ROIs are single-channel.
     """
     def __init__(self, samples, img_side=128, grayscale=True):
         self.samples   = samples
         self.grayscale = grayscale
+
+        self.resize = T.Resize((img_side, img_side))
 
         self.aug_transform = T.Compose([
             T.Resize((img_side, img_side)),
@@ -116,7 +122,6 @@ class AugmentedDataset(Dataset):
             ]),
         ])
 
-        # normalisation differs by model family
         if grayscale:
             self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
         else:
@@ -130,31 +135,27 @@ class AugmentedDataset(Dataset):
 
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        if self.grayscale:
-            img = Image.open(path).convert("L")   # grayscale for CompNet/CCNet
-        else:
-            img = Image.open(path).convert("RGB") # RGB for DINOv2 — augment in RGB
-        img = self.aug_transform(img)
-        return self.norm(img), label
+        mode = "L" if self.grayscale else "RGB"
+        img  = Image.open(path).convert(mode)
+        orig = self.norm(self.resize(img))         # original — no augmentation
+        aug  = self.norm(self.aug_transform(img))  # spatially augmented copy
+        return [orig, aug], label
 
 
 class PairedDataset(Dataset):
     """
     Paired same-class dataset for CCNet contrastive training.
 
-    Returns ([img1, img2], label) where img2 is a different sample of the
-    same identity — required to form the two views for SupConLoss.
+    Returns ([img1, img2], label):
+      img1 — original sample of the identity, normalised with NO augmentation.
+              Always anchors SupConLoss to the real data distribution.
+      img2 — different real sample of the same identity, augmented:
+              • use_fft=True  → FFT style swap from random other client
+                                + spatial augmentation
+              • use_fft=False → spatial augmentation only
 
-    Augmentation modes (controlled by style_bank argument):
-      style_bank is None or empty → standard spatial augmentation only
-      style_bank is populated      → FFT style swap on both views
-                                     (each view independently gets a random
-                                      template from a random other client)
-                                     + spatial augmentation applied after FFT
-
-    The foreground mask is saved before FFT and re-applied after
-    reconstruction so that NormSingleROI always operates on the correct
-    palm ROI pixels only.
+    This asymmetric design ensures SupConLoss always pulls augmented
+    embeddings toward their real-data anchors, not toward each other.
     """
     def __init__(self, samples, img_side=128,
                  style_bank=None, client_id=None, beta=0.15):
@@ -171,7 +172,7 @@ class PairedDataset(Dataset):
         for i, (_, lab) in enumerate(samples):
             self.label2idxs[lab].append(i)
 
-        # spatial augmentation — applied to every image
+        # spatial augmentation — used for img2
         self.spatial_aug = T.RandomChoice([
             T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
             T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
@@ -184,12 +185,19 @@ class PairedDataset(Dataset):
             ]),
         ])
 
-        self.to_tensor = T.Compose([
+        # original view — resize only, no augmentation, no spatial randomness
+        self.to_tensor_orig = T.Compose([
             T.Resize((img_side, img_side)),
             T.ToTensor(),
             NormSingleROI(outchannels=1),
         ])
-        # no T.Resize in to_tensor_fft — _load_np already resizes
+        # augmented view — includes resize for spatial aug path
+        self.to_tensor_aug = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+        # FFT aug path — _load_np already resizes, so no T.Resize needed
         self.to_tensor_fft = T.Compose([
             T.ToTensor(),
             NormSingleROI(outchannels=1),
@@ -198,82 +206,79 @@ class PairedDataset(Dataset):
     def __len__(self): return len(self.samples)
 
     def _load_np(self, path):
-        """Load, resize, return float32 in [0, 1]."""
+        """Load, resize, return grayscale float32 in [0, 1]."""
         img = Image.open(path).convert("L").resize(
             (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
-    def _augment_image(self, path):
+    def _original_view(self, path):
+        """Load original image with NO augmentation — real-data anchor for img1."""
+        img = Image.open(path).convert("L")
+        return self.to_tensor_orig(img)
+
+    def _aug_view(self, path):
         """
-        Load one image and apply the configured augmentation.
-        Returns a normalised tensor.
+        Load and augment — used for img2.
+        use_fft=True  → FFT style swap from random other client + spatial aug
+        use_fft=False → spatial augmentation only
         """
         if self.use_fft:
-            img_np  = self._load_np(path)
-            fg_mask = img_np > 0
-
+            img_np        = self._load_np(path)
             rand_client   = random.choice(self.other_ids)
             rand_template = random.choice(self.style_bank[rand_client])
-            img_np = apply_style_template(img_np, rand_template, self.beta)
-            img_np[~fg_mask] = 0.0   # restore background zeros
-
+            img_np        = apply_style_template(img_np, rand_template, self.beta)
             pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
             pil = self.spatial_aug(pil)
             return self.to_tensor_fft(pil)
         else:
             img = Image.open(path).convert("L")
             img = self.spatial_aug(img)
-            return self.to_tensor(img)
+            return self.to_tensor_aug(img)
 
     def __getitem__(self, idx):
         path1, label = self.samples[idx]
-        # pick a different sample from the same identity
+        # pick a different sample of the same identity for img2
         idxs = self.label2idxs[label]
         idx2 = idx
         while idx2 == idx and len(idxs) > 1:
             idx2 = random.choice(idxs)
         path2, _ = self.samples[idx2]
 
-        img1 = self._augment_image(path1)
-        img2 = self._augment_image(path2)
+        img1 = self._original_view(path1)  # original — no augmentation
+        img2 = self._aug_view(path2)       # FFT+spatial or spatial only
         return [img1, img2], label
 
 
 class FFTAugmentedDataset(Dataset):
     """
-    Training dataset with FFT style augmentation + spatial augmentation.
-    Used for CompNet when use_fft_aug=True.
+    Training dataset with FFT style augmentation for CompNet and DINOv2.
 
-    For each original sample x_i, M-1 synthetic copies are produced by
-    replacing its low-frequency amplitude with a randomly chosen template
-    from a randomly chosen other client's style bank.
+    Returns ([orig, aug], label) — one pair per sample:
+      orig — original image, normalised with NO augmentation.
+             Anchors SupConLoss to the real data distribution.
+      aug  — same original with FFT style swap from a random other client,
+             then spatial augmentation.
 
-    Index layout: indices [i*M .. i*M+M-1] map to sample i.
-      aug_idx == 0  → original   + spatial augmentation
-      aug_idx >= 1  → FFT styled + spatial augmentation
+    SupConLoss in train_compnet_epoch directly enforces that the
+    FFT-augmented embedding stays close to the original embedding of the
+    same identity, improving intra-class compactness across domains.
 
     Notes
     ─────
-    • T.Resize absent from self.to_tensor — _load_np already resizes.
-    • Spatial augmentation applied to ALL samples for fair comparison.
-    • Foreground mask saved before FFT and re-applied after reconstruction
-      so NormSingleROI computes statistics on palm ROI pixels only
-      (inverse FFT leaves small non-zero residuals in background).
+    • Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2.
+    • Foreground mask and per-channel logic live in apply_style_template.
     """
 
-    def __init__(self, samples, style_bank, client_id, M, beta, img_side,
+    def __init__(self, samples, style_bank, client_id, beta, img_side,
                  grayscale=True):
         self.samples    = samples
-        self.style_bank = style_bank   # {client_id: [amp_array, ...]}
+        self.style_bank = style_bank
         self.client_id  = client_id
-        self.M          = M
         self.beta       = beta
         self.img_side   = img_side
         self.grayscale  = grayscale
-        # a client never borrows its own style (no domain shift otherwise)
         self.other_ids  = [cid for cid in style_bank if cid != client_id]
 
-        # spatial augmentation — applied to all samples after FFT processing
         self.spatial_aug = T.RandomChoice([
             T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
             T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
@@ -286,19 +291,26 @@ class FFTAugmentedDataset(Dataset):
             ]),
         ])
 
-        # no T.Resize — _load_np already resizes to img_side
-        # normalisation differs by model family
+        # original view — resize only, no augmentation
+        self.norm_orig = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1) if grayscale else
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        # FFT-augmented view — _load_np already resizes, no T.Resize needed
         if grayscale:
-            self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
+            self.norm_aug = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
         else:
-            self.norm = T.Compose([
+            self.norm_aug = T.Compose([
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406],
                             std =[0.229, 0.224, 0.225]),
             ])
 
     def __len__(self):
-        return len(self.samples) * self.M
+        return len(self.samples)
 
     def _load_np(self, path):
         """Load and resize. Returns float32 in [0, 1].
@@ -308,33 +320,34 @@ class FFTAugmentedDataset(Dataset):
             (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
-    def _to_tensor(self, img_np):
-        """numpy array → PIL → spatial aug → normalised tensor.
-        For grayscale (H, W): mode="L", NormSingleROI.
-        For RGB (H, W, 3): mode="RGB", ImageNet norm — no conversion needed."""
+    def _np_to_aug_tensor(self, img_np):
+        """numpy → PIL (correct mode) → spatial aug → normalised tensor."""
         if self.grayscale:
             pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
         else:
             pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="RGB")
         pil = self.spatial_aug(pil)
-        return self.norm(pil)
+        return self.norm_aug(pil)
 
     def __getitem__(self, idx):
-        sample_idx = idx // self.M   # which original sample
-        aug_idx    = idx  % self.M   # 0 = original, 1..M-1 = synthetic
-
-        path, label = self.samples[sample_idx]
+        path, label = self.samples[idx]
+        mode   = "L" if self.grayscale else "RGB"
         img_np = self._load_np(path)
 
-        if aug_idx == 0 or not self.other_ids:
-            return self._to_tensor(img_np), label
+        # orig: original image with NO augmentation — real-data anchor
+        orig = self.norm_orig(Image.open(path).convert(mode))
 
-        # FFT style swap — foreground mask and per-channel handling are
-        # both dealt with inside apply_style_template based on img_np.ndim
-        rand_client   = random.choice(self.other_ids)
-        rand_template = random.choice(self.style_bank[rand_client])
-        img_syn       = apply_style_template(img_np, rand_template, self.beta)
-        return self._to_tensor(img_syn), label
+        # aug: FFT style swap + spatial aug
+        if self.other_ids:
+            rand_client   = random.choice(self.other_ids)
+            rand_template = random.choice(self.style_bank[rand_client])
+            img_syn       = apply_style_template(img_np, rand_template, self.beta)
+            aug = self._np_to_aug_tensor(img_syn)
+        else:
+            # fallback: spatial aug only (no other clients)
+            aug = self._np_to_aug_tensor(img_np)
+
+        return [orig, aug], label
 
 
 # ══════════════════════════════════════════════════════════════
