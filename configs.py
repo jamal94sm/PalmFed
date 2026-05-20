@@ -25,7 +25,7 @@ CONFIG = {
     # XJTU  (only used when dataset="xjtu")
     "xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",
 
-    "base_results_dir" : "./rst_fedavg_casiams",
+    "base_results_dir" : "./rst_fedavg_{dataset}_{model}",
 
     # ── Fair comparison: shared splits and init weights ────────
     # Both runs (use_fft_aug=True and False) must load from the
@@ -52,10 +52,10 @@ CONFIG = {
     #   (use_mixed_aug takes priority over use_fft_aug when both are True)
     "use_fft_aug"      : True,  # True → FFT aug for all rounds
     "use_mixed_aug"    : True,  # True → spatial first, then FFT (overrides use_fft_aug)
-    "mixed_aug_round"  : 25,     # round at which to switch spatial → FFT (mixed mode only)
+    "mixed_aug_round"  : 15,     # round at which to switch spatial → FFT (mixed mode only)
 
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 50,    # R: total communication rounds
+    "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── CompNet hyperparameters ────────────────────────────────
