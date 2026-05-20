@@ -273,20 +273,14 @@ class CenterLoss(nn.Module):
 
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
-                        lambda_center=0.0, lambda_con=0.0, temperature=0.07):
+                        lambda_center=0.0):
     """
     Train CompNet (or DINOv2) for one epoch.
 
     Loss : CrossEntropyLoss(ArcFace logits)
-         + lambda_con    × SupConLoss  (optional, batch-level)
          + lambda_center × CenterLoss  (optional)
 
     Dataset returns (img, label) — single image per sample.
-
-    SupConLoss is applied over the full batch using labels to identify
-    positive pairs. A per-batch guard skips the loss when no class has
-    ≥2 samples in the batch (which is common when batch_size < 2 ×
-    num_classes), preventing NaN from empty positive sets.
 
     Parameters
     ----------
@@ -297,9 +291,7 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     device           : torch.device
     center_loss      : CenterLoss | None
     center_optimizer : torch.optim.SGD | None
-    lambda_center    : float  CenterLoss weight  (0 → disabled)
-    lambda_con       : float  SupConLoss weight  (0 → disabled)
-    temperature      : float  SupConLoss temperature
+    lambda_center    : float  CenterLoss weight (0 → disabled)
 
     Returns
     -------
@@ -313,19 +305,6 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     use_center = (center_loss is not None and
                   center_optimizer is not None and
                   lambda_center > 0.0)
-    use_supcon = lambda_con > 0.0
-    if use_supcon:
-        supcon = SupConLoss(temperature=temperature,
-                            base_temperature=temperature)
-
-    def _get_emb(imgs):
-        return model._backbone(imgs) if hasattr(model, "_backbone") \
-               else model.backbone(imgs)
-
-    def _get_logits(emb, labels):
-        if hasattr(model, "drop"):
-            return model.arc(model.drop(emb), labels)
-        return model.arc(emb, labels)
 
     running_loss = 0.0; correct = 0; total = 0
 
@@ -336,21 +315,13 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         if use_center:
             center_optimizer.zero_grad()
 
-        if use_supcon or use_center:
-            emb    = _get_emb(imgs)
-            logits = _get_logits(emb, labels)
-            loss   = criterion(logits, labels)
-            if use_supcon:
-                # guard: skip if no class has ≥2 samples in this batch
-                # (prevents NaN from mask.sum(1) == 0 in SupConLoss)
-                label_counts  = torch.bincount(
-                    labels, minlength=labels.max().item() + 1)
-                has_positives = (label_counts >= 2).any()
-                if has_positives:
-                    emb_n = F.normalize(emb, p=2, dim=1).unsqueeze(1)  # [B,1,D]
-                    loss  = loss + lambda_con * supcon(emb_n, labels)
-            if use_center:
-                loss = loss + lambda_center * center_loss(emb.detach(), labels)
+        if use_center:
+            emb    = model._backbone(imgs) if hasattr(model, "_backbone") \
+                     else model.backbone(imgs)
+            logits = model.arc(model.drop(emb), labels) if hasattr(model, "drop") \
+                     else model.arc(emb, labels)
+            loss   = criterion(logits, labels) + \
+                     lambda_center * center_loss(emb.detach(), labels)
         else:
             logits = model(imgs, labels)
             loss   = criterion(logits, labels)
