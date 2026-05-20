@@ -239,7 +239,6 @@ class FFTAugmentedDataset(Dataset):
         self.samples    = samples
         self.style_bank = style_bank
         self.client_id  = client_id
-        self.M          = M
         self.beta       = beta
         self.img_side   = img_side
         self.grayscale  = grayscale
@@ -275,7 +274,7 @@ class FFTAugmentedDataset(Dataset):
             ])
 
     def __len__(self):
-        return len(self.samples) * self.M
+        return len(self.samples)
 
     def _load_np(self, path):
         """Load and resize. Returns float32 in [0, 1].
