@@ -21,7 +21,7 @@ Outputs
 # ==============================================================
 CONFIG = {
     # ── Dataset ────────────────────────────────────────────────
-    "dataset"        : "casiams",   # "casiams" | "xjtu"
+    "dataset"        : "xjtu",   # "casiams" | "xjtu"
     "casiams_root"   : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "xjtu_root"      : "/home/pai-ng/Jamal/XJTU-UP",
     "img_side"       : 128,
