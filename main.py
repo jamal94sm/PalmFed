@@ -218,6 +218,8 @@ class FLClient:
                     center_loss      = self.center_loss,
                     center_optimizer = self.center_optimizer,
                     lambda_center    = lambda_c,
+                    lambda_con       = self.cfg.get("con_weight",  0.2),
+                    temperature      = self.cfg.get("temperature", 0.07),
                 )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
