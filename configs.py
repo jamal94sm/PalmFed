@@ -14,7 +14,7 @@ CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # "casiams" : 6 clients, one per spectral band
     # "xjtu"    : 4 clients, one per (smartphone, lighting) domain
-    "dataset"          : "xjtu",
+    "dataset"          : "casiams",
 
     # ── Model selection ────────────────────────────────────────
     "model"            : "compnet",  # "compnet" | "ccnet" | "dinov2"
@@ -42,7 +42,7 @@ CONFIG = {
     "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
     # ── FFT style augmentation ─────────────────────────────────
-    "fft_beta"         : 0.8,   # Gaussian mask sigma as fraction of image size
+    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # augmented copies per sample (1 original + M-1 synthetic)
 
     # Augmentation mode — exactly one should be True (or both False for spatial-only):
