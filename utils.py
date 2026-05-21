@@ -446,7 +446,7 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                   lambda_center > 0.0)
     use_style  = lambda_style > 0.0
     use_moe_lb = (lambda_load_balance > 0.0 and
-                  hasattr(model, "moe") and model.moe is not None)
+                  hasattr(model, "get_moe_lb_loss"))
 
     def _get_emb(imgs):
         return model._backbone(imgs) if hasattr(model, "_backbone") \
@@ -462,7 +462,6 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     for data, labels in loader:
         labels = labels.to(device)
 
-        # format detection: paired [orig, aug] or single image
         if isinstance(data, (list, tuple)):
             orig    = data[0].to(device)
             aug     = data[1].to(device)
@@ -476,35 +475,23 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         if use_center:
             center_optimizer.zero_grad()
 
-        # backbone embedding (before MoE and ArcFace)
-        emb_backbone = _get_emb(orig)
-
-        # apply MoE if present — get refined embedding and lb loss
-        if use_moe_lb:
-            emb_orig, lb_loss = model.moe(emb_backbone)
-        elif hasattr(model, "moe") and model.moe is not None:
-            emb_orig, _       = model.moe(emb_backbone)
-            lb_loss           = torch.tensor(0.0, device=device)
-        else:
-            emb_orig = emb_backbone
-            lb_loss  = torch.tensor(0.0, device=device)
-
-        logits = _get_logits(emb_orig, labels)
-        loss   = criterion(logits, labels)
+        # backbone forward — if use_moe=True, LoRA MoE runs inside blocks 10-11
+        # and populates _lb_loss in each LoRAMoEMLP
+        emb_orig = _get_emb(orig)
+        logits   = _get_logits(emb_orig, labels)
+        loss     = criterion(logits, labels)
 
         if use_style and has_aug:
-            emb_aug_bb = _get_emb(aug)
-            if hasattr(model, "moe") and model.moe is not None:
-                emb_aug, _ = model.moe(emb_aug_bb)
-            else:
-                emb_aug = emb_aug_bb
-            sim   = F.cosine_similarity(
+            emb_aug = _get_emb(aug)
+            sim     = F.cosine_similarity(
                 F.normalize(emb_orig, p=2, dim=1),
                 F.normalize(emb_aug,  p=2, dim=1), dim=1)
-            loss  = loss + lambda_style * (1.0 - sim.mean())
+            loss = loss + lambda_style * (1.0 - sim.mean())
 
         if use_moe_lb:
-            loss = loss + lambda_load_balance * lb_loss
+            # collect lb_loss from LoRAMoEMLP._lb_loss of blocks 10 and 11
+            lb_loss = model.get_moe_lb_loss()
+            loss    = loss + lambda_load_balance * lb_loss
 
         if use_center:
             loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
