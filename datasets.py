@@ -86,7 +86,13 @@ class PalmDataset(Dataset):
 class AugmentedDataset(Dataset):
     """
     Training dataset with standard spatial/photometric augmentation.
-    Returns a single (augmented_image, label) per sample.
+    Returns ([orig, aug], label):
+      orig — original image, resize + normalise only (no augmentation).
+      aug  — same image with random spatial augmentation applied.
+
+    The pair enables style consistency loss in train_compnet_epoch:
+      loss += lambda_style * (1 - cosine_sim(emb_orig, emb_aug))
+    ArcFace classification uses orig only.
 
     Parameters
     ----------
@@ -98,7 +104,7 @@ class AugmentedDataset(Dataset):
         self.samples   = samples
         self.grayscale = grayscale
 
-        self.transform = T.Compose([
+        aug_transforms = [
             T.Resize((img_side, img_side)),
             T.RandomChoice([
                 T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
@@ -111,17 +117,26 @@ class AugmentedDataset(Dataset):
                                      center=(0, int(0.5*img_side))),
                 ]),
             ]),
-            T.ToTensor(),
-            NormSingleROI(outchannels=1) if grayscale else
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        ]
+
+        if grayscale:
+            norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
+        else:
+            norm = T.Compose([T.ToTensor(),
+                              T.Normalize(mean=[0.485, 0.456, 0.406],
+                                          std =[0.229, 0.224, 0.225])])
+
+        self.transform_orig = T.Compose([T.Resize((img_side, img_side))] +
+                                         [norm])
+        self.transform_aug  = T.Compose(aug_transforms + [norm])
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         mode = "L" if self.grayscale else "RGB"
-        return self.transform(Image.open(path).convert(mode)), label
+        img  = Image.open(path).convert(mode)
+        return [self.transform_orig(img), self.transform_aug(img)], label
 
 
 class PairedDataset(Dataset):
@@ -216,40 +231,44 @@ class PairedDataset(Dataset):
 
 class FFTAugmentedDataset(Dataset):
     """
-    Training dataset with FFT style augmentation + spatial augmentation.
-    Used for CompNet and DINOv2 when use_fft_aug=True.
+    Training dataset with FFT style augmentation for CompNet and DINOv2.
 
-    For each original sample x_i, M-1 synthetic copies are produced by
-    replacing its low-frequency amplitude with a randomly chosen template
-    from a randomly chosen other client's style bank.
+    Returns ([orig, aug], label) — one pair per sample index:
+      orig — clean original image, resize + normalise only (no augmentation).
+             Anchors ArcFace, CenterLoss, and StyleConsistencyLoss to the
+             real data distribution.
+      aug  — augmented version of the same image:
+               aug_idx == 0 → spatial augmentation only (original appearance)
+               aug_idx >= 1 → FFT style swap from donor client + spatial aug
 
-    Index layout: indices [i*M .. i*M+M-1] map to sample i.
-      aug_idx == 0  → original   + spatial augmentation
-      aug_idx >= 1  → FFT styled + spatial augmentation
+    Index layout with M multiplier (same as before):
+      indices [i*M .. i*M+M-1] all map to sample i.
+      aug_idx 0     → (orig, spatial_aug_of_orig)
+      aug_idx 1..M-1 → (orig, fft_aug_of_orig)
 
     Notes
     ─────
     • Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2.
-    • Foreground mask and per-channel logic live in apply_style_template.
+    • Domain-aware donor selection via mean_bank + prefer_distant toggle.
+    • use_mean_template: use donor mean template vs random sample from bank.
     """
 
-    def __init__(self, samples, style_bank, client_id, beta, M, img_side,
-             grayscale=True, mean_bank=None,
-             prefer_distant=True, use_mean_template=False):
-        self.samples    = samples
-        self.style_bank = style_bank
-        self.client_id  = client_id
-        self.beta       = beta
-        self.M          = M 
-        self.img_side   = img_side
-        self.grayscale  = grayscale
-        self.other_ids  = [cid for cid in style_bank if cid != client_id]
-        self.mean_bank         = mean_bank
-        self.prefer_distant    = prefer_distant
+    def __init__(self, samples, style_bank, client_id, M, beta, img_side,
+                 grayscale=True, mean_bank=None,
+                 prefer_distant=True, use_mean_template=False):
+        self.samples          = samples
+        self.style_bank       = style_bank
+        self.client_id        = client_id
+        self.M                = M
+        self.beta             = beta
+        self.img_side         = img_side
+        self.grayscale        = grayscale
+        self.other_ids        = [cid for cid in style_bank if cid != client_id]
+        self.mean_bank        = mean_bank
+        self.prefer_distant   = prefer_distant
         self.use_mean_template = use_mean_template
-    
-        # pre-compute donor order by L2 distance of low-frequency mean templates
-        # done once at dataset construction — not repeated per sample
+
+        # pre-compute donor ranking once at construction
         self.donor_order = self._rank_donors()
 
         self.spatial_aug = T.RandomChoice([
@@ -264,15 +283,20 @@ class FFTAugmentedDataset(Dataset):
             ]),
         ])
 
-        # no T.Resize — _load_np already resizes
         if grayscale:
-            self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
+            # orig: resize only, no spatial randomness
+            self.norm_orig = T.Compose([
+                T.Resize((img_side, img_side)),
+                T.ToTensor(), NormSingleROI(outchannels=1)])
+            # aug: _load_np already resizes, so no T.Resize here
+            self.norm_aug = T.Compose([
+                T.ToTensor(), NormSingleROI(outchannels=1)])
         else:
-            self.norm = T.Compose([
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406],
-                            std =[0.229, 0.224, 0.225]),
-            ])
+            inet = T.Normalize(mean=[0.485, 0.456, 0.406],
+                               std =[0.229, 0.224, 0.225])
+            self.norm_orig = T.Compose([
+                T.Resize((img_side, img_side)), T.ToTensor(), inet])
+            self.norm_aug  = T.Compose([T.ToTensor(), inet])
 
     def __len__(self):
         return len(self.samples) * self.M
@@ -285,83 +309,82 @@ class FFTAugmentedDataset(Dataset):
             (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
-    def _to_tensor(self, img_np):
-        """numpy array → PIL (correct mode) → spatial aug → normalised tensor."""
-        if self.grayscale:
-            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="L")
-        else:
-            pil = Image.fromarray((img_np * 255).astype(np.uint8), mode="RGB")
-        pil = self.spatial_aug(pil)
-        return self.norm(pil)
+    def _to_orig_tensor(self, path):
+        """Clean original — resize + normalise, no spatial augmentation."""
+        mode = "L" if self.grayscale else "RGB"
+        return self.norm_orig(Image.open(path).convert(mode))
+
+    def _to_aug_tensor(self, img_np):
+        """numpy → PIL → spatial aug → normalised tensor."""
+        mode = "L" if self.grayscale else "RGB"
+        pil  = Image.fromarray((img_np * 255).astype(np.uint8), mode=mode)
+        return self.norm_aug(self.spatial_aug(pil))
 
     def _rank_donors(self):
         """
-        Rank other clients by L2 distance of their mean template to this
-        client's mean template. Uses only the low-frequency region (centre
-        patch of the fftshifted amplitude — same region the Gaussian mask
-        targets) to measure domain distance.
-    
-        Returns sorted list of client IDs:
-          prefer_distant=True  → most different first
-          prefer_distant=False → most similar first
-        Falls back to random order if mean_bank is unavailable.
+        Pre-rank other clients by L2 distance of mean low-freq template.
+        Uses the inner 25% patch of the fftshifted amplitude (the region
+        that the Gaussian mask actually blends). Falls back to unordered
+        list when mean_bank is unavailable (domain_aware_mixing=False).
+
+        prefer_distant=True  → most different domain first (max L2)
+        prefer_distant=False → most similar domain first (min L2)
         """
         if not self.mean_bank or self.client_id not in self.mean_bank:
-            return list(self.other_ids)   # fallback: random order
-    
+            return list(self.other_ids)
+
         own_mean = self.mean_bank[self.client_id]
         H, W     = own_mean.shape[:2]
-    
-        # extract centre low-frequency patch (inner 25% of H and W)
         ch, cw   = H // 2, W // 2
-        ph, pw   = H // 8, W // 8          # patch half-size
+        ph, pw   = H // 8, W // 8
+
         def _lf_patch(arr):
-            patch = arr[ch-ph:ch+ph, cw-pw:cw+pw]
-            return patch.flatten()
-    
-        own_lf = _lf_patch(own_mean)
-    
+            return arr[ch-ph:ch+ph, cw-pw:cw+pw].flatten()
+
+        own_lf    = _lf_patch(own_mean)
         distances = {}
         for cid in self.other_ids:
             if cid in self.mean_bank:
-                other_lf     = _lf_patch(self.mean_bank[cid])
-                distances[cid] = np.linalg.norm(own_lf - other_lf)
+                distances[cid] = float(
+                    np.linalg.norm(own_lf - _lf_patch(self.mean_bank[cid])))
             else:
                 distances[cid] = 0.0
-    
-        # sort: largest distance first if prefer_distant, else smallest first
+
         return sorted(self.other_ids,
                       key=lambda c: distances[c],
                       reverse=self.prefer_distant)
-        
+
     def __getitem__(self, idx):
         sample_idx = idx // self.M
         aug_idx    = idx  % self.M
-    
+
         path, label = self.samples[sample_idx]
+
+        # orig: always the clean image — anchor for all losses
+        orig   = self._to_orig_tensor(path)
         img_np = self._load_np(path)
-    
+
         if aug_idx == 0 or not self.other_ids:
-            return self._to_tensor(img_np), label
-    
+            # spatial augmentation only — same behaviour as AugmentedDataset
+            aug = self._to_aug_tensor(img_np)
+            return [orig, aug], label
+
         # donor client selection
         if self.donor_order and self.mean_bank:
-            # domain-aware: pre-ranked by L2 distance of mean low-freq templates
             rand_client = self.donor_order[0]
         else:
-            # default: uniform random — original behaviour
             rand_client = random.choice(self.other_ids)
-    
+
         # template selection from chosen donor
-        if self.use_mean_template and self.mean_bank and rand_client in self.mean_bank:
-            # domain-aware: use the donor's mean amplitude template
+        if self.use_mean_template and self.mean_bank \
+                and rand_client in self.mean_bank:
             rand_template = self.mean_bank[rand_client]
         else:
-            # default: random sample from donor's bank — original behaviour
             rand_template = random.choice(self.style_bank[rand_client])
-    
+
         img_syn = apply_style_template(img_np, rand_template, self.beta)
-        return self._to_tensor(img_syn), label
+        aug     = self._to_aug_tensor(img_syn)
+        return [orig, aug], label
 
 
 # ══════════════════════════════════════════════════════════════
