@@ -375,129 +375,210 @@ class DINOBackbone(nn.Module):
         return F.normalize(cls, p=2, dim=1)
 
 
-class MoELayer(nn.Module):
+class LoRAExpert(nn.Module):
     """
-    Soft Mixture of Experts layer for domain-invariant feature learning.
-
-    Integrated into DINOv2 between the backbone CLS token and ArcFace.
-    Each expert is a two-layer MLP with a residual connection, specialising
-    in a different feature transformation. The gating network produces soft
-    weights so all experts receive gradients on every forward pass.
-
-    Design rationale in the FL setting:
-      n_experts matches the number of FL clients (one per domain). After
-      FedAvg, the shared gating network learns universal routing — which
-      input patterns benefit from which expert's transformation. Experts
-      that were trained on different domains by different clients become
-      complementary transformations in the shared model.
-
-    Load balancing loss:
-      Prevents expert collapse (all inputs routing to one expert) by
-      penalising uneven utilisation. Standard auxiliary loss from the
-      Switch Transformer paper: n_experts × sum(mean_gate² per expert).
-      Returned alongside the output so training can add it to the total loss.
+    Single LoRA adapter: a low-rank decomposition A·B applied to one linear layer.
+    B is initialised to zero so the initial contribution to the base layer is
+    exactly zero — LoRA starts as an identity pass-through and learns from there.
 
     Parameters
     ----------
-    embed_dim  : int  input/output dimensionality (384 for DINOv2 ViT-S/14)
-    n_experts  : int  number of experts — set to number of FL clients/domains
-    hidden_dim : int  expert hidden layer width (bottleneck)
+    in_dim  : int  input dimensionality  (384 for DINOv2 ViT-S fc1 input)
+    out_dim : int  output dimensionality (1536 for DINOv2 ViT-S fc1 output)
+    rank    : int  LoRA rank — controls capacity vs. parameter count
     """
-    def __init__(self, embed_dim=384, n_experts=6, hidden_dim=128):
+    def __init__(self, in_dim, out_dim, rank):
         super().__init__()
+        self.A = nn.Linear(in_dim,  rank,    bias=False)
+        self.B = nn.Linear(rank,    out_dim, bias=False)
+        nn.init.normal_(self.A.weight, std=0.02)
+        nn.init.zeros_(self.B.weight)          # zero init → zero initial output
+
+    def forward(self, x):
+        return self.B(self.A(x))
+
+
+class LoRAMoEMLP(nn.Module):
+    """
+    LoRA Mixture-of-Experts wrapper for a ViT MLP block.
+
+    Replaces the MLP inside transformer blocks 10 and 11 of DINOv2.
+    Instead of adding a separate module after all blocks (which operates on
+    an already-formed CLS token), this integrates domain-specific adaptation
+    directly into the intermediate feature transformation, where the model
+    can still modulate both patch and CLS representations.
+
+    Architecture:
+      h = fc1(x) + scale × Σ_k gate_k(CLS) × LoRA_k(x)
+      h = act(h)
+      h = fc2(h)
+
+    The gating network reads the CLS token (x[:, 0, :]) and produces soft
+    routing weights over all n_experts LoRA adapters. The same gates apply
+    to all N tokens — domain routing is image-level, not token-level.
+
+    Load balancing:
+      After each forward pass, _lb_loss stores the load balance penalty:
+        n_experts × Σ(mean_gate_k²)
+      DINOv2Model.get_moe_lb_loss() collects this from both blocks 10 and 11.
+
+    Parameters
+    ----------
+    original_mlp : nn.Module  the original MLP from the ViT block (kept intact)
+    n_experts    : int        number of LoRA adapters
+    rank         : int        LoRA rank
+    embed_dim    : int        ViT embedding dim (384 for ViT-S)
+    """
+    def __init__(self, original_mlp, n_experts, rank, embed_dim):
+        super().__init__()
+        self.mlp       = original_mlp
         self.n_experts = n_experts
+        fc1_out        = original_mlp.fc1.out_features   # 1536 for ViT-S
 
-        # gating: soft routing weights over all experts
-        self.gate = nn.Linear(embed_dim, n_experts)
-
-        # experts: independent 2-layer MLPs
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(embed_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, embed_dim),
-            )
+        self.lora_experts = nn.ModuleList([
+            LoRAExpert(embed_dim, fc1_out, rank)
             for _ in range(n_experts)
         ])
+        self.gate  = nn.Linear(embed_dim, n_experts)
+        self.scale = nn.Parameter(torch.ones(1))   # learnable LoRA scaling
+        self._lb_loss = None                        # populated each forward pass
 
     def forward(self, x):
         """
         Parameters
         ----------
-        x : Tensor [B, embed_dim]  L2-normalised CLS token from backbone
+        x : Tensor [B, N_tokens, embed_dim]  token sequence (patch + CLS)
 
         Returns
         -------
-        out     : Tensor [B, embed_dim]  L2-normalised MoE output
-        lb_loss : scalar Tensor          load balancing auxiliary loss
+        Tensor [B, N_tokens, embed_dim]  MLP output with LoRA MoE injection
         """
-        gates = torch.softmax(self.gate(x), dim=-1)    # [B, n_experts]
+        # gate on CLS token (index 0) — image-level domain routing
+        cls   = x[:, 0, :]                                 # [B, D]
+        gates = torch.softmax(self.gate(cls), dim=-1)      # [B, n_experts]
 
-        # all expert outputs: [B, n_experts, D]
-        expert_outs = torch.stack(
-            [expert(x) for expert in self.experts], dim=1)
+        # all expert outputs for all tokens: stack → [B, n_experts, N, fc1_out]
+        lora_out = torch.stack(
+            [exp(x) for exp in self.lora_experts], dim=1)
 
-        # weighted sum of expert outputs: [B, D]
-        out = (gates.unsqueeze(-1) * expert_outs).sum(dim=1)
+        # weighted sum over experts: [B, N, fc1_out]
+        weighted = (gates[:, :, None, None] * lora_out).sum(dim=1)
 
-        # residual: experts refine rather than replace the backbone embedding
-        out = F.normalize(x + out, p=2, dim=1)
+        # inject into fc1 output
+        h = self.mlp.fc1(x) + self.scale * weighted
+        h = self.mlp.act(h)
+        h = self.mlp.drop1(h) if hasattr(self.mlp, "drop1") else h
+        h = self.mlp.fc2(h)
+        h = self.mlp.drop2(h) if hasattr(self.mlp, "drop2") else h
 
-        # load balancing loss — penalise non-uniform expert utilisation
-        # target: each expert used equally (1/n_experts on average)
-        mean_gates = gates.mean(dim=0)                 # [n_experts]
-        lb_loss    = self.n_experts * (mean_gates ** 2).sum()
+        # load balancing loss — stored for extraction by get_moe_lb_loss()
+        mean_gates    = gates.mean(dim=0)                  # [n_experts]
+        self._lb_loss = self.n_experts * (mean_gates ** 2).sum()
 
-        return out, lb_loss
+        return h
+
+
+class DINOBackbone(nn.Module):
+    """
+    DINOv2 ViT-S/14 backbone with selective unfreezing and optional LoRA MoE.
+
+    Without LoRA MoE (use_moe=False):
+      Blocks 0–9   frozen (ImageNet features)
+      Blocks 10–11 unfrozen (fine-tuned for palmprint)
+      forward() → L2-normalised 384-d CLS token
+
+    With LoRA MoE (use_moe=True):
+      Blocks 0–9   frozen
+      Blocks 10–11 attention layers: unfrozen
+      Blocks 10–11 MLP: replaced with LoRAMoEMLP
+        base MLP weights stay unfrozen (as before)
+        LoRA adapters (A, B) and gating: new trainable parameters
+      The LoRA adapters inject domain-specific transformations directly into
+      the MLP intermediate representations, operating on all tokens rather
+      than only the final CLS token.
+    """
+    EMBED_DIM = 384
+
+    def __init__(self, use_moe=False, n_experts=6, lora_rank=16):
+        super().__init__()
+        backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
+                                  verbose=False)
+
+        # freeze all, unfreeze last two blocks
+        for name, p in backbone.named_parameters():
+            p.requires_grad = False
+            if "blocks.10" in name or "blocks.11" in name:
+                p.requires_grad = True
+
+        # inject LoRA MoE into the MLP of blocks 10 and 11
+        if use_moe:
+            for blk_idx in [10, 11]:
+                original_mlp = backbone.blocks[blk_idx].mlp
+                backbone.blocks[blk_idx].mlp = LoRAMoEMLP(
+                    original_mlp, n_experts, lora_rank, self.EMBED_DIM)
+
+        self.backbone = backbone
+        self.use_moe  = use_moe
+
+    def forward(self, x):
+        """Returns L2-normalised 384-d CLS token.
+        If use_moe=True, LoRA MoE is applied inside blocks 10-11 during
+        forward_features(), populating _lb_loss in each LoRAMoEMLP."""
+        out = self.backbone.forward_features(x)
+        cls = out["x_norm_clstoken"]
+        return F.normalize(cls, p=2, dim=1)
+
+    def get_moe_lb_loss(self):
+        """
+        Collect and sum load-balancing losses from both LoRA MoE blocks.
+        Called after forward() — _lb_loss is populated during forward_features().
+        Returns zero tensor when use_moe=False.
+        """
+        if not self.use_moe:
+            return torch.tensor(0.0,
+                                device=next(self.parameters()).device)
+        total = torch.tensor(0.0, device=next(self.parameters()).device)
+        for blk_idx in [10, 11]:
+            mlp = self.backbone.blocks[blk_idx].mlp
+            if hasattr(mlp, "_lb_loss") and mlp._lb_loss is not None:
+                total = total + mlp._lb_loss
+        return total
 
 
 class DINOv2Model(nn.Module):
     """
-    DINOv2 FL model = DINOBackbone + optional MoELayer + ArcFace.
+    DINOv2 FL model = DINOBackbone (+ optional LoRA MoE inside blocks) + ArcFace.
 
-    With use_moe=False (default):
-      backbone(x) → CLS [B, 384] → ArcFace → logits
-      get_embedding returns backbone CLS token
-
-    With use_moe=True:
-      backbone(x) → CLS [B, 384] → MoELayer → refined [B, 384] → ArcFace → logits
-      get_embedding returns MoE-refined embedding
-
-    The MoE layer is inserted between blocks 10-11 output and ArcFace —
-    the last learned stage, while the frozen backbone blocks remain unchanged.
+    Without LoRA MoE: identical to the original — backbone CLS → ArcFace.
+    With LoRA MoE:    LoRA adapters inside blocks 10-11 MLPs refine the
+                      intermediate token representations domain-specifically,
+                      producing a better CLS token before ArcFace.
 
     Weight sharing in FL:
-      backbone.* and moe.* → shared via FedAvg
-      arc.*                → kept local (client-specific identity prototypes)
-
-    Training: train_compnet_epoch handles the MoE load balancing loss by
-    directly calling model.moe when present — no change to forward() return
-    signature, maintaining compatibility with the rest of the pipeline.
+      backbone.* (including lora_experts, gate, scale) → shared via FedAvg
+      arc.*                                            → kept local
 
     Input: RGB 224×224 with ImageNet normalisation.
     """
     def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30,
-                 use_moe=False, n_experts=6, moe_hidden_dim=128):
+                 use_moe=False, n_experts=6, lora_rank=16):
         super().__init__()
-        self.backbone = DINOBackbone()
-        self.moe      = MoELayer(DINOBackbone.EMBED_DIM, n_experts, moe_hidden_dim) \
-                        if use_moe else None
+        self.backbone = DINOBackbone(use_moe, n_experts, lora_rank)
         self.arc      = ArcMarginProduct(DINOBackbone.EMBED_DIM, num_classes,
                                          s=arcface_s, m=arcface_m)
 
     def forward(self, x, y=None):
-        emb = self.backbone(x)                          # [B, 384] L2-normalised
-        if self.moe is not None:
-            emb, _ = self.moe(emb)                     # refined [B, 384]
-        return self.arc(emb, y)                         # [B, num_classes] logits
+        emb = self.backbone(x)         # LoRA MoE applied inside if enabled
+        return self.arc(emb, y)        # [B, num_classes] logits
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 384-d embedding — MoE-refined when enabled."""
-        emb = self.backbone(x)
-        if self.moe is not None:
-            emb, _ = self.moe(emb)
-        return emb
+        """L2-normalised 384-d CLS embedding — LoRA-refined when use_moe=True."""
+        return self.backbone(x)
+
+    def get_moe_lb_loss(self):
+        """Sum of load-balancing losses from LoRA MoE blocks. Zero if disabled."""
+        return self.backbone.get_moe_lb_loss()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -536,12 +617,12 @@ def build_model(cfg, num_classes):
         )
     elif name == "dinov2":
         return DINOv2Model(
-            num_classes    = num_classes,
-            arcface_s      = cfg.get("dino_scale",      16.0),
-            arcface_m      = cfg.get("dino_margin",      0.30),
-            use_moe        = cfg.get("use_moe",          False),
-            n_experts      = cfg.get("n_experts",        6),
-            moe_hidden_dim = cfg.get("moe_hidden_dim",   128),
+            num_classes = num_classes,
+            arcface_s   = cfg.get("dino_scale",  16.0),
+            arcface_m   = cfg.get("dino_margin",  0.30),
+            use_moe     = cfg.get("use_moe",      False),
+            n_experts   = cfg.get("n_experts",    6),
+            lora_rank   = cfg.get("lora_rank",    16),
         )
     else:
         raise ValueError(f"Unknown model: '{cfg['model']}'. "
