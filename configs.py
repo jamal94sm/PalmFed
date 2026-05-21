@@ -17,7 +17,7 @@ CONFIG = {
     "dataset"          : "xjtu",
 
     # ── Model selection ────────────────────────────────────────
-    "model"            : "compnet",  # "compnet" | "ccnet" | "dinov2"
+    "model"            : "dinov2",  # "compnet" | "ccnet" | "dinov2"
 
     # ── Paths ──────────────────────────────────────────────────
     # CASIA-MS
@@ -77,7 +77,7 @@ CONFIG = {
     #                     and global mean is added before similarity scoring,
     #                     aligning gallery and probe embeddings from different
     #                     domains into a shared coordinate system
-    "use_proto_mixing"  : "train-inference",  # "neither" | "train-only" | "train-inference"
+    "use_proto_mixing"  : "neither",  # "neither" | "train-only" | "train-inference"
     "proto_start_round" : 1,         # wait R rounds before first extraction
     "proto_beta"        : 0.1,        # shift magnitude along domain offset direction
     "lambda_proto"      : 0.2,        # domain offset consistency loss weight
