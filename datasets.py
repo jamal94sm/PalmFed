@@ -231,26 +231,26 @@ class PairedDataset(Dataset):
 
 class FFTAugmentedDataset(Dataset):
     """
-    Training dataset with FFT style augmentation for CompNet and DINOv2.
+    Training dataset with FFT style augmentation + spatial augmentation.
+    Used for CompNet and DINOv2 when use_fft_aug=True.
 
-    Returns ([orig, aug], label) — one pair per sample index:
-      orig — clean original image, resize + normalise only (no augmentation).
-             Anchors ArcFace, CenterLoss, and StyleConsistencyLoss to the
-             real data distribution.
-      aug  — augmented version of the same image:
-               aug_idx == 0 → spatial augmentation only (original appearance)
-               aug_idx >= 1 → FFT style swap from donor client + spatial aug
+    Returns (img, label) — single image per index.
+    Index layout with M multiplier:
+      indices [i*M .. i*M+M-1] map to sample i.
+      aug_idx == 0  → original + spatial augmentation
+      aug_idx >= 1  → FFT styled + spatial augmentation
 
-    Index layout with M multiplier (same as before):
-      indices [i*M .. i*M+M-1] all map to sample i.
-      aug_idx 0     → (orig, spatial_aug_of_orig)
-      aug_idx 1..M-1 → (orig, fft_aug_of_orig)
+    Domain-aware donor selection (optional):
+      If mean_bank is provided (domain_aware_mixing=True), donors are
+      pre-ranked by L2 distance of mean low-frequency templates.
+      prefer_distant=True  → most different domain first
+      prefer_distant=False → most similar domain first
+      use_mean_template    → use donor's mean template vs random sample
 
     Notes
     ─────
     • Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2.
-    • Domain-aware donor selection via mean_bank + prefer_distant toggle.
-    • use_mean_template: use donor mean template vs random sample from bank.
+    • Foreground mask and per-channel logic live in apply_style_template.
     """
 
     def __init__(self, samples, style_bank, client_id, M, beta, img_side,
@@ -283,20 +283,15 @@ class FFTAugmentedDataset(Dataset):
             ]),
         ])
 
+        # no T.Resize — _load_np already resizes to img_side
         if grayscale:
-            # orig: resize only, no spatial randomness
-            self.norm_orig = T.Compose([
-                T.Resize((img_side, img_side)),
-                T.ToTensor(), NormSingleROI(outchannels=1)])
-            # aug: _load_np already resizes, so no T.Resize here
-            self.norm_aug = T.Compose([
-                T.ToTensor(), NormSingleROI(outchannels=1)])
+            self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
         else:
-            inet = T.Normalize(mean=[0.485, 0.456, 0.406],
-                               std =[0.229, 0.224, 0.225])
-            self.norm_orig = T.Compose([
-                T.Resize((img_side, img_side)), T.ToTensor(), inet])
-            self.norm_aug  = T.Compose([T.ToTensor(), inet])
+            self.norm = T.Compose([
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std =[0.229, 0.224, 0.225]),
+            ])
 
     def __len__(self):
         return len(self.samples) * self.M
@@ -309,26 +304,18 @@ class FFTAugmentedDataset(Dataset):
             (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
-    def _to_orig_tensor(self, path):
-        """Clean original — resize + normalise, no spatial augmentation."""
-        mode = "L" if self.grayscale else "RGB"
-        return self.norm_orig(Image.open(path).convert(mode))
-
-    def _to_aug_tensor(self, img_np):
+    def _to_tensor(self, img_np):
         """numpy → PIL → spatial aug → normalised tensor."""
         mode = "L" if self.grayscale else "RGB"
         pil  = Image.fromarray((img_np * 255).astype(np.uint8), mode=mode)
-        return self.norm_aug(self.spatial_aug(pil))
+        return self.norm(self.spatial_aug(pil))
 
     def _rank_donors(self):
         """
-        Pre-rank other clients by L2 distance of mean low-freq template.
-        Uses the inner 25% patch of the fftshifted amplitude (the region
-        that the Gaussian mask actually blends). Falls back to unordered
-        list when mean_bank is unavailable (domain_aware_mixing=False).
-
-        prefer_distant=True  → most different domain first (max L2)
-        prefer_distant=False → most similar domain first (min L2)
+        Rank other clients by L2 distance of mean low-freq template patch.
+        Uses inner 25% patch of fftshifted amplitude — the region the
+        Gaussian mask targets. Falls back to unordered list when
+        mean_bank is unavailable (domain_aware_mixing=False).
         """
         if not self.mean_bank or self.client_id not in self.mean_bank:
             return list(self.other_ids)
@@ -359,15 +346,10 @@ class FFTAugmentedDataset(Dataset):
         aug_idx    = idx  % self.M
 
         path, label = self.samples[sample_idx]
-
-        # orig: always the clean image — anchor for all losses
-        orig   = self._to_orig_tensor(path)
         img_np = self._load_np(path)
 
         if aug_idx == 0 or not self.other_ids:
-            # spatial augmentation only — same behaviour as AugmentedDataset
-            aug = self._to_aug_tensor(img_np)
-            return [orig, aug], label
+            return self._to_tensor(img_np), label
 
         # donor client selection
         if self.donor_order and self.mean_bank:
@@ -383,8 +365,7 @@ class FFTAugmentedDataset(Dataset):
             rand_template = random.choice(self.style_bank[rand_client])
 
         img_syn = apply_style_template(img_np, rand_template, self.beta)
-        aug     = self._to_aug_tensor(img_syn)
-        return [orig, aug], label
+        return self._to_tensor(img_syn), label
 
 
 # ══════════════════════════════════════════════════════════════
