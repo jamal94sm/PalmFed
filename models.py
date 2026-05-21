@@ -375,37 +375,129 @@ class DINOBackbone(nn.Module):
         return F.normalize(cls, p=2, dim=1)
 
 
+class MoELayer(nn.Module):
+    """
+    Soft Mixture of Experts layer for domain-invariant feature learning.
+
+    Integrated into DINOv2 between the backbone CLS token and ArcFace.
+    Each expert is a two-layer MLP with a residual connection, specialising
+    in a different feature transformation. The gating network produces soft
+    weights so all experts receive gradients on every forward pass.
+
+    Design rationale in the FL setting:
+      n_experts matches the number of FL clients (one per domain). After
+      FedAvg, the shared gating network learns universal routing — which
+      input patterns benefit from which expert's transformation. Experts
+      that were trained on different domains by different clients become
+      complementary transformations in the shared model.
+
+    Load balancing loss:
+      Prevents expert collapse (all inputs routing to one expert) by
+      penalising uneven utilisation. Standard auxiliary loss from the
+      Switch Transformer paper: n_experts × sum(mean_gate² per expert).
+      Returned alongside the output so training can add it to the total loss.
+
+    Parameters
+    ----------
+    embed_dim  : int  input/output dimensionality (384 for DINOv2 ViT-S/14)
+    n_experts  : int  number of experts — set to number of FL clients/domains
+    hidden_dim : int  expert hidden layer width (bottleneck)
+    """
+    def __init__(self, embed_dim=384, n_experts=6, hidden_dim=128):
+        super().__init__()
+        self.n_experts = n_experts
+
+        # gating: soft routing weights over all experts
+        self.gate = nn.Linear(embed_dim, n_experts)
+
+        # experts: independent 2-layer MLPs
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, embed_dim),
+            )
+            for _ in range(n_experts)
+        ])
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : Tensor [B, embed_dim]  L2-normalised CLS token from backbone
+
+        Returns
+        -------
+        out     : Tensor [B, embed_dim]  L2-normalised MoE output
+        lb_loss : scalar Tensor          load balancing auxiliary loss
+        """
+        gates = torch.softmax(self.gate(x), dim=-1)    # [B, n_experts]
+
+        # all expert outputs: [B, n_experts, D]
+        expert_outs = torch.stack(
+            [expert(x) for expert in self.experts], dim=1)
+
+        # weighted sum of expert outputs: [B, D]
+        out = (gates.unsqueeze(-1) * expert_outs).sum(dim=1)
+
+        # residual: experts refine rather than replace the backbone embedding
+        out = F.normalize(x + out, p=2, dim=1)
+
+        # load balancing loss — penalise non-uniform expert utilisation
+        # target: each expert used equally (1/n_experts on average)
+        mean_gates = gates.mean(dim=0)                 # [n_experts]
+        lb_loss    = self.n_experts * (mean_gates ** 2).sum()
+
+        return out, lb_loss
+
+
 class DINOv2Model(nn.Module):
     """
-    DINOv2 FL model = DINOBackbone + ArcFace.
+    DINOv2 FL model = DINOBackbone + optional MoELayer + ArcFace.
 
-    Interface is identical to CompNet:
-      forward(x, y)    → logits             used during training
-      get_embedding(x) → L2-normalised 384-d CLS token  used at evaluation
+    With use_moe=False (default):
+      backbone(x) → CLS [B, 384] → ArcFace → logits
+      get_embedding returns backbone CLS token
 
-    Same augmentation policy as CompNet (AugmentedDataset / FFTAugmentedDataset
-    with grayscale=False — RGB ImageNet-normalised input).
+    With use_moe=True:
+      backbone(x) → CLS [B, 384] → MoELayer → refined [B, 384] → ArcFace → logits
+      get_embedding returns MoE-refined embedding
+
+    The MoE layer is inserted between blocks 10-11 output and ArcFace —
+    the last learned stage, while the frozen backbone blocks remain unchanged.
 
     Weight sharing in FL:
-      backbone.* → shared via FedAvg
-      arc.*      → kept local (client-specific identity prototypes)
+      backbone.* and moe.* → shared via FedAvg
+      arc.*                → kept local (client-specific identity prototypes)
+
+    Training: train_compnet_epoch handles the MoE load balancing loss by
+    directly calling model.moe when present — no change to forward() return
+    signature, maintaining compatibility with the rest of the pipeline.
 
     Input: RGB 224×224 with ImageNet normalisation.
     """
-    def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30):
+    def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30,
+                 use_moe=False, n_experts=6, moe_hidden_dim=128):
         super().__init__()
         self.backbone = DINOBackbone()
+        self.moe      = MoELayer(DINOBackbone.EMBED_DIM, n_experts, moe_hidden_dim) \
+                        if use_moe else None
         self.arc      = ArcMarginProduct(DINOBackbone.EMBED_DIM, num_classes,
                                          s=arcface_s, m=arcface_m)
 
     def forward(self, x, y=None):
-        emb = self.backbone(x)      # [B, 384] L2-normalised
-        return self.arc(emb, y)     # [B, num_classes] logits
+        emb = self.backbone(x)                          # [B, 384] L2-normalised
+        if self.moe is not None:
+            emb, _ = self.moe(emb)                     # refined [B, 384]
+        return self.arc(emb, y)                         # [B, num_classes] logits
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 384-d CLS embedding for cosine matching."""
-        return self.backbone(x)
+        """L2-normalised 384-d embedding — MoE-refined when enabled."""
+        emb = self.backbone(x)
+        if self.moe is not None:
+            emb, _ = self.moe(emb)
+        return emb
 
 
 # ══════════════════════════════════════════════════════════════
@@ -444,9 +536,12 @@ def build_model(cfg, num_classes):
         )
     elif name == "dinov2":
         return DINOv2Model(
-            num_classes = num_classes,
-            arcface_s   = cfg.get("dino_scale",  16.0),
-            arcface_m   = cfg.get("dino_margin",  0.30),
+            num_classes    = num_classes,
+            arcface_s      = cfg.get("dino_scale",      16.0),
+            arcface_m      = cfg.get("dino_margin",      0.30),
+            use_moe        = cfg.get("use_moe",          False),
+            n_experts      = cfg.get("n_experts",        6),
+            moe_hidden_dim = cfg.get("moe_hidden_dim",   128),
         )
     else:
         raise ValueError(f"Unknown model: '{cfg['model']}'. "
