@@ -392,9 +392,20 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     running_loss = 0.0; correct = 0; total = 0
 
     for data, labels in loader:
-        orig   = data[0].to(device)
-        aug    = data[1].to(device)
         labels = labels.to(device)
+
+        # ── data format detection ─────────────────────────────────────────
+        # AugmentedDataset  → data is list [orig, aug]:  both [B, C, H, W]
+        # FFTAugmentedDataset → data is single Tensor:   [B, C, H, W]
+        # Detecting by type avoids any dataset-specific branching here.
+        if isinstance(data, (list, tuple)):
+            orig    = data[0].to(device)   # clean original
+            aug     = data[1].to(device)   # spatially/FFT augmented
+            has_aug = True
+        else:
+            orig    = data.to(device)      # augmented single image
+            aug     = None
+            has_aug = False
 
         optimizer.zero_grad()
         if use_center:
@@ -404,7 +415,7 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         logits   = _get_logits(emb_orig, labels)
         loss     = criterion(logits, labels)
 
-        if use_style:
+        if use_style and has_aug:
             emb_aug = _get_emb(aug)
             sim     = F.cosine_similarity(
                 F.normalize(emb_orig, p=2, dim=1),
@@ -412,18 +423,13 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
             loss = loss + lambda_style * (1.0 - sim.mean())
 
         if use_proto:
-            # find nearest other-client prototype for each sample
-            emb_n      = F.normalize(emb_orig, p=2, dim=1)    # [B, D]
-            dists      = torch.cdist(emb_n, protos_t)          # [B, N_other]
-            nearest    = protos_t[dists.argmin(dim=1)]         # [B, D]
-
-            # blend toward nearest donor prototype
-            emb_mixed  = (1.0 - proto_beta) * emb_n + proto_beta * nearest
-            emb_mixed  = F.normalize(emb_mixed, p=2, dim=1)
-
-            # consistency loss — ArcFace never sees emb_mixed
-            sim_proto  = F.cosine_similarity(emb_n, emb_mixed, dim=1)
-            loss       = loss + lambda_proto * (1.0 - sim_proto.mean())
+            emb_n   = F.normalize(emb_orig, p=2, dim=1)
+            dists   = torch.cdist(emb_n, protos_t)
+            nearest = protos_t[dists.argmin(dim=1)]
+            emb_mixed = F.normalize(
+                (1.0 - proto_beta) * emb_n + proto_beta * nearest, p=2, dim=1)
+            sim_proto = F.cosine_similarity(emb_n, emb_mixed, dim=1)
+            loss      = loss + lambda_proto * (1.0 - sim_proto.mean())
 
         if use_center:
             loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
