@@ -255,18 +255,20 @@ class FFTAugmentedDataset(Dataset):
 
     def __init__(self, samples, style_bank, client_id, M, beta, img_side,
                  grayscale=True, mean_bank=None,
-                 prefer_distant=True, use_mean_template=False):
-        self.samples          = samples
-        self.style_bank       = style_bank
-        self.client_id        = client_id
-        self.M                = M
-        self.beta             = beta
-        self.img_side         = img_side
-        self.grayscale        = grayscale
-        self.other_ids        = [cid for cid in style_bank if cid != client_id]
-        self.mean_bank        = mean_bank
-        self.prefer_distant   = prefer_distant
-        self.use_mean_template = use_mean_template
+                 prefer_distant=True, use_mean_template=False,
+                 deterministic_donors=False):
+        self.samples             = samples
+        self.style_bank          = style_bank
+        self.client_id           = client_id
+        self.M                   = M
+        self.beta                = beta
+        self.img_side            = img_side
+        self.grayscale           = grayscale
+        self.other_ids           = [cid for cid in style_bank if cid != client_id]
+        self.mean_bank           = mean_bank
+        self.prefer_distant      = prefer_distant
+        self.use_mean_template   = use_mean_template
+        self.deterministic_donors = deterministic_donors
 
         # pre-compute donor ranking once at construction
         self.donor_order = self._rank_donors()
@@ -352,7 +354,12 @@ class FFTAugmentedDataset(Dataset):
             return self._to_tensor(img_np), label
 
         # donor client selection
-        if self.donor_order and self.mean_bank:
+        if self.deterministic_donors:
+            # aug_idx 1 → donor_order[0], aug_idx 2 → donor_order[1], ...
+            # ensures systematic coverage of all other domains each epoch
+            donor_idx   = (aug_idx - 1) % len(self.donor_order)
+            rand_client = self.donor_order[donor_idx]
+        elif self.donor_order and self.mean_bank:
             rand_client = self.donor_order[0]
         else:
             rand_client = random.choice(self.other_ids)
