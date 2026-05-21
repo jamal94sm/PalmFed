@@ -250,40 +250,85 @@ def evaluate_model(model, gallery_loader, probe_loader, device,
 
 
 # ══════════════════════════════════════════════════════════════
-#  DOMAIN MEAN EXTRACTION
+#  EVALUATION
 # ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract_domain_mean(model, loader, device):
+def extract_features(model, loader, device):
     """
-    Compute the mean embedding of all local training samples using the
-    current (global) backbone — called BEFORE local training so all
-    clients' means share the same feature space.
-
-    With many identities per client, identity variation averages out
-    and what remains is the domain's characteristic position in feature
-    space (sensor response, spectral band, illumination). This is
-    directly analogous to the mean FFT amplitude template: identity
-    variation cancels, domain signal dominates.
-
-    Parameters
-    ----------
-    model  : backbone — must expose get_embedding()
-    loader : DataLoader over the client's training samples (no aug)
-    device : torch.device
+    Extract L2-normalised embeddings using model.get_embedding().
+    Compatible with CompNet, CCNet, and DINOv2 (all expose get_embedding).
+    For DINOv2 with MoE enabled, get_embedding returns the MoE-refined
+    embedding automatically.
+    NaN guard: any NaN row replaced with zero vector.
 
     Returns
     -------
-    mean_emb : np.ndarray  [embed_dim]  L2-normalised domain mean
+    feats  : np.ndarray  [N, D]
+    labels : np.ndarray  [N]
     """
     model.eval()
-    all_embs = []
-    for imgs, _ in loader:
-        e = model.get_embedding(imgs.to(device)).cpu().numpy()
-        all_embs.append(e)
-    mean = np.mean(np.concatenate(all_embs, axis=0), axis=0)
-    norm = np.linalg.norm(mean)
-    return (mean / (norm + 1e-8)).astype(np.float32)   # [D]
+    feats, labels = [], []
+    for imgs, labs in loader:
+        batch_np = model.get_embedding(imgs.to(device)).cpu().numpy()
+        nan_rows = np.isnan(batch_np).any(axis=1)
+        if nan_rows.any():
+            batch_np[nan_rows] = 0.0
+        feats.append(batch_np)
+        labels.append(labs.numpy())
+    return np.concatenate(feats), np.concatenate(labels)
+
+
+def compute_eer(scores_array):
+    """
+    EER from an Nx2 array of [cosine_score, label(+1/-1)].
+    Returns EER in [0, 1]. Returns 1.0 on error or NaN.
+    """
+    ins  = scores_array[scores_array[:, 1] ==  1, 0]
+    outs = scores_array[scores_array[:, 1] == -1, 0]
+    if len(ins) == 0 or len(outs) == 0:
+        return 1.0
+    y = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
+    s = np.concatenate([ins, outs])
+    if not np.isfinite(s).all():
+        return 1.0
+    try:
+        fpr, tpr, _ = roc_curve(y, s, pos_label=1)
+        return float(brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0))
+    except Exception:
+        return 1.0
+
+
+def evaluate_model(model, gallery_loader, probe_loader, device,
+                   # kept for backward compat — unused
+                   feature_mean_bank=None, global_mean=None,
+                   all_protos=None, proto_beta=0.3):
+    """
+    Cosine-similarity evaluation on gallery and probe sets.
+    Uses model.get_embedding() — MoE-refined for DINOv2 when enabled.
+
+    Returns
+    -------
+    eer   : float  EER in [0, 1]
+    rank1 : float  Rank-1 accuracy in [0, 100]
+    """
+    gal_feats, gal_labels = extract_features(model, gallery_loader, device)
+    prb_feats, prb_labels = extract_features(model, probe_loader,   device)
+
+    sim_matrix = np.nan_to_num(prb_feats @ gal_feats.T, nan=0.0)
+
+    scores_list, labels_list = [], []
+    for i in range(len(prb_feats)):
+        for j in range(len(gal_feats)):
+            scores_list.append(float(sim_matrix[i, j]))
+            labels_list.append(1 if prb_labels[i] == gal_labels[j] else -1)
+
+    eer     = compute_eer(np.column_stack([scores_list, labels_list]))
+    nn_idx  = np.argmax(sim_matrix, axis=1)
+    correct = sum(prb_labels[i] == gal_labels[nn_idx[i]]
+                  for i in range(len(prb_feats)))
+    rank1   = 100.0 * correct / max(len(prb_feats), 1)
+    return eer, rank1
 
 class CenterLoss(nn.Module):
     """
@@ -352,52 +397,40 @@ class CenterLoss(nn.Module):
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
                         lambda_center=0.0, lambda_style=0.0,
-                        own_mean_vec=None, other_means_avg=None,
-                        proto_beta=0.3, lambda_proto=0.0):
+                        lambda_load_balance=0.0):
     """
     Train CompNet (or DINOv2) for one epoch.
 
     Loss : CrossEntropy(ArcFace, emb_orig)
-         + lambda_style  × StyleConsistencyLoss         (optional)
-         + lambda_center × CenterLoss(emb_orig)         (optional)
-         + lambda_proto  × DomainOffsetConsistencyLoss  (optional)
+         + lambda_style        × StyleConsistencyLoss   (optional)
+         + lambda_center       × CenterLoss(emb_orig)   (optional)
+         + lambda_load_balance × MoE LoadBalancingLoss  (DINOv2+MoE only)
 
     StyleConsistencyLoss:
       1 - cosine_sim(emb_orig, emb_aug)
       Input-level domain invariance via FFT/spatial augmentation pairs.
+      Active only when loader returns ([orig, aug], label) pairs.
 
-    DomainOffsetConsistencyLoss:
-      Enforces feature-level domain invariance using domain mean vectors.
-      For each embedding, compute the domain offset direction — the unit
-      vector from this client's mean embedding toward the average of all
-      other clients' means. Shift the embedding along this direction by
-      proto_beta and enforce the backbone output stays close:
+    MoE LoadBalancingLoss:
+      Penalises uneven expert utilisation when DINOv2 is trained with
+      use_moe=True. Computed directly from the MoE layer's gate activations.
+      Has no effect for CompNet (no MoE layer) or when lambda_load_balance=0.
 
-          offset     = normalise(other_means_avg - own_mean_vec)  [D]
-          emb_shifted = normalise(emb_n + beta × offset)
-          loss       = 1 - cosine_sim(emb_n, emb_shifted)
-
-      The offset is identity-agnostic: means average over many identities
-      so identity variation cancels, leaving only the domain component.
-      The loss has real gradient magnitude unlike nearest-proto blending
-      because emb_shifted moves meaningfully in embedding space.
-      ArcFace never sees emb_shifted — no identity-label mismatch.
+    Dataset returns ([orig, aug], label) or (img, label) — both handled.
+    ArcFace and CenterLoss use emb_orig only.
 
     Parameters
     ----------
-    model            : CompNet or DINOv2Model
-    loader           : DataLoader yielding ([orig, aug], label) or (img, label)
-    criterion        : nn.CrossEntropyLoss
-    optimizer        : torch.optim.Optimizer
-    device           : torch.device
-    center_loss      : CenterLoss | None
-    center_optimizer : torch.optim.SGD | None
-    lambda_center    : float  CenterLoss weight                  (0 → disabled)
-    lambda_style     : float  StyleConsistencyLoss weight        (0 → disabled)
-    own_mean_vec     : np.ndarray [D] | None  this client's domain mean
-    other_means_avg  : np.ndarray [D] | None  mean of other clients' means
-    proto_beta       : float  shift magnitude along domain offset direction
-    lambda_proto     : float  DomainOffsetConsistencyLoss weight (0 → disabled)
+    model               : CompNet or DINOv2Model
+    loader              : DataLoader
+    criterion           : nn.CrossEntropyLoss
+    optimizer           : torch.optim.Optimizer
+    device              : torch.device
+    center_loss         : CenterLoss | None
+    center_optimizer    : torch.optim.SGD | None
+    lambda_center       : float  CenterLoss weight          (0 → disabled)
+    lambda_style        : float  StyleConsistencyLoss weight (0 → disabled)
+    lambda_load_balance : float  MoE load balance weight    (0 → disabled)
 
     Returns
     -------
@@ -412,20 +445,8 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                   center_optimizer is not None and
                   lambda_center > 0.0)
     use_style  = lambda_style > 0.0
-    use_proto  = (lambda_proto > 0.0 and
-                  own_mean_vec is not None and
-                  other_means_avg is not None)
-
-    # pre-compute domain offset vector once — same for all batches
-    if use_proto:
-        offset_np  = other_means_avg - own_mean_vec          # [D]
-        norm       = np.linalg.norm(offset_np)
-        if norm < 1e-8:                                       # degenerate case
-            use_proto = False
-        else:
-            offset_t = torch.tensor(
-                (offset_np / norm).astype(np.float32),
-                device=device)                               # [D] unit vector
+    use_moe_lb = (lambda_load_balance > 0.0 and
+                  hasattr(model, "moe") and model.moe is not None)
 
     def _get_emb(imgs):
         return model._backbone(imgs) if hasattr(model, "_backbone") \
@@ -455,25 +476,35 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         if use_center:
             center_optimizer.zero_grad()
 
-        emb_orig = _get_emb(orig)
-        logits   = _get_logits(emb_orig, labels)
-        loss     = criterion(logits, labels)
+        # backbone embedding (before MoE and ArcFace)
+        emb_backbone = _get_emb(orig)
+
+        # apply MoE if present — get refined embedding and lb loss
+        if use_moe_lb:
+            emb_orig, lb_loss = model.moe(emb_backbone)
+        elif hasattr(model, "moe") and model.moe is not None:
+            emb_orig, _       = model.moe(emb_backbone)
+            lb_loss           = torch.tensor(0.0, device=device)
+        else:
+            emb_orig = emb_backbone
+            lb_loss  = torch.tensor(0.0, device=device)
+
+        logits = _get_logits(emb_orig, labels)
+        loss   = criterion(logits, labels)
 
         if use_style and has_aug:
-            emb_aug = _get_emb(aug)
-            sim     = F.cosine_similarity(
+            emb_aug_bb = _get_emb(aug)
+            if hasattr(model, "moe") and model.moe is not None:
+                emb_aug, _ = model.moe(emb_aug_bb)
+            else:
+                emb_aug = emb_aug_bb
+            sim   = F.cosine_similarity(
                 F.normalize(emb_orig, p=2, dim=1),
                 F.normalize(emb_aug,  p=2, dim=1), dim=1)
-            loss = loss + lambda_style * (1.0 - sim.mean())
+            loss  = loss + lambda_style * (1.0 - sim.mean())
 
-        if use_proto:
-            emb_n      = F.normalize(emb_orig, p=2, dim=1)     # [B, D]
-            # shift all embeddings along the domain offset direction
-            emb_shifted = F.normalize(
-                emb_n + proto_beta * offset_t.unsqueeze(0),    # [B, D]
-                p=2, dim=1)
-            sim_domain  = F.cosine_similarity(emb_n, emb_shifted, dim=1)
-            loss        = loss + lambda_proto * (1.0 - sim_domain.mean())
+        if use_moe_lb:
+            loss = loss + lambda_load_balance * lb_loss
 
         if use_center:
             loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
