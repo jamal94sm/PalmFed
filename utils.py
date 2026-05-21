@@ -118,32 +118,57 @@ def apply_style_template(img_np, amp_template, beta):
 # ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract_features(model, loader, device):
+def extract_features(model, loader, device, all_protos=None, proto_beta=0.3):
     """
     Extract L2-normalised embeddings from a DataLoader using model.get_embedding().
     Compatible with CompNet, CCNet, and DINOv2 (all expose get_embedding).
 
-    NaN guard: a randomly-initialised model can produce near-zero embedding
-    vectors; after L2 normalisation these become 0/0 = NaN. Any NaN row is
-    replaced with a zero vector so downstream evaluation remains numerically
-    stable (zero vectors produce a cosine similarity of 0 with all gallery
-    entries, which is a safe neutral score).
+    Optional prototype blending (inference-time domain normalisation):
+      If all_protos is provided (np.ndarray [N_total, D]), each embedding
+      is blended with its nearest prototype before being returned:
+          emb_blended = (1 - beta) * emb + beta * nearest_proto
+          emb_blended = L2_normalise(emb_blended)
+      This suppresses domain-induced variance in gallery/probe embeddings
+      before similarity scoring, analogous to the training-time proto loss.
+
+    NaN guard: any NaN row is replaced with a zero vector.
 
     Returns
     -------
-    feats  : np.ndarray  [N, embed_dim]  — NaN-free
+    feats  : np.ndarray  [N, embed_dim]  — NaN-free, optionally proto-blended
     labels : np.ndarray  [N]
     """
     model.eval()
+
+    # pre-build prototype tensor once if blending is requested
+    if all_protos is not None and len(all_protos) > 0:
+        protos_t = torch.tensor(all_protos, dtype=torch.float32, device=device)
+        protos_t = F.normalize(protos_t, p=2, dim=1)   # [N_total, D]
+    else:
+        protos_t = None
+
     feats, labels = [], []
     for imgs, labs in loader:
-        batch_feats = model.get_embedding(imgs.to(device)).cpu().numpy()
-        # replace any NaN row (zero-norm embedding after L2 norm) with zeros
-        nan_rows = np.isnan(batch_feats).any(axis=1)
+        batch_feats = model.get_embedding(imgs.to(device))   # [B, D] tensor
+
+        if protos_t is not None:
+            # find nearest prototype for each embedding in the batch
+            emb_n   = F.normalize(batch_feats, p=2, dim=1)   # [B, D]
+            dists   = torch.cdist(emb_n, protos_t)            # [B, N_total]
+            nearest = protos_t[dists.argmin(dim=1)]           # [B, D]
+            blended = (1.0 - proto_beta) * emb_n + proto_beta * nearest
+            batch_feats = F.normalize(blended, p=2, dim=1)
+
+        batch_np = batch_feats.cpu().numpy()
+
+        # NaN guard: zero-vector for degenerate embeddings
+        nan_rows = np.isnan(batch_np).any(axis=1)
         if nan_rows.any():
-            batch_feats[nan_rows] = 0.0
-        feats.append(batch_feats)
+            batch_np[nan_rows] = 0.0
+
+        feats.append(batch_np)
         labels.append(labs.numpy())
+
     return np.concatenate(feats), np.concatenate(labels)
 
 
@@ -169,22 +194,27 @@ def compute_eer(scores_array):
         return 1.0
 
 
-def evaluate_model(model, gallery_loader, probe_loader, device):
+def evaluate_model(model, gallery_loader, probe_loader, device,
+                   all_protos=None, proto_beta=0.3):
     """
     Cosine-similarity evaluation on pre-split gallery and probe loaders.
     Uses model.get_embedding() — compatible with all models.
+
+    If all_protos is provided, gallery and probe embeddings are blended
+    with their nearest prototype before scoring (inference-time domain
+    normalisation). This is activated when use_proto_mixing="train-inference".
 
     Returns
     -------
     eer   : float  EER in [0, 1]
     rank1 : float  Rank-1 accuracy in [0, 100]
     """
-    gal_feats, gal_labels = extract_features(model, gallery_loader, device)
-    prb_feats, prb_labels = extract_features(model, probe_loader,   device)
+    gal_feats, gal_labels = extract_features(
+        model, gallery_loader, device, all_protos, proto_beta)
+    prb_feats, prb_labels = extract_features(
+        model, probe_loader,   device, all_protos, proto_beta)
 
-    # cosine similarity matrix (embeddings are L2-normalised)
     sim_matrix = prb_feats @ gal_feats.T
-    # guard against any residual NaN in similarity matrix
     sim_matrix = np.nan_to_num(sim_matrix, nan=0.0)
 
     scores_list, labels_list = [], []
