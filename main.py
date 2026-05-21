@@ -25,7 +25,6 @@ from datasets import (PalmDataset, AugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
-                      extract_domain_mean,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
