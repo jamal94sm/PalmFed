@@ -61,7 +61,15 @@ CONFIG = {
                                      # False → most similar domain (min L2)
     "use_mean_template"   : True,  # True → use donor's mean template
                                      # False → random sample from donor's bank
-        
+
+    # ── feature-level knowledge sharing (MoK) ───────────────────────────
+    "use_proto_mixing"  : False,  # master toggle
+    "n_prototypes"      : 20,     # K cluster centres per client
+    "proto_start_round" : 20,     # wait for meaningful prototypes
+    "proto_beta"        : 0.3,    # blend weight toward donor prototype
+    "lambda_proto"      : 0.5,    # consistency loss weight
+
+    
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
