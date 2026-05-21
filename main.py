@@ -25,7 +25,7 @@ from datasets import (PalmDataset, AugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
-                      extract_domain_prototypes,
+                      extract_domain_mean,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
@@ -143,7 +143,7 @@ class FLClient:
     # ── local training ──────────────────────────────────────────────────────
 
     def local_train(self, local_epochs, active_style_bank, M, rnd,
-                    other_protos=None, mean_bank=None):
+                    own_mean_vec=None, other_means_avg=None, mean_bank=None):
         """
         Train local model for local_epochs epochs.
 
@@ -226,7 +226,8 @@ class FLClient:
                     center_optimizer = self.center_optimizer,
                     lambda_center    = lambda_c,
                     lambda_style     = self.cfg.get("lambda_style", 0.0),
-                    other_protos     = other_protos,
+                    own_mean_vec     = own_mean_vec,
+                    other_means_avg  = other_means_avg,
                     proto_beta       = self.cfg.get("proto_beta",   0.3),
                     lambda_proto     = self.cfg.get("lambda_proto", 0.0)
                                        if self.cfg.get("use_proto_mixing",
@@ -330,17 +331,15 @@ class FLServer:
         global_state.update(avg_dict)
         self.global_model.load_state_dict(global_state)
 
-    def evaluate(self, all_protos=None, proto_beta=0.3):
-        """Evaluate global model on the shared gallery and probe sets.
-        If all_protos is provided, blends each embedding with its nearest
-        prototype before scoring (inference-time domain normalisation)."""
+    def evaluate(self, feature_mean_bank=None, global_mean=None,
+                 all_protos=None, proto_beta=0.3):
+        """Evaluate global model. feature_mean_bank + global_mean enable
+        domain-neutral projection at inference (train-inference mode)."""
         return evaluate_model(
             self.global_model,
-            self.gallery_loader,
-            self.probe_loader,
-            self.device,
-            all_protos = all_protos,
-            proto_beta = proto_beta)
+            self.gallery_loader, self.probe_loader, self.device,
+            feature_mean_bank = feature_mean_bank,
+            global_mean       = global_mean)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -556,86 +555,88 @@ def main():
     g_eer, g_rank1 = g_eer_0, g_rank1_0
 
     # ── FL rounds ─────────────────────────────────────────────────────────
-    proto_bank = {}   # {client_id: np.ndarray [K, D]} — built from global model
+    feature_mean_bank = {}   # {client_id: mean_emb [D]} from global backbone
+    global_mean       = None # mean of all domain means — for inference projection
 
     for rnd in range(1, cfg["n_rounds"] + 1):
         t_start = time.time()
 
-        # determine which style bank to pass this round
         active_style_bank = get_active_style_bank(
             style_bank_full, rnd, cfg, is_dinov2)
         mode_label = aug_mode_label(rnd, cfg, is_dinov2)
 
         global_weights = server.get_global_weights()
 
-        # ── Prototype extraction from global backbone ─────────────────────
-        # Done BEFORE local training so all prototypes share the same
-        # feature space — global backbone only, no ArcFace specialisation.
-        # Active from proto_start_round onward; updated every round after that.
-        use_proto   = cfg.get("use_proto_mixing", "neither") != "neither" \
-                      and not is_dinov2
+        # ── Domain mean extraction from global backbone ───────────────────
+        # Done BEFORE local training — all means share the same feature space.
+        # Updated every round after proto_start_round because the global
+        # backbone evolves and better means emerge as training progresses.
+        use_proto       = cfg.get("use_proto_mixing", "neither") != "neither" \
+                          and not is_dinov2
         use_proto_infer = cfg.get("use_proto_mixing", "neither") == "train-inference" \
                           and not is_dinov2
-        start_round = cfg.get("proto_start_round", 20)
+        start_round     = cfg.get("proto_start_round", 20)
 
         if use_proto and rnd == start_round:
-            print(f"\n  [Round {rnd}] First prototype extraction "
-                  f"(K={cfg['n_prototypes']}) …")
+            print(f"\n  [Round {rnd}] First domain mean extraction …")
 
         if use_proto and rnd >= start_round:
             for client in clients:
-                # load global weights temporarily for extraction
                 client.set_weights(global_weights)
-                # DataLoader over training samples — no augmentation needed
                 proto_loader = DataLoader(
                     PalmDataset(client.train_samples, cfg["img_side"]),
                     batch_size  = cfg["batch_size"],
                     shuffle     = False,
                     num_workers = cfg["num_workers"],
                 )
-                proto_bank[client.client_id] = extract_domain_prototypes(
-                    client.model, proto_loader, device,
-                    K = cfg["n_prototypes"])
+                feature_mean_bank[client.client_id] = extract_domain_mean(
+                    client.model, proto_loader, device)
+            # global mean = mean of all domain means
+            global_mean = np.mean(
+                list(feature_mean_bank.values()), axis=0).astype(np.float32)
+            global_mean /= (np.linalg.norm(global_mean) + 1e-8)
             if rnd == start_round:
-                print(f"  Proto bank ready — "
-                      f"{len(proto_bank)} clients × "
-                      f"{cfg['n_prototypes']} centres each\n")
+                print(f"  Feature mean bank ready — "
+                      f"{len(feature_mean_bank)} domain means\n")
 
         client_weights = []
         client_metrics = []
 
-        # all prototypes from all clients — used at inference when train-inference
-        all_protos_inf = None
-        if use_proto_infer and len(proto_bank) > 1:
-            all_protos_inf = np.concatenate(
-                list(proto_bank.values()), axis=0)   # [n_clients × K, D]
+        # for inference projection: stack all domain means
+        infer_mean_bank = feature_mean_bank if use_proto_infer \
+                          and len(feature_mean_bank) > 1 else None
+        infer_global    = global_mean if infer_mean_bank is not None else None
 
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
             client.set_weights(global_weights)
 
-            # build this client's other_protos: all prototypes except its own
-            if use_proto and rnd >= start_round and len(proto_bank) > 1:
-                other_protos = np.concatenate([
-                    proto_bank[cid]
-                    for cid in proto_bank
+            # per-client domain offset: own mean vs average of others
+            if use_proto and rnd >= start_round \
+                    and len(feature_mean_bank) > 1:
+                own_mean_vec    = feature_mean_bank[client.client_id]
+                other_means_avg = np.mean([
+                    feature_mean_bank[cid]
+                    for cid in feature_mean_bank
                     if cid != client.client_id
-                ], axis=0)   # [n_other_clients × K, D]
+                ], axis=0).astype(np.float32)
             else:
-                other_protos = None
+                own_mean_vec    = None
+                other_means_avg = None
 
             loss, acc = client.local_train(
                 cfg["local_epochs"], active_style_bank, cfg["M"], rnd,
-                other_protos = other_protos,
-                mean_bank    = mean_bank_full
-                               if cfg.get("domain_aware_mixing", False)
-                               else None)
+                own_mean_vec    = own_mean_vec,
+                other_means_avg = other_means_avg,
+                mean_bank       = mean_bank_full
+                                  if cfg.get("domain_aware_mixing", False)
+                                  else None)
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
                 device,
-                all_protos = all_protos_inf,
-                proto_beta = cfg.get("proto_beta", 0.3))
+                feature_mean_bank = infer_mean_bank,
+                global_mean       = infer_global)
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -649,8 +650,8 @@ def main():
         # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
         g_eer, g_rank1 = server.evaluate(
-            all_protos = all_protos_inf,
-            proto_beta = cfg.get("proto_beta", 0.3))
+            feature_mean_bank = infer_mean_bank,
+            global_mean       = infer_global)
         elapsed = time.time() - t_start
 
         ts = time.strftime("%H:%M:%S")
