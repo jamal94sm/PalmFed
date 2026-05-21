@@ -158,20 +158,28 @@ class FLClient:
         grayscale  = not is_dino
 
         if model_name in ("compnet", "dinov2"):
-            if active_style_bank and M > 1:
+            # when use_moe=True, M is overridden to cover all other clients:
+            # aug_idx 0 = original, aug_idx 1..N-1 = one per other domain
+            use_moe    = self.cfg.get("use_moe", False) and model_name == "dinov2"
+            effective_M = len(self.cfg.get("_n_clients", [0])) \
+                          if use_moe else M
+            det_donors  = use_moe    # deterministic per-domain coverage
+
+            if active_style_bank and effective_M > 1:
                 dataset = FFTAugmentedDataset(
-                    samples           = self.train_samples,
-                    style_bank        = active_style_bank,
-                    client_id         = self.client_id,
-                    M                 = M,
-                    beta              = self.cfg["fft_beta"],
-                    img_side          = img_side,
-                    grayscale         = grayscale,
-                    mean_bank         = mean_bank
-                                        if self.cfg.get("domain_aware_mixing", False)
-                                        else None,
-                    prefer_distant    = self.cfg.get("prefer_distant_domain", True),
-                    use_mean_template = self.cfg.get("use_mean_template", False),
+                    samples              = self.train_samples,
+                    style_bank           = active_style_bank,
+                    client_id            = self.client_id,
+                    M                    = effective_M,
+                    beta                 = self.cfg["fft_beta"],
+                    img_side             = img_side,
+                    grayscale            = grayscale,
+                    mean_bank            = mean_bank
+                                           if self.cfg.get("domain_aware_mixing", False)
+                                           else None,
+                    prefer_distant       = self.cfg.get("prefer_distant_domain", True),
+                    use_mean_template    = self.cfg.get("use_mean_template", False),
+                    deterministic_donors = det_donors,
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
@@ -474,6 +482,8 @@ def main():
             cfg           = cfg,
             device        = device,
         ))
+    # expose n_clients so local_train can auto-set M when use_moe=True
+    cfg["_n_clients"] = list(range(n_clients))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
     if os.path.exists(init_weights_path):
