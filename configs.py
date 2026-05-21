@@ -62,17 +62,21 @@ CONFIG = {
     "use_mean_template"   : True,  # True → use donor's mean template
                                      # False → random sample from donor's bank
 
-    # ── Mixture of Experts (DINOv2 only) ──────────────────────
-    # Inserts a soft MoE layer between the DINOv2 backbone CLS token
-    # and ArcFace. Each expert is a 2-layer MLP with a residual connection.
-    # The gating network produces soft weights so all experts receive
-    # gradients. n_experts should match the number of FL clients/domains
-    # (6 for CASIA-MS, 4 for XJTU). MoE weights are shared via FedAvg
-    # alongside the backbone — arc.* is still kept local.
+    # ── Mixture of Experts with LoRA (DINOv2 only) ────────────
+    # Replaces the MLP inside transformer blocks 10 and 11 with a
+    # LoRA MoE MLP. Each expert is a low-rank adapter (A·B) injected
+    # into the fc1 output. The gating network reads the CLS token and
+    # produces soft routing weights over all experts.
     # Only active when model="dinov2". Ignored for compnet and ccnet.
-    "use_moe"            : True,  # True → add MoE layer to DINOv2
-    "n_experts"          : 4,      # number of experts (= number of domains)
-    "moe_hidden_dim"     : 128,    # expert hidden layer width
+    #
+    # When use_moe=True, FFT augmentation is also changed:
+    #   M is auto-set to n_clients so each sample gets one synthetic
+    #   copy per other domain (deterministic, not random), ensuring
+    #   systematic cross-domain coverage in every epoch.
+    #   Set use_fft_aug=True or use_mixed_aug=True to activate this.
+    "use_moe"            : False,  # True → LoRA MoE in blocks 10-11 (dinov2)
+    "n_experts"          : 6,      # number of LoRA experts (= number of domains)
+    "lora_rank"          : 16,     # LoRA rank — higher = more capacity
     "lambda_load_balance": 0.1,    # load balancing loss weight
     # CrossEntropy + ArcFace is always active for all models.
 
