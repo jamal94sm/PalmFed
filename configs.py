@@ -78,9 +78,9 @@ CONFIG = {
     #                     aligning gallery and probe embeddings from different
     #                     domains into a shared coordinate system
     "use_proto_mixing"  : "train-inference",  # "neither" | "train-only" | "train-inference"
-    "proto_start_round" : 20,         # wait R rounds before first extraction
-    "proto_beta"        : 0.3,        # shift magnitude along domain offset direction
-    "lambda_proto"      : 0.5,        # domain offset consistency loss weight
+    "proto_start_round" : 1,         # wait R rounds before first extraction
+    "proto_beta"        : 0.1,        # shift magnitude along domain offset direction
+    "lambda_proto"      : 0.2,        # domain offset consistency loss weight
     # CrossEntropy + ArcFace is always active for all models.
 
     
