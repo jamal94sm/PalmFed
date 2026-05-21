@@ -62,25 +62,18 @@ CONFIG = {
     "use_mean_template"   : True,  # True → use donor's mean template
                                      # False → random sample from donor's bank
 
-    # ── Feature-level Domain Offset Mixing ────────────────────
-    # Computes a single mean embedding per client using the global backbone
-    # (before local training) and shares them across clients. The domain
-    # offset vector — direction from this client's mean toward the average
-    # of all other clients' means — is used to shift embeddings during
-    # training, enforcing feature-level domain invariance without involving
-    # ArcFace or identity labels.
-    #
-    # "neither"         → disabled entirely
-    # "train-only"      → domain offset consistency loss during training only
-    # "train-inference" → same as train-only PLUS domain-neutral projection
-    #                     at evaluation: nearest domain mean is subtracted
-    #                     and global mean is added before similarity scoring,
-    #                     aligning gallery and probe embeddings from different
-    #                     domains into a shared coordinate system
-    "use_proto_mixing"  : "neither",  # "neither" | "train-only" | "train-inference"
-    "proto_start_round" : 1,         # wait R rounds before first extraction
-    "proto_beta"        : 0.1,        # shift magnitude along domain offset direction
-    "lambda_proto"      : 0.2,        # domain offset consistency loss weight
+    # ── Mixture of Experts (DINOv2 only) ──────────────────────
+    # Inserts a soft MoE layer between the DINOv2 backbone CLS token
+    # and ArcFace. Each expert is a 2-layer MLP with a residual connection.
+    # The gating network produces soft weights so all experts receive
+    # gradients. n_experts should match the number of FL clients/domains
+    # (6 for CASIA-MS, 4 for XJTU). MoE weights are shared via FedAvg
+    # alongside the backbone — arc.* is still kept local.
+    # Only active when model="dinov2". Ignored for compnet and ccnet.
+    "use_moe"            : True,  # True → add MoE layer to DINOv2
+    "n_experts"          : 4,      # number of experts (= number of domains)
+    "moe_hidden_dim"     : 128,    # expert hidden layer width
+    "lambda_load_balance": 0.1,    # load balancing loss weight
     # CrossEntropy + ArcFace is always active for all models.
 
     
