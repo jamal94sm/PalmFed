@@ -143,7 +143,7 @@ class FLClient:
     # ── local training ──────────────────────────────────────────────────────
 
     def local_train(self, local_epochs, active_style_bank, M, rnd,
-                    other_protos=None):
+                    other_protos=None, mean_bank=None):
         """
         Train local model for local_epochs epochs.
 
@@ -161,13 +161,18 @@ class FLClient:
         if model_name in ("compnet", "dinov2"):
             if active_style_bank and M > 1:
                 dataset = FFTAugmentedDataset(
-                    samples    = self.train_samples,
-                    style_bank = active_style_bank,
-                    client_id  = self.client_id,
-                    M          = M,
-                    beta       = self.cfg["fft_beta"],
-                    img_side   = img_side,
-                    grayscale  = grayscale,
+                    samples           = self.train_samples,
+                    style_bank        = active_style_bank,
+                    client_id         = self.client_id,
+                    M                 = M,
+                    beta              = self.cfg["fft_beta"],
+                    img_side          = img_side,
+                    grayscale         = grayscale,
+                    mean_bank         = mean_bank
+                                        if self.cfg.get("domain_aware_mixing", False)
+                                        else None,
+                    prefer_distant    = self.cfg.get("prefer_distant_domain", True),
+                    use_mean_template = self.cfg.get("use_mean_template", False),
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
@@ -514,6 +519,17 @@ def main():
     if total > 0:
         print(f"  Style bank ready — {total} templates "
               f"across {len(style_bank_full)} clients")
+
+    # compute per-client mean template for domain-aware mixing
+    # mean_bank_full: {client_id: mean_amplitude_array}
+    # identity variation averages out over many samples leaving domain signal
+    mean_bank_full = {
+        cid: np.mean(templates, axis=0)
+        for cid, templates in style_bank_full.items()
+        if len(templates) > 0
+    }
+    if cfg.get("domain_aware_mixing", False):
+        print(f"  Mean bank ready — {len(mean_bank_full)} domain mean templates")
     if aug_mode == "mixed":
         switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
         print(f"  Mixed augmentation: Spatial rounds 1–{switch}, "
@@ -596,7 +612,10 @@ def main():
 
             loss, acc = client.local_train(
                 cfg["local_epochs"], active_style_bank, cfg["M"], rnd,
-                other_protos = other_protos)
+                other_protos = other_protos,
+                mean_bank    = mean_bank_full
+                               if cfg.get("domain_aware_mixing", False)
+                               else None)
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
