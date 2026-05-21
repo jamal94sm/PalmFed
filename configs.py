@@ -62,12 +62,26 @@ CONFIG = {
     "use_mean_template"   : True,  # True → use donor's mean template
                                      # False → random sample from donor's bank
 
-    # ── feature-level knowledge sharing (MoK) ───────────────────────────
-    "use_proto_mixing"  : "train-inference",  # "neither" | "train-only" | "train-inference"
-    "n_prototypes"      : 100,     # K cluster centres per client
-    "proto_start_round" : 20,     # wait for meaningful prototypes
-    "proto_beta"        : 0.2,    # blend weight toward donor prototype
-    "lambda_proto"      : 1,    # consistency loss weight
+    # ── Feature-level Domain Offset Mixing ────────────────────
+    # Computes a single mean embedding per client using the global backbone
+    # (before local training) and shares them across clients. The domain
+    # offset vector — direction from this client's mean toward the average
+    # of all other clients' means — is used to shift embeddings during
+    # training, enforcing feature-level domain invariance without involving
+    # ArcFace or identity labels.
+    #
+    # "neither"         → disabled entirely
+    # "train-only"      → domain offset consistency loss during training only
+    # "train-inference" → same as train-only PLUS domain-neutral projection
+    #                     at evaluation: nearest domain mean is subtracted
+    #                     and global mean is added before similarity scoring,
+    #                     aligning gallery and probe embeddings from different
+    #                     domains into a shared coordinate system
+    "use_proto_mixing"  : "neither",  # "neither" | "train-only" | "train-inference"
+    "proto_start_round" : 20,         # wait R rounds before first extraction
+    "proto_beta"        : 0.3,        # shift magnitude along domain offset direction
+    "lambda_proto"      : 0.5,        # domain offset consistency loss weight
+    # CrossEntropy + ArcFace is always active for all models.
 
     
     # ── FL hyperparameters ─────────────────────────────────────
