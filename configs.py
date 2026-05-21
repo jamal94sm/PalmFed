@@ -66,12 +66,12 @@ CONFIG = {
     "use_proto_mixing"  : True,  # master toggle
     "n_prototypes"      : 100,     # K cluster centres per client
     "proto_start_round" : 20,     # wait for meaningful prototypes
-    "proto_beta"        : 0.2,    # blend weight toward donor prototype
+    "proto_beta"        : 0.3,    # blend weight toward donor prototype
     "lambda_proto"      : 1,    # consistency loss weight
 
     
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 30,    # R: total communication rounds
+    "n_rounds"         : 50,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── CompNet hyperparameters ────────────────────────────────
