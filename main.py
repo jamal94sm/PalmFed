@@ -229,7 +229,8 @@ class FLClient:
                     other_protos     = other_protos,
                     proto_beta       = self.cfg.get("proto_beta",   0.3),
                     lambda_proto     = self.cfg.get("lambda_proto", 0.0)
-                                       if self.cfg.get("use_proto_mixing", False)
+                                       if self.cfg.get("use_proto_mixing",
+                                                        "neither") != "neither"
                                        else 0.0,
                 )
             elif model_name == "ccnet":
@@ -329,13 +330,17 @@ class FLServer:
         global_state.update(avg_dict)
         self.global_model.load_state_dict(global_state)
 
-    def evaluate(self):
-        """Evaluate global model on the shared gallery and probe sets."""
+    def evaluate(self, all_protos=None, proto_beta=0.3):
+        """Evaluate global model on the shared gallery and probe sets.
+        If all_protos is provided, blends each embedding with its nearest
+        prototype before scoring (inference-time domain normalisation)."""
         return evaluate_model(
             self.global_model,
             self.gallery_loader,
             self.probe_loader,
-            self.device)
+            self.device,
+            all_protos = all_protos,
+            proto_beta = proto_beta)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -567,7 +572,10 @@ def main():
         # Done BEFORE local training so all prototypes share the same
         # feature space — global backbone only, no ArcFace specialisation.
         # Active from proto_start_round onward; updated every round after that.
-        use_proto   = cfg.get("use_proto_mixing", False) and not is_dinov2
+        use_proto   = cfg.get("use_proto_mixing", "neither") != "neither" \
+                      and not is_dinov2
+        use_proto_infer = cfg.get("use_proto_mixing", "neither") == "train-inference" \
+                          and not is_dinov2
         start_round = cfg.get("proto_start_round", 20)
 
         if use_proto and rnd == start_round:
@@ -596,6 +604,12 @@ def main():
         client_weights = []
         client_metrics = []
 
+        # all prototypes from all clients — used at inference when train-inference
+        all_protos_inf = None
+        if use_proto_infer and len(proto_bank) > 1:
+            all_protos_inf = np.concatenate(
+                list(proto_bank.values()), axis=0)   # [n_clients × K, D]
+
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
             client.set_weights(global_weights)
@@ -619,7 +633,9 @@ def main():
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
-                device)
+                device,
+                all_protos = all_protos_inf,
+                proto_beta = cfg.get("proto_beta", 0.3))
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -632,7 +648,9 @@ def main():
 
         # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
-        g_eer, g_rank1 = server.evaluate()
+        g_eer, g_rank1 = server.evaluate(
+            all_protos = all_protos_inf,
+            proto_beta = cfg.get("proto_beta", 0.3))
         elapsed = time.time() - t_start
 
         ts = time.strftime("%H:%M:%S")
