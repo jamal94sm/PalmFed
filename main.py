@@ -25,6 +25,7 @@ from datasets import (PalmDataset, AugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
+                      extract_domain_prototypes,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
@@ -141,7 +142,8 @@ class FLClient:
 
     # ── local training ──────────────────────────────────────────────────────
 
-    def local_train(self, local_epochs, active_style_bank, M, rnd, mean_bank=None):
+    def local_train(self, local_epochs, active_style_bank, M, rnd,
+                    other_protos=None):
         """
         Train local model for local_epochs epochs.
 
@@ -163,12 +165,8 @@ class FLClient:
                     style_bank = active_style_bank,
                     client_id  = self.client_id,
                     beta       = self.cfg["fft_beta"],
-                    M          = M,
                     img_side   = img_side,
                     grayscale  = grayscale,
-                    mean_bank       = mean_bank,
-                    prefer_distant  = self.cfg.get("prefer_distant_domain", True),
-                    use_mean_template = self.cfg.get("use_mean_template", False),
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
@@ -221,6 +219,12 @@ class FLClient:
                     center_loss      = self.center_loss,
                     center_optimizer = self.center_optimizer,
                     lambda_center    = lambda_c,
+                    lambda_style     = self.cfg.get("lambda_style", 0.0),
+                    other_protos     = other_protos,
+                    proto_beta       = self.cfg.get("proto_beta",   0.3),
+                    lambda_proto     = self.cfg.get("lambda_proto", 0.0)
+                                       if self.cfg.get("use_proto_mixing", False)
+                                       else 0.0,
                 )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
@@ -519,15 +523,6 @@ def main():
         print("  Spatial augmentation only — style bank extracted "
               "but not used during training.\n")
 
-    # compute per-client mean template for domain distance-aware mixing
-    # mean_bank: {client_id: mean_amplitude_array}  same shape as one template
-    mean_bank = {
-        cid: np.mean(templates, axis=0)
-        for cid, templates in style_bank_full.items()
-        if len(templates) > 0
-    }
-    print(f"  Mean bank ready — {len(mean_bank)} domain mean templates")
-
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
     g_eer_0, g_rank1_0 = server.evaluate()
@@ -539,6 +534,8 @@ def main():
     g_eer, g_rank1 = g_eer_0, g_rank1_0
 
     # ── FL rounds ─────────────────────────────────────────────────────────
+    proto_bank = {}   # {client_id: np.ndarray [K, D]} — built from global model
+
     for rnd in range(1, cfg["n_rounds"] + 1):
         t_start = time.time()
 
@@ -548,16 +545,57 @@ def main():
         mode_label = aug_mode_label(rnd, cfg, is_dinov2)
 
         global_weights = server.get_global_weights()
+
+        # ── Prototype extraction from global backbone ─────────────────────
+        # Done BEFORE local training so all prototypes share the same
+        # feature space — global backbone only, no ArcFace specialisation.
+        # Active from proto_start_round onward; updated every round after that.
+        use_proto   = cfg.get("use_proto_mixing", False) and not is_dinov2
+        start_round = cfg.get("proto_start_round", 20)
+
+        if use_proto and rnd == start_round:
+            print(f"\n  [Round {rnd}] First prototype extraction "
+                  f"(K={cfg['n_prototypes']}) …")
+
+        if use_proto and rnd >= start_round:
+            for client in clients:
+                # load global weights temporarily for extraction
+                client.set_weights(global_weights)
+                # DataLoader over training samples — no augmentation needed
+                proto_loader = DataLoader(
+                    PalmDataset(client.train_samples, cfg["img_side"]),
+                    batch_size  = cfg["batch_size"],
+                    shuffle     = False,
+                    num_workers = cfg["num_workers"],
+                )
+                proto_bank[client.client_id] = extract_domain_prototypes(
+                    client.model, proto_loader, device,
+                    K = cfg["n_prototypes"])
+            if rnd == start_round:
+                print(f"  Proto bank ready — "
+                      f"{len(proto_bank)} clients × "
+                      f"{cfg['n_prototypes']} centres each\n")
+
         client_weights = []
         client_metrics = []
 
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
             client.set_weights(global_weights)
+
+            # build this client's other_protos: all prototypes except its own
+            if use_proto and rnd >= start_round and len(proto_bank) > 1:
+                other_protos = np.concatenate([
+                    proto_bank[cid]
+                    for cid in proto_bank
+                    if cid != client.client_id
+                ], axis=0)   # [n_other_clients × K, D]
+            else:
+                other_protos = None
+
             loss, acc = client.local_train(
                 cfg["local_epochs"], active_style_bank, cfg["M"], rnd,
-                mean_bank = mean_bank if cfg.get("domain_aware_mixing", False) else None,
-            )
+                other_protos = other_protos)
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
