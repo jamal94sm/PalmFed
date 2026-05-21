@@ -118,54 +118,73 @@ def apply_style_template(img_np, amp_template, beta):
 # ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract_features(model, loader, device, all_protos=None, proto_beta=0.3):
+def extract_features(model, loader, device,
+                     feature_mean_bank=None, global_mean=None):
     """
-    Extract L2-normalised embeddings from a DataLoader using model.get_embedding().
-    Compatible with CompNet, CCNet, and DINOv2 (all expose get_embedding).
+    Extract L2-normalised embeddings using model.get_embedding().
+    Compatible with CompNet, CCNet, and DINOv2.
 
-    Optional prototype blending (inference-time domain normalisation):
-      If all_protos is provided (np.ndarray [N_total, D]), each embedding
-      is blended with its nearest prototype before being returned:
-          emb_blended = (1 - beta) * emb + beta * nearest_proto
-          emb_blended = L2_normalise(emb_blended)
-      This suppresses domain-induced variance in gallery/probe embeddings
-      before similarity scoring, analogous to the training-time proto loss.
+    Optional domain-neutral projection (inference-time, train-inference mode):
+      If feature_mean_bank and global_mean are provided, each embedding is
+      projected to remove its nearest domain's mean and re-centred on the
+      global mean across all clients:
 
-    NaN guard: any NaN row is replaced with a zero vector.
+          domain_mean  = feature_mean_bank[nearest_client]   # [D]
+          z_neutral    = z - domain_mean + global_mean
+          z_neutral    = L2_normalise(z_neutral)
+
+      This is identity-agnostic: domain means average out identity variation,
+      so subtracting them removes only the domain offset. Gallery and probe
+      embeddings from different domains are pulled into the same coordinate
+      system before similarity scoring.
+
+    NaN guard: any NaN row replaced with zero vector.
+
+    Parameters
+    ----------
+    model             : backbone with get_embedding()
+    loader            : DataLoader
+    device            : torch.device
+    feature_mean_bank : dict {client_id: mean_emb [D]} | None
+    global_mean       : np.ndarray [D] | None  mean of all domain means
 
     Returns
     -------
-    feats  : np.ndarray  [N, embed_dim]  — NaN-free, optionally proto-blended
+    feats  : np.ndarray  [N, D]
     labels : np.ndarray  [N]
     """
     model.eval()
 
-    # pre-build prototype tensor once if blending is requested
-    if all_protos is not None and len(all_protos) > 0:
-        protos_t = torch.tensor(all_protos, dtype=torch.float32, device=device)
-        protos_t = F.normalize(protos_t, p=2, dim=1)   # [N_total, D]
+    # prepare domain mean stack for nearest-domain lookup
+    if feature_mean_bank is not None and global_mean is not None:
+        domain_ids   = sorted(feature_mean_bank.keys())
+        domain_stack = np.stack(
+            [feature_mean_bank[cid] for cid in domain_ids])       # [C, D]
+        domain_t     = torch.tensor(
+            domain_stack, dtype=torch.float32, device=device)     # [C, D]
+        global_t     = torch.tensor(
+            global_mean, dtype=torch.float32, device=device)      # [D]
+        do_project   = True
     else:
-        protos_t = None
+        do_project   = False
 
     feats, labels = [], []
     for imgs, labs in loader:
-        batch_feats = model.get_embedding(imgs.to(device))   # [B, D] tensor
+        batch_t = model.get_embedding(imgs.to(device))    # [B, D]
 
-        if protos_t is not None:
-            # find nearest prototype for each embedding in the batch
-            emb_n   = F.normalize(batch_feats, p=2, dim=1)   # [B, D]
-            dists   = torch.cdist(emb_n, protos_t)            # [B, N_total]
-            nearest = protos_t[dists.argmin(dim=1)]           # [B, D]
-            blended = (1.0 - proto_beta) * emb_n + proto_beta * nearest
-            batch_feats = F.normalize(blended, p=2, dim=1)
+        if do_project:
+            emb_n = F.normalize(batch_t, p=2, dim=1)     # [B, D]
+            # find nearest domain mean for each embedding
+            dists        = torch.cdist(emb_n, domain_t)  # [B, C]
+            nearest_mean = domain_t[dists.argmin(dim=1)]  # [B, D]
+            # remove nearest domain offset, re-centre on global mean
+            z_neutral    = emb_n - nearest_mean + global_t.unsqueeze(0)
+            batch_t      = F.normalize(z_neutral, p=2, dim=1)
 
-        batch_np = batch_feats.cpu().numpy()
-
-        # NaN guard: zero-vector for degenerate embeddings
+        batch_np = batch_t.cpu().numpy()
         nan_rows = np.isnan(batch_np).any(axis=1)
         if nan_rows.any():
             batch_np[nan_rows] = 0.0
-
         feats.append(batch_np)
         labels.append(labs.numpy())
 
@@ -175,9 +194,7 @@ def extract_features(model, loader, device, all_protos=None, proto_beta=0.3):
 def compute_eer(scores_array):
     """
     EER from an Nx2 array of [cosine_score, label(+1/-1)].
-    Higher cosine score = more similar (genuine pairs score near +1).
-    Returns EER as a float in [0, 1].
-    Returns 1.0 (worst case) if scores contain NaN or classes are missing.
+    Returns EER in [0, 1]. Returns 1.0 on error or NaN.
     """
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
@@ -195,14 +212,16 @@ def compute_eer(scores_array):
 
 
 def evaluate_model(model, gallery_loader, probe_loader, device,
+                   feature_mean_bank=None, global_mean=None,
+                   # legacy params kept for backward compat — ignored
                    all_protos=None, proto_beta=0.3):
     """
-    Cosine-similarity evaluation on pre-split gallery and probe loaders.
-    Uses model.get_embedding() — compatible with all models.
+    Cosine-similarity evaluation on gallery and probe sets.
 
-    If all_protos is provided, gallery and probe embeddings are blended
-    with their nearest prototype before scoring (inference-time domain
-    normalisation). This is activated when use_proto_mixing="train-inference".
+    If feature_mean_bank and global_mean are provided (train-inference mode),
+    applies domain-neutral projection to both gallery and probe embeddings
+    before scoring — removes nearest domain offset and re-centres on the
+    global feature mean, aligning embeddings from different domains.
 
     Returns
     -------
@@ -210,12 +229,11 @@ def evaluate_model(model, gallery_loader, probe_loader, device,
     rank1 : float  Rank-1 accuracy in [0, 100]
     """
     gal_feats, gal_labels = extract_features(
-        model, gallery_loader, device, all_protos, proto_beta)
+        model, gallery_loader, device, feature_mean_bank, global_mean)
     prb_feats, prb_labels = extract_features(
-        model, probe_loader,   device, all_protos, proto_beta)
+        model, probe_loader,   device, feature_mean_bank, global_mean)
 
-    sim_matrix = prb_feats @ gal_feats.T
-    sim_matrix = np.nan_to_num(sim_matrix, nan=0.0)
+    sim_matrix = np.nan_to_num(prb_feats @ gal_feats.T, nan=0.0)
 
     scores_list, labels_list = [], []
     for i in range(len(prb_feats)):
@@ -223,59 +241,49 @@ def evaluate_model(model, gallery_loader, probe_loader, device,
             scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if prb_labels[i] == gal_labels[j] else -1)
 
-    eer = compute_eer(np.column_stack([scores_list, labels_list]))
-
-    nn_idx  = np.argmax(sim_matrix, axis=1)
+    eer    = compute_eer(np.column_stack([scores_list, labels_list]))
+    nn_idx = np.argmax(sim_matrix, axis=1)
     correct = sum(prb_labels[i] == gal_labels[nn_idx[i]]
                   for i in range(len(prb_feats)))
-    rank1   = 100.0 * correct / max(len(prb_feats), 1)
-
+    rank1  = 100.0 * correct / max(len(prb_feats), 1)
     return eer, rank1
 
 
 # ══════════════════════════════════════════════════════════════
-#  DOMAIN PROTOTYPE EXTRACTION
+#  DOMAIN MEAN EXTRACTION
 # ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract_domain_prototypes(model, loader, device, K=20):
+def extract_domain_mean(model, loader, device):
     """
-    Extract K cluster centres from the embeddings of all local training
-    samples, computed using the current (global) backbone.
+    Compute the mean embedding of all local training samples using the
+    current (global) backbone — called BEFORE local training so all
+    clients' means share the same feature space.
 
-    Called BEFORE local training so that all clients' prototypes live in
-    the same feature space — the shared global backbone with no ArcFace
-    specialisation. Identity variation averages out across the K clusters
-    when K << N_samples, leaving the dominant domain structure.
+    With many identities per client, identity variation averages out
+    and what remains is the domain's characteristic position in feature
+    space (sensor response, spectral band, illumination). This is
+    directly analogous to the mean FFT amplitude template: identity
+    variation cancels, domain signal dominates.
 
     Parameters
     ----------
-    model  : backbone model — must expose get_embedding()
-    loader : DataLoader over the client's training samples
+    model  : backbone — must expose get_embedding()
+    loader : DataLoader over the client's training samples (no aug)
     device : torch.device
-    K      : int  number of cluster centres to extract
 
     Returns
     -------
-    centres : np.ndarray  [K, embed_dim]  L2-normalised cluster centres
+    mean_emb : np.ndarray  [embed_dim]  L2-normalised domain mean
     """
-    from sklearn.cluster import KMeans
-
     model.eval()
-    embs = []
+    all_embs = []
     for imgs, _ in loader:
         e = model.get_embedding(imgs.to(device)).cpu().numpy()
-        embs.append(e)
-    embs = np.concatenate(embs, axis=0)   # [N, D]
-
-    K_eff = min(K, len(embs))             # never more clusters than samples
-    km    = KMeans(n_clusters=K_eff, n_init=10, random_state=42)
-    km.fit(embs)
-
-    centres = km.cluster_centers_.astype(np.float32)  # [K, D]
-    # L2-normalise so cosine distance is used consistently
-    norms   = np.linalg.norm(centres, axis=1, keepdims=True) + 1e-8
-    return centres / norms
+        all_embs.append(e)
+    mean = np.mean(np.concatenate(all_embs, axis=0), axis=0)
+    norm = np.linalg.norm(mean)
+    return (mean / (norm + 1e-8)).astype(np.float32)   # [D]
 
 class CenterLoss(nn.Module):
     """
@@ -344,48 +352,52 @@ class CenterLoss(nn.Module):
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
                         lambda_center=0.0, lambda_style=0.0,
-                        other_protos=None, proto_beta=0.3,
-                        lambda_proto=0.0):
+                        own_mean_vec=None, other_means_avg=None,
+                        proto_beta=0.3, lambda_proto=0.0):
     """
     Train CompNet (or DINOv2) for one epoch.
 
     Loss : CrossEntropy(ArcFace, emb_orig)
-         + lambda_style  × StyleConsistencyLoss       (optional)
-         + lambda_center × CenterLoss(emb_orig)       (optional)
-         + lambda_proto  × ProtoConsistencyLoss        (optional)
+         + lambda_style  × StyleConsistencyLoss         (optional)
+         + lambda_center × CenterLoss(emb_orig)         (optional)
+         + lambda_proto  × DomainOffsetConsistencyLoss  (optional)
 
     StyleConsistencyLoss:
       1 - cosine_sim(emb_orig, emb_aug)
-      Enforces that FFT/spatially-augmented embeddings stay close to
-      their original counterparts — input-level domain invariance.
+      Input-level domain invariance via FFT/spatial augmentation pairs.
 
-    ProtoConsistencyLoss:
-      1 - cosine_sim(emb_orig, emb_mixed)
-      where emb_mixed = (1-β)×emb_orig + β×nearest_other_proto
-      For each sample, finds the nearest prototype from other clients
-      (shared domain feature cluster centres extracted from the global
-      backbone), blends the embedding toward it, and enforces that the
-      backbone's output is close to the domain-shifted version. ArcFace
-      never sees emb_mixed — no identity-label mismatch.
-      Enforces feature-level domain invariance.
+    DomainOffsetConsistencyLoss:
+      Enforces feature-level domain invariance using domain mean vectors.
+      For each embedding, compute the domain offset direction — the unit
+      vector from this client's mean embedding toward the average of all
+      other clients' means. Shift the embedding along this direction by
+      proto_beta and enforce the backbone output stays close:
 
-    Dataset returns ([orig, aug], label).
-    ArcFace and CenterLoss use emb_orig only.
+          offset     = normalise(other_means_avg - own_mean_vec)  [D]
+          emb_shifted = normalise(emb_n + beta × offset)
+          loss       = 1 - cosine_sim(emb_n, emb_shifted)
+
+      The offset is identity-agnostic: means average over many identities
+      so identity variation cancels, leaving only the domain component.
+      The loss has real gradient magnitude unlike nearest-proto blending
+      because emb_shifted moves meaningfully in embedding space.
+      ArcFace never sees emb_shifted — no identity-label mismatch.
 
     Parameters
     ----------
     model            : CompNet or DINOv2Model
-    loader           : DataLoader yielding ([orig, aug], label)
+    loader           : DataLoader yielding ([orig, aug], label) or (img, label)
     criterion        : nn.CrossEntropyLoss
     optimizer        : torch.optim.Optimizer
     device           : torch.device
     center_loss      : CenterLoss | None
     center_optimizer : torch.optim.SGD | None
-    lambda_center    : float  CenterLoss weight              (0 → disabled)
-    lambda_style     : float  StyleConsistencyLoss weight    (0 → disabled)
-    other_protos     : Tensor [N_other, D] | None  other clients' prototypes
-    proto_beta       : float  blend weight toward donor prototype
-    lambda_proto     : float  ProtoConsistencyLoss weight    (0 → disabled)
+    lambda_center    : float  CenterLoss weight                  (0 → disabled)
+    lambda_style     : float  StyleConsistencyLoss weight        (0 → disabled)
+    own_mean_vec     : np.ndarray [D] | None  this client's domain mean
+    other_means_avg  : np.ndarray [D] | None  mean of other clients' means
+    proto_beta       : float  shift magnitude along domain offset direction
+    lambda_proto     : float  DomainOffsetConsistencyLoss weight (0 → disabled)
 
     Returns
     -------
@@ -401,14 +413,19 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                   lambda_center > 0.0)
     use_style  = lambda_style > 0.0
     use_proto  = (lambda_proto > 0.0 and
-                  other_protos is not None and
-                  len(other_protos) > 0)
+                  own_mean_vec is not None and
+                  other_means_avg is not None)
 
-    # pre-move prototypes to device once, L2-normalised
+    # pre-compute domain offset vector once — same for all batches
     if use_proto:
-        protos_t = F.normalize(
-            torch.tensor(other_protos, dtype=torch.float32, device=device),
-            p=2, dim=1)                             # [N_other, D]
+        offset_np  = other_means_avg - own_mean_vec          # [D]
+        norm       = np.linalg.norm(offset_np)
+        if norm < 1e-8:                                       # degenerate case
+            use_proto = False
+        else:
+            offset_t = torch.tensor(
+                (offset_np / norm).astype(np.float32),
+                device=device)                               # [D] unit vector
 
     def _get_emb(imgs):
         return model._backbone(imgs) if hasattr(model, "_backbone") \
@@ -424,16 +441,13 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     for data, labels in loader:
         labels = labels.to(device)
 
-        # ── data format detection ─────────────────────────────────────────
-        # AugmentedDataset  → data is list [orig, aug]:  both [B, C, H, W]
-        # FFTAugmentedDataset → data is single Tensor:   [B, C, H, W]
-        # Detecting by type avoids any dataset-specific branching here.
+        # format detection: paired [orig, aug] or single image
         if isinstance(data, (list, tuple)):
-            orig    = data[0].to(device)   # clean original
-            aug     = data[1].to(device)   # spatially/FFT augmented
+            orig    = data[0].to(device)
+            aug     = data[1].to(device)
             has_aug = True
         else:
-            orig    = data.to(device)      # augmented single image
+            orig    = data.to(device)
             aug     = None
             has_aug = False
 
@@ -453,13 +467,13 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
             loss = loss + lambda_style * (1.0 - sim.mean())
 
         if use_proto:
-            emb_n   = F.normalize(emb_orig, p=2, dim=1)
-            dists   = torch.cdist(emb_n, protos_t)
-            nearest = protos_t[dists.argmin(dim=1)]
-            emb_mixed = F.normalize(
-                (1.0 - proto_beta) * emb_n + proto_beta * nearest, p=2, dim=1)
-            sim_proto = F.cosine_similarity(emb_n, emb_mixed, dim=1)
-            loss      = loss + lambda_proto * (1.0 - sim_proto.mean())
+            emb_n      = F.normalize(emb_orig, p=2, dim=1)     # [B, D]
+            # shift all embeddings along the domain offset direction
+            emb_shifted = F.normalize(
+                emb_n + proto_beta * offset_t.unsqueeze(0),    # [B, D]
+                p=2, dim=1)
+            sim_domain  = F.cosine_similarity(emb_n, emb_shifted, dim=1)
+            loss        = loss + lambda_proto * (1.0 - sim_domain.mean())
 
         if use_center:
             loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
