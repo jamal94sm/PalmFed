@@ -63,7 +63,7 @@ CONFIG = {
                                      # False → random sample from donor's bank
 
     # ── feature-level knowledge sharing (MoK) ───────────────────────────
-    "use_proto_mixing"  : "neither",  # "neither" | "train-only" | "train-inference"
+    "use_proto_mixing"  : "train-inference",  # "neither" | "train-only" | "train-inference"
     "n_prototypes"      : 100,     # K cluster centres per client
     "proto_start_round" : 20,     # wait for meaningful prototypes
     "proto_beta"        : 0.5,    # blend weight toward donor prototype
