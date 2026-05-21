@@ -204,8 +204,48 @@ def evaluate_model(model, gallery_loader, probe_loader, device):
 
 
 # ══════════════════════════════════════════════════════════════
-#  CENTER LOSS
+#  DOMAIN PROTOTYPE EXTRACTION
 # ══════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def extract_domain_prototypes(model, loader, device, K=20):
+    """
+    Extract K cluster centres from the embeddings of all local training
+    samples, computed using the current (global) backbone.
+
+    Called BEFORE local training so that all clients' prototypes live in
+    the same feature space — the shared global backbone with no ArcFace
+    specialisation. Identity variation averages out across the K clusters
+    when K << N_samples, leaving the dominant domain structure.
+
+    Parameters
+    ----------
+    model  : backbone model — must expose get_embedding()
+    loader : DataLoader over the client's training samples
+    device : torch.device
+    K      : int  number of cluster centres to extract
+
+    Returns
+    -------
+    centres : np.ndarray  [K, embed_dim]  L2-normalised cluster centres
+    """
+    from sklearn.cluster import KMeans
+
+    model.eval()
+    embs = []
+    for imgs, _ in loader:
+        e = model.get_embedding(imgs.to(device)).cpu().numpy()
+        embs.append(e)
+    embs = np.concatenate(embs, axis=0)   # [N, D]
+
+    K_eff = min(K, len(embs))             # never more clusters than samples
+    km    = KMeans(n_clusters=K_eff, n_init=10, random_state=42)
+    km.fit(embs)
+
+    centres = km.cluster_centers_.astype(np.float32)  # [K, D]
+    # L2-normalise so cosine distance is used consistently
+    norms   = np.linalg.norm(centres, axis=1, keepdims=True) + 1e-8
+    return centres / norms
 
 class CenterLoss(nn.Module):
     """
@@ -273,30 +313,54 @@ class CenterLoss(nn.Module):
 
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
-                        lambda_center=0.0):
+                        lambda_center=0.0, lambda_style=0.0,
+                        other_protos=None, proto_beta=0.3,
+                        lambda_proto=0.0):
     """
     Train CompNet (or DINOv2) for one epoch.
 
-    Loss : CrossEntropyLoss(ArcFace logits)
-         + lambda_center × CenterLoss  (optional)
+    Loss : CrossEntropy(ArcFace, emb_orig)
+         + lambda_style  × StyleConsistencyLoss       (optional)
+         + lambda_center × CenterLoss(emb_orig)       (optional)
+         + lambda_proto  × ProtoConsistencyLoss        (optional)
 
-    Dataset returns (img, label) — single image per sample.
+    StyleConsistencyLoss:
+      1 - cosine_sim(emb_orig, emb_aug)
+      Enforces that FFT/spatially-augmented embeddings stay close to
+      their original counterparts — input-level domain invariance.
+
+    ProtoConsistencyLoss:
+      1 - cosine_sim(emb_orig, emb_mixed)
+      where emb_mixed = (1-β)×emb_orig + β×nearest_other_proto
+      For each sample, finds the nearest prototype from other clients
+      (shared domain feature cluster centres extracted from the global
+      backbone), blends the embedding toward it, and enforces that the
+      backbone's output is close to the domain-shifted version. ArcFace
+      never sees emb_mixed — no identity-label mismatch.
+      Enforces feature-level domain invariance.
+
+    Dataset returns ([orig, aug], label).
+    ArcFace and CenterLoss use emb_orig only.
 
     Parameters
     ----------
     model            : CompNet or DINOv2Model
-    loader           : DataLoader yielding (img_tensor, label_tensor)
+    loader           : DataLoader yielding ([orig, aug], label)
     criterion        : nn.CrossEntropyLoss
     optimizer        : torch.optim.Optimizer
     device           : torch.device
     center_loss      : CenterLoss | None
     center_optimizer : torch.optim.SGD | None
-    lambda_center    : float  CenterLoss weight (0 → disabled)
+    lambda_center    : float  CenterLoss weight              (0 → disabled)
+    lambda_style     : float  StyleConsistencyLoss weight    (0 → disabled)
+    other_protos     : Tensor [N_other, D] | None  other clients' prototypes
+    proto_beta       : float  blend weight toward donor prototype
+    lambda_proto     : float  ProtoConsistencyLoss weight    (0 → disabled)
 
     Returns
     -------
     avg_loss : float
-    accuracy : float  (classification accuracy in %)
+    accuracy : float  (classification accuracy on orig in %)
     """
     model.train()
     if center_loss is not None:
@@ -305,26 +369,64 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     use_center = (center_loss is not None and
                   center_optimizer is not None and
                   lambda_center > 0.0)
+    use_style  = lambda_style > 0.0
+    use_proto  = (lambda_proto > 0.0 and
+                  other_protos is not None and
+                  len(other_protos) > 0)
+
+    # pre-move prototypes to device once, L2-normalised
+    if use_proto:
+        protos_t = F.normalize(
+            torch.tensor(other_protos, dtype=torch.float32, device=device),
+            p=2, dim=1)                             # [N_other, D]
+
+    def _get_emb(imgs):
+        return model._backbone(imgs) if hasattr(model, "_backbone") \
+               else model.backbone(imgs)
+
+    def _get_logits(emb, labels):
+        if hasattr(model, "drop"):
+            return model.arc(model.drop(emb), labels)
+        return model.arc(emb, labels)
 
     running_loss = 0.0; correct = 0; total = 0
 
-    for imgs, labels in loader:
-        imgs, labels = imgs.to(device), labels.to(device)
+    for data, labels in loader:
+        orig   = data[0].to(device)
+        aug    = data[1].to(device)
+        labels = labels.to(device)
 
         optimizer.zero_grad()
         if use_center:
             center_optimizer.zero_grad()
 
+        emb_orig = _get_emb(orig)
+        logits   = _get_logits(emb_orig, labels)
+        loss     = criterion(logits, labels)
+
+        if use_style:
+            emb_aug = _get_emb(aug)
+            sim     = F.cosine_similarity(
+                F.normalize(emb_orig, p=2, dim=1),
+                F.normalize(emb_aug,  p=2, dim=1), dim=1)
+            loss = loss + lambda_style * (1.0 - sim.mean())
+
+        if use_proto:
+            # find nearest other-client prototype for each sample
+            emb_n      = F.normalize(emb_orig, p=2, dim=1)    # [B, D]
+            dists      = torch.cdist(emb_n, protos_t)          # [B, N_other]
+            nearest    = protos_t[dists.argmin(dim=1)]         # [B, D]
+
+            # blend toward nearest donor prototype
+            emb_mixed  = (1.0 - proto_beta) * emb_n + proto_beta * nearest
+            emb_mixed  = F.normalize(emb_mixed, p=2, dim=1)
+
+            # consistency loss — ArcFace never sees emb_mixed
+            sim_proto  = F.cosine_similarity(emb_n, emb_mixed, dim=1)
+            loss       = loss + lambda_proto * (1.0 - sim_proto.mean())
+
         if use_center:
-            emb    = model._backbone(imgs) if hasattr(model, "_backbone") \
-                     else model.backbone(imgs)
-            logits = model.arc(model.drop(emb), labels) if hasattr(model, "drop") \
-                     else model.arc(emb, labels)
-            loss   = criterion(logits, labels) + \
-                     lambda_center * center_loss(emb.detach(), labels)
-        else:
-            logits = model(imgs, labels)
-            loss   = criterion(logits, labels)
+            loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
 
         loss.backward()
         optimizer.step()
@@ -335,9 +437,9 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                     p.grad.data *= 1.0 / (lambda_center + 1e-8)
             center_optimizer.step()
 
-        running_loss += loss.item() * imgs.size(0)
+        running_loss += loss.item() * orig.size(0)
         correct      += logits.argmax(1).eq(labels).sum().item()
-        total        += imgs.size(0)
+        total        += orig.size(0)
 
     return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
 
