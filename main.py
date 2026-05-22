@@ -574,7 +574,7 @@ def main():
                 server.gallery_loader.dataset.get_paths(),
                 moe_gal_domain_ids,
                 cfg["img_side"],
-                cfg["fft_beta"],
+                beta=1.0,   # full amplitude spectrum for domain discrimination
                 probe_domain_ids_gt=prb_domain_ids_gt,
             )
             print(f"  MoE domain IDs cached — "
