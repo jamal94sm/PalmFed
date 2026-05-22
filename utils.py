@@ -268,88 +268,108 @@ def extract_fft_descriptor(path, img_side=128, beta=0.15):
     return (amp * mask).flatten().astype(np.float32)
 
 
+def _extract_lowfreq_crop(path, img_side, l):
+    """
+    Hard crop of the low-frequency FFT amplitude around the DC component.
+    Matches the paper's Eq. 17: f_low = M[cr-l : cr+l, cc-l : cc+l]
+    where M is the fftshifted amplitude and l is the frequency radius.
+    """
+    img    = Image.open(path).convert("L").resize(
+        (img_side, img_side), Image.BILINEAR)
+    img_np = np.array(img, dtype=np.float32) / 255.0
+    M      = np.abs(np.fft.fftshift(np.fft.fft2(img_np)))
+    cr, cc = img_side // 2, img_side // 2
+    return M[cr - l : cr + l, cc - l : cc + l].flatten().astype(np.float32)
+
+
 def predict_probe_domain_ids(probe_paths, gallery_paths, gallery_domain_ids,
-                              img_side=128, beta=1.0,
+                              img_side=128, beta=0.1,
                               probe_domain_ids_gt=None):
     """
-    Predict domain label for each probe sample by nearest-neighbour search
-    against per-domain mean FFT amplitude templates computed from the gallery.
+    Predict domain label for each probe sample using diagonal Mahalanobis
+    distance to per-domain Gaussian models fitted on gallery descriptors.
+    Implements the FDD approach from the AAAI-26 paper.
 
-    Gallery processing:
-      For each domain, average the full FFT amplitude spectra of all gallery
-      samples belonging to that domain → one mean template per domain.
-      This suppresses identity-specific texture and retains the domain's
-      characteristic spectral signature.
+    Descriptor — hard-cropped low-frequency FFT amplitude (paper Eq. 17):
+      l      = int(beta * img_side)        e.g. beta=0.1, img_side=128 → l=12
+      f_low  = M[cr-l:cr+l, cc-l:cc+l]   → (2l)² = 576-d vector
+      Captures domain-specific spectral signature near DC while discarding
+      mid-/high-frequency identity texture.
 
-    Probe matching:
-      For each probe, compute its full FFT amplitude and find the nearest
-      domain mean template (L2 distance). The probe inherits that domain label.
+    Gallery — per-domain diagonal Gaussian (μ_i, σ²_i):
+      μ_i  = mean descriptor of all gallery samples for domain i
+      σ²_i = per-dimension variance + ε·I regularisation
+      Diagonal (not full) covariance avoids rank-deficiency when
+      N_samples (~40) << descriptor_dim (576).
 
-    beta=1.0 uses the full amplitude spectrum (no Gaussian mask) — the
-    complete spectral signature rather than just the low-frequency region.
+    Matching — diagonal Mahalanobis distance (paper Eq. 9):
+      m_i(z) = Σ_k (z_k - μ_ik)² / σ²_ik
+      i* = argmin_i m_i(z)
+      Down-weights uninformative (high-variance) frequency bins and
+      amplifies discriminative (low-variance, domain-specific) bins.
 
     Parameters
     ----------
     probe_paths          : list[str]
     gallery_paths        : list[str]
-    gallery_domain_ids   : list[int]   known domain per gallery sample
+    gallery_domain_ids   : list[int]  known domain index per gallery sample
     img_side             : int
-    beta                 : float       1.0 = full spectrum (no mask)
-    probe_domain_ids_gt  : list[int] | None  for accuracy reporting
+    beta                 : float      frequency radius as fraction of img_side
+    probe_domain_ids_gt  : list[int] | None  GT labels for accuracy report
 
     Returns
     -------
     pred_domain_ids : np.ndarray [N_probe] int
     """
-    print("  [MoE] Computing domain templates from gallery …")
-    gal_ids  = np.array(gallery_domain_ids, dtype=np.int64)
-    domains  = sorted(np.unique(gal_ids).tolist())
+    l   = max(1, int(beta * img_side))   # e.g. beta=0.1, img_side=128 → l=12
+    dim = (2 * l) ** 2                   # e.g. 24×24 = 576
 
-    # extract full FFT amplitude for all gallery samples
-    if beta >= 1.0:
-        # full spectrum — no mask
-        def _desc(path):
-            img = Image.open(path).convert("L").resize(
-                (img_side, img_side), Image.BILINEAR)
-            img_np = np.array(img, dtype=np.float32) / 255.0
-            amp    = np.abs(np.fft.fft2(img_np))
-            return np.fft.fftshift(amp).flatten().astype(np.float32)
-    else:
-        def _desc(path):
-            return extract_fft_descriptor(path, img_side, beta)
+    print(f"  [MoE] FDD: beta={beta}  l={l}  descriptor={dim}-d  "
+          f"(low-freq crop {2*l}×{2*l})")
+    print("  [MoE] Extracting gallery descriptors …")
 
-    gal_descs = np.stack([_desc(p) for p in gallery_paths])   # [G, D²]
+    gal_ids   = np.array(gallery_domain_ids, dtype=np.int64)
+    domains   = sorted(np.unique(gal_ids).tolist())
+    gal_descs = np.stack(
+        [_extract_lowfreq_crop(p, img_side, l) for p in gallery_paths])
 
-    # one mean template per domain  [n_domains, D²]
-    domain_templates = np.stack([
-        gal_descs[gal_ids == d].mean(axis=0) for d in domains
-    ])                                                          # [n_domains, D²]
+    # ── per-domain diagonal Gaussian ──────────────────────────────────────
+    # regularisation ε = 1% of global variance — keeps σ² > 0 everywhere
+    eps = max(float(gal_descs.var()), 1e-8) * 1e-2
+
+    mu_stack  = np.zeros((len(domains), dim), dtype=np.float32)
+    var_stack = np.zeros((len(domains), dim), dtype=np.float32)
+
+    for k, d in enumerate(domains):
+        D_d           = gal_descs[gal_ids == d]     # [N_d, dim]
+        mu_stack[k]   = D_d.mean(axis=0)
+        var_stack[k]  = D_d.var(axis=0) + eps
+
+    n_gal_str = ", ".join(f"d{d}:{(gal_ids==d).sum()}" for d in domains)
+    print(f"  [MoE] {len(domains)} Gaussian models built ({n_gal_str})")
+
+    # ── probe Mahalanobis matching ────────────────────────────────────────
+    print("  [MoE] Matching probe samples via Mahalanobis distance …")
+    prb_descs = np.stack(
+        [_extract_lowfreq_crop(p, img_side, l) for p in probe_paths])
+
     domain_labels = np.array(domains, dtype=np.int64)
-
-    print(f"  [MoE] {len(domains)} domain templates built  "
-          f"(each averaged over "
-          + ", ".join(str((gal_ids == d).sum()) for d in domains)
-          + " gallery samples)")
-
-    # probe descriptors and nearest-template matching
-    print("  [MoE] Matching probe samples to domain templates …")
-    prb_descs = np.stack([_desc(p) for p in probe_paths])      # [P, D²]
-
-    chunk = 512
     N_prb = len(prb_descs)
     pred  = np.empty(N_prb, dtype=np.int64)
+    chunk = 256
+
     for start in range(0, N_prb, chunk):
-        end  = min(start + chunk, N_prb)
-        diff = prb_descs[start:end, None, :] - \
-               domain_templates[None, :, :]                    # [C, n_d, D²]
-        dists = (diff ** 2).sum(axis=-1)                       # [C, n_d]
-        pred[start:end] = domain_labels[dists.argmin(axis=-1)]
+        end   = min(start + chunk, N_prb)
+        z     = prb_descs[start:end]                        # [C, dim]
+        diff  = z[:, None, :] - mu_stack[None, :, :]       # [C, K, dim]
+        mahal = (diff ** 2 / var_stack[None, :, :]).sum(-1) # [C, K]
+        pred[start:end] = domain_labels[mahal.argmin(axis=-1)]
 
     unique, counts = np.unique(pred, return_counts=True)
     dist_str = ", ".join(f"d{d}:{c}" for d, c in zip(unique, counts))
     print(f"  [MoE] Predicted probe distribution: {dist_str}")
 
-    # accuracy report
+    # ── accuracy report ───────────────────────────────────────────────────
     if probe_domain_ids_gt is not None:
         gt  = np.array(probe_domain_ids_gt, dtype=np.int64)
         acc = 100.0 * (pred == gt).sum() / len(pred)
