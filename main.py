@@ -574,7 +574,7 @@ def main():
                 server.gallery_loader.dataset.get_paths(),
                 moe_gal_domain_ids,
                 cfg["img_side"],
-                beta=1.0,   # full amplitude spectrum for domain discrimination
+                beta=0.1,   # hard-crop low-freq patch, Mahalanobis matching
                 probe_domain_ids_gt=prb_domain_ids_gt,
             )
             print(f"  MoE domain IDs cached — "
@@ -688,3 +688,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
