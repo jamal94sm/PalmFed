@@ -137,4 +137,5 @@ CONFIG = {
     # ── Misc ───────────────────────────────────────────────────
     "random_seed"      : 42,
     "num_workers"      : 4,
+    "avg_last_rounds"  : 5,     # number of final rounds to average for reporting
 }
