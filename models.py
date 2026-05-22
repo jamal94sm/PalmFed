@@ -104,90 +104,92 @@ class ArcMarginProduct(nn.Module):
 
 class MoEFC(nn.Module):
     """
-    Base FC + residual Mixture-of-Experts replacing CompNet's FC(9708→512).
+    Base FC + domain-label-conditioned residual experts.
 
     Architecture:
-      output = base_FC(x) + Σ_k gates_k × residual_expert_k(x)
+      output = base_FC(x) + expert[domain_id](x)
 
-    The shared base_FC is identical to the original nn.Linear(9708→512).
-    Residual experts are low-rank adapters (9708→rank→512) initialised to
-    output zero (B matrix set to zeros). This guarantees that at round 0
-    the model behaves exactly like the original CompNet — no degradation
-    from initialisation. Experts learn domain-specific corrections on top
-    of the shared base as training progresses.
+    The shared base FC (9708→512) is identical to the original nn.Linear
+    and is the domain-invariant component shared via FedAvg.
 
-    Top-K gating: only top-k experts receive non-zero weight, forcing
-    specialisation. Load balancing uses full gate weights so all experts
-    receive gradient to maintain utilisation.
+    Each expert is a low-rank residual adapter (9708→rank→512) indexed by
+    domain label. B is zero-initialised so at round 0 the output equals
+    base_FC(x) exactly — identical to non-MoE CompNet, no degradation.
+
+    Domain label routing:
+      Training: each sample's domain label is known explicitly.
+        Original samples → local client's domain index.
+        FFT-augmented samples → donor client's domain index.
+        Expert[domain_id] is activated for that sample.
+      Inference: domain label unknown → only base_FC used (domain_id=None).
+        Residuals are training-time signals; at inference the base FC
+        carries the full domain-invariant representation.
+
+    FedAvg aggregation:
+      base.*    → averaged across all clients (domain-invariant projection)
+      experts.k → averaged across all clients' expert k
+                  Client 0 (940nm) trains expert[0] on 940nm originals
+                  + other domains' FFT copies lightly.
+                  Client 1 (850nm) trains expert[1] on 850nm originals.
+                  After FedAvg, expert[k] = 940nm-specialised adapter
+                  averaged with light contributions from other clients.
+                  This is coherent because corresponding experts aggregate.
+
+    No gating network, no load balancing loss — domain routing is exact.
+    get_moe_lb_loss() returns 0.0 (kept for interface compatibility).
 
     Parameters
     ----------
     in_features  : int  9708
     out_features : int  512
-    n_experts    : int  number of residual experts
-    rank         : int  expert bottleneck rank
-    top_k        : int  active experts per sample
+    n_experts    : int  number of domain experts (= number of FL clients)
+    rank         : int  LoRA rank for each expert
     """
     def __init__(self, in_features=9708, out_features=512,
-                 n_experts=6, rank=64, top_k=2):
+                 n_experts=6, rank=64):
         super().__init__()
         self.n_experts = n_experts
-        self.top_k     = min(top_k, n_experts)
-        self._lb_loss  = None
 
-        # shared base — same as original FC, same initialisation
+        # shared base — domain-invariant, identical to original FC
         self.base = nn.Linear(in_features, out_features)
 
-        # gating network
-        self.gate = nn.Linear(in_features, n_experts)
-
-        # residual experts — B initialised to zero → zero initial output
+        # one residual expert per domain — zero-init B → zero initial output
         self.experts = nn.ModuleList([
             _ResidualExpert(in_features, out_features, rank)
             for _ in range(n_experts)
         ])
 
-    def forward(self, x):
+    def forward(self, x, domain_ids=None):
         """
-        x   : [B, 9708]
-        out : [B, 512]   base + weighted residual corrections
+        x          : [B, 9708]
+        domain_ids : LongTensor [B] | None
+                     Domain index per sample (0..n_experts-1).
+                     None at inference → base FC only, no residual.
+        Returns    : [B, 512]
         """
-        base_out   = self.base(x)                              # [B, 512]
+        base_out = self.base(x)                          # [B, 512]
 
-        gates_full = torch.softmax(self.gate(x), dim=-1)      # [B, n_experts]
+        if domain_ids is None:
+            return base_out                              # inference: base only
 
-        # top-k mask
-        if self.top_k < self.n_experts:
-            topk_vals, topk_idx = gates_full.topk(self.top_k, dim=-1)
-            mask  = torch.zeros_like(gates_full)
-            mask.scatter_(1, topk_idx, topk_vals)
-            gates = mask / (mask.sum(dim=-1, keepdim=True) + 1e-8)
-        else:
-            gates = gates_full
-
-        # residual expert outputs: [B, n_experts, 512]
-        expert_outs = torch.stack(
-            [exp(x) for exp in self.experts], dim=1)
-
-        # weighted sum of residuals: [B, 512]
-        residual = (gates.unsqueeze(-1) * expert_outs).sum(dim=1)
-
-        # load balancing on full (unmasked) gates
-        mean_gates    = gates_full.mean(dim=0)
-        self._lb_loss = self.n_experts * (mean_gates ** 2).sum()
+        residual = torch.zeros_like(base_out)            # [B, 512]
+        for d in range(self.n_experts):
+            mask = (domain_ids == d)                     # [B] bool
+            if mask.any():
+                residual[mask] = self.experts[d](x[mask])
 
         return base_out + residual
 
 
 class _ResidualExpert(nn.Module):
     """Low-rank residual adapter: Linear(in→rank) → ReLU → Linear(rank→out).
-    B initialised to zero so initial contribution is exactly zero."""
+    B initialised to zero — zero contribution at start, learned from training."""
     def __init__(self, in_features, out_features, rank):
         super().__init__()
         self.A = nn.Linear(in_features, rank, bias=False)
         self.B = nn.Linear(rank, out_features, bias=False)
         nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
-        nn.init.zeros_(self.B.weight)    # ← zero init: no contribution at start
+        nn.init.zeros_(self.B.weight)
 
     def forward(self, x):
         return self.B(F.relu(self.A(x)))
@@ -195,60 +197,58 @@ class _ResidualExpert(nn.Module):
 
 class CompNet(nn.Module):
     """
-    CompNet = CB1 // CB2 // CB3 + FC(9708→emb_dim) + Dropout + ArcFace.
+    CompNet = CB1 // CB2 // CB3 + FC(9708→512) + Dropout + ArcFace.
 
     Without MoE (use_moe=False):
       Three parallel CompetitiveBlocks → concat [B, 9708]
-      → FC(9708→512) → Dropout → ArcFace
+      → nn.Linear(9708→512) → Dropout → ArcFace
 
     With MoE (use_moe=True):
       Three parallel CompetitiveBlocks → concat [B, 9708]
-      → MoEFC(9708→512, K experts, top-k routing) → Dropout → ArcFace
+      → MoEFC: base_FC(x) + expert[domain_id](x) → Dropout → ArcFace
 
-    The MoEFC replaces the single projection with K low-rank experts.
-    The gate reads the 9708-d multi-scale Gabor feature vector and routes
-    each sample to its top-k experts — learning domain-specific projections
-    from the concatenated texture fingerprint.
-
-    get_moe_lb_loss(): returns load balancing loss after _backbone()
-    is called. Returns zero when use_moe=False.
+    _backbone(x, domain_ids=None):
+      domain_ids passed during training so each sample activates its
+      domain-specific expert. At inference (get_embedding), domain_ids=None
+      so only the base FC is used.
     """
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25,
-                 use_moe=False, n_experts=6, lora_rank=64, moe_top_k=2):
+                 use_moe=False, n_experts=6, lora_rank=64):
         super().__init__()
         self.cb1 = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
         self.cb2 = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
         self.use_moe = use_moe
         if use_moe:
-            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank, moe_top_k)
+            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank)
         else:
             self.fc = nn.Linear(9708, embedding_dim)
         self.drop = nn.Dropout(p=dropout)
         self.arc  = ArcMarginProduct(embedding_dim, num_classes,
                                      s=arcface_s, m=arcface_m)
 
-    def _backbone(self, x):
-        x1 = self.cb1(x).flatten(1)
-        x2 = self.cb2(x).flatten(1)
-        x3 = self.cb3(x).flatten(1)
-        return self.fc(torch.cat([x1, x2, x3], dim=1))
+    def _backbone(self, x, domain_ids=None):
+        x1   = self.cb1(x).flatten(1)
+        x2   = self.cb2(x).flatten(1)
+        x3   = self.cb3(x).flatten(1)
+        feat = torch.cat([x1, x2, x3], dim=1)       # [B, 9708]
+        if self.use_moe:
+            return self.fc(feat, domain_ids)         # domain-conditioned
+        return self.fc(feat)                         # standard FC
 
-    def forward(self, x, y=None):
-        return self.arc(self.drop(self._backbone(x)), y)
+    def forward(self, x, y=None, domain_ids=None):
+        return self.arc(self.drop(self._backbone(x, domain_ids)), y)
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised embedding for matching — no ArcFace head."""
-        return F.normalize(self._backbone(x), p=2, dim=1)
+        """L2-normalised embedding — base FC only (no residual).
+        Domain label unknown at inference, base carries domain-invariant repr."""
+        return F.normalize(self._backbone(x, domain_ids=None), p=2, dim=1)
 
     def get_moe_lb_loss(self):
-        """Load balancing loss from MoEFC. Zero when use_moe=False."""
-        if not self.use_moe or not hasattr(self.fc, "_lb_loss") \
-                or self.fc._lb_loss is None:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-        return self.fc._lb_loss
+        """No load balancing needed — domain routing is exact. Returns 0."""
+        return torch.tensor(0.0, device=next(self.parameters()).device)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -727,7 +727,6 @@ def build_model(cfg, num_classes):
             use_moe       = cfg.get("use_moe",    False),
             n_experts     = cfg.get("n_experts",  6),
             lora_rank     = cfg.get("lora_rank",  64),
-            moe_top_k     = cfg.get("moe_top_k",  2),
         )
     elif name == "ccnet":
         return CCNet(
