@@ -84,7 +84,7 @@ CONFIG = {
     #   False → MoE kept local per client (not shared).
     #     Gate only sees one domain → cannot learn universal routing.
     #     Degenerates to a domain-specific projection — defeats the purpose.
-    "use_moe"            : False,  # True → MoE FC for compnet | LoRA MoE for dinov2
+    "use_moe"            : True,  # True → MoE FC for compnet | LoRA MoE for dinov2
     "n_experts"          : 6,      # number of experts (= number of FL domains)
     "lora_rank"          : 64,     # expert bottleneck rank (64 for compnet, 16 for dinov2)
     "moe_top_k"          : 2,      # top-k active experts per sample
