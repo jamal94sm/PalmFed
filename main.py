@@ -161,15 +161,8 @@ class FLClient:
         grayscale  = not is_dino
 
         if model_name in ("compnet", "dinov2"):
-            # when use_moe=True, expand M to cover all other domains BUT only
-            # after moe_fft_start_round — before that use standard M to allow
-            # the base FC and experts to warm up on simpler augmentation first
-            use_moe          = self.cfg.get("use_moe", False)
-            moe_fft_start    = self.cfg.get("moe_fft_start_round", 10)
-            moe_fft_active   = use_moe and rnd >= moe_fft_start
-            effective_M      = len(self.cfg.get("_n_clients", [0])) \
-                               if moe_fft_active else M
-            det_donors       = moe_fft_active
+            det_donors  = False
+            effective_M = M
 
             if active_style_bank and effective_M > 1:
                 dataset = FFTAugmentedDataset(
