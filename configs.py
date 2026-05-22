@@ -87,7 +87,7 @@ CONFIG = {
     "use_moe"            : True,   # True → MoE FC for compnet | LoRA MoE for dinov2
     "n_experts"          : 6,      # number of experts (= number of FL domains)
     "lora_rank"          : 64,     # expert bottleneck rank (64 for compnet, 16 for dinov2)
-    "moe_top_k"          : 2,      # top-k active experts per sample
+    "moe_top_k"          : 6,      # top-k active experts per sample
     "share_moe"          : True,   # True → FedAvg MoE | False → keep local
     "lambda_load_balance": 0.1,    # load balancing loss weight
     # CrossEntropy + ArcFace is always active for all models.
