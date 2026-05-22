@@ -104,38 +104,29 @@ class ArcMarginProduct(nn.Module):
 
 class MoEFC(nn.Module):
     """
-    Mixture-of-Experts FC layer replacing CompNet's single FC(9708→512).
+    Base FC + residual Mixture-of-Experts replacing CompNet's FC(9708→512).
 
-    Each expert is a low-rank two-layer projection: Linear(9708→rank) → ReLU
-    → Linear(rank→512). Low-rank keeps parameter count comparable to the
-    original single FC while providing K independent projection paths.
+    Architecture:
+      output = base_FC(x) + Σ_k gates_k × residual_expert_k(x)
 
-    Top-K gating: only the top-k experts receive non-zero weight each
-    forward pass, forcing specialisation. Gradients still flow to all
-    experts via the soft weights (no straight-through estimator needed
-    because the top-k mask is applied after softmax, not to logits).
+    The shared base_FC is identical to the original nn.Linear(9708→512).
+    Residual experts are low-rank adapters (9708→rank→512) initialised to
+    output zero (B matrix set to zeros). This guarantees that at round 0
+    the model behaves exactly like the original CompNet — no degradation
+    from initialisation. Experts learn domain-specific corrections on top
+    of the shared base as training progresses.
 
-    Load balancing loss (Switch Transformer):
-      lb_loss = n_experts × Σ_k (mean_gate_k)²
-    Minimised when all experts are used equally. Stored in self._lb_loss
-    and retrieved by CompNet.get_moe_lb_loss() after each forward pass.
-
-    In the FL setting:
-      Shared via FedAvg (share_moe=True, recommended):
-        Gate learns universal domain routing; experts specialise for
-        different domains through gradient signals from all clients.
-      Kept local (share_moe=False):
-        Gate and experts only see one domain — degenerates to a
-        redundant single-domain projection with no cross-domain benefit.
-      → share_moe=True is more logical and is the default.
+    Top-K gating: only top-k experts receive non-zero weight, forcing
+    specialisation. Load balancing uses full gate weights so all experts
+    receive gradient to maintain utilisation.
 
     Parameters
     ----------
-    in_features  : int  9708 for CompNet with 128×128 input
-    out_features : int  512  (embedding_dim)
-    n_experts    : int  number of experts — set to number of FL domains
-    rank         : int  low-rank bottleneck (64 keeps params ≈ original FC)
-    top_k        : int  number of active experts per sample
+    in_features  : int  9708
+    out_features : int  512
+    n_experts    : int  number of residual experts
+    rank         : int  expert bottleneck rank
+    top_k        : int  active experts per sample
     """
     def __init__(self, in_features=9708, out_features=512,
                  n_experts=6, rank=64, top_k=2):
@@ -144,25 +135,28 @@ class MoEFC(nn.Module):
         self.top_k     = min(top_k, n_experts)
         self._lb_loss  = None
 
+        # shared base — same as original FC, same initialisation
+        self.base = nn.Linear(in_features, out_features)
+
+        # gating network
         self.gate = nn.Linear(in_features, n_experts)
+
+        # residual experts — B initialised to zero → zero initial output
         self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(in_features, rank, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Linear(rank, out_features),
-            )
+            _ResidualExpert(in_features, out_features, rank)
             for _ in range(n_experts)
         ])
 
     def forward(self, x):
         """
         x   : [B, 9708]
-        out : [B, 512]   weighted combination of top-k expert outputs
-        Stores lb_loss in self._lb_loss for retrieval after forward.
+        out : [B, 512]   base + weighted residual corrections
         """
-        gates_full = torch.softmax(self.gate(x), dim=-1)   # [B, n_experts]
+        base_out   = self.base(x)                              # [B, 512]
 
-        # top-k mask: zero out all but top-k weights, renormalise
+        gates_full = torch.softmax(self.gate(x), dim=-1)      # [B, n_experts]
+
+        # top-k mask
         if self.top_k < self.n_experts:
             topk_vals, topk_idx = gates_full.topk(self.top_k, dim=-1)
             mask  = torch.zeros_like(gates_full)
@@ -171,18 +165,32 @@ class MoEFC(nn.Module):
         else:
             gates = gates_full
 
-        # expert outputs: [B, n_experts, out_features]
+        # residual expert outputs: [B, n_experts, 512]
         expert_outs = torch.stack(
             [exp(x) for exp in self.experts], dim=1)
 
-        # weighted sum: [B, out_features]
-        out = (gates.unsqueeze(-1) * expert_outs).sum(dim=1)
+        # weighted sum of residuals: [B, 512]
+        residual = (gates.unsqueeze(-1) * expert_outs).sum(dim=1)
 
-        # load balancing loss uses full (un-masked) gate weights
-        mean_gates     = gates_full.mean(dim=0)             # [n_experts]
-        self._lb_loss  = self.n_experts * (mean_gates ** 2).sum()
+        # load balancing on full (unmasked) gates
+        mean_gates    = gates_full.mean(dim=0)
+        self._lb_loss = self.n_experts * (mean_gates ** 2).sum()
 
-        return out
+        return base_out + residual
+
+
+class _ResidualExpert(nn.Module):
+    """Low-rank residual adapter: Linear(in→rank) → ReLU → Linear(rank→out).
+    B initialised to zero so initial contribution is exactly zero."""
+    def __init__(self, in_features, out_features, rank):
+        super().__init__()
+        self.A = nn.Linear(in_features, rank, bias=False)
+        self.B = nn.Linear(rank, out_features, bias=False)
+        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
+        nn.init.zeros_(self.B.weight)    # ← zero init: no contribution at start
+
+    def forward(self, x):
+        return self.B(F.relu(self.A(x)))
 
 
 class CompNet(nn.Module):
