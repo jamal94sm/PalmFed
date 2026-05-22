@@ -102,18 +102,121 @@ class ArcMarginProduct(nn.Module):
         return self.s * cosine
 
 
+class MoEFC(nn.Module):
+    """
+    Mixture-of-Experts FC layer replacing CompNet's single FC(9708→512).
+
+    Each expert is a low-rank two-layer projection: Linear(9708→rank) → ReLU
+    → Linear(rank→512). Low-rank keeps parameter count comparable to the
+    original single FC while providing K independent projection paths.
+
+    Top-K gating: only the top-k experts receive non-zero weight each
+    forward pass, forcing specialisation. Gradients still flow to all
+    experts via the soft weights (no straight-through estimator needed
+    because the top-k mask is applied after softmax, not to logits).
+
+    Load balancing loss (Switch Transformer):
+      lb_loss = n_experts × Σ_k (mean_gate_k)²
+    Minimised when all experts are used equally. Stored in self._lb_loss
+    and retrieved by CompNet.get_moe_lb_loss() after each forward pass.
+
+    In the FL setting:
+      Shared via FedAvg (share_moe=True, recommended):
+        Gate learns universal domain routing; experts specialise for
+        different domains through gradient signals from all clients.
+      Kept local (share_moe=False):
+        Gate and experts only see one domain — degenerates to a
+        redundant single-domain projection with no cross-domain benefit.
+      → share_moe=True is more logical and is the default.
+
+    Parameters
+    ----------
+    in_features  : int  9708 for CompNet with 128×128 input
+    out_features : int  512  (embedding_dim)
+    n_experts    : int  number of experts — set to number of FL domains
+    rank         : int  low-rank bottleneck (64 keeps params ≈ original FC)
+    top_k        : int  number of active experts per sample
+    """
+    def __init__(self, in_features=9708, out_features=512,
+                 n_experts=6, rank=64, top_k=2):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_k     = min(top_k, n_experts)
+        self._lb_loss  = None
+
+        self.gate = nn.Linear(in_features, n_experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_features, rank, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Linear(rank, out_features),
+            )
+            for _ in range(n_experts)
+        ])
+
+    def forward(self, x):
+        """
+        x   : [B, 9708]
+        out : [B, 512]   weighted combination of top-k expert outputs
+        Stores lb_loss in self._lb_loss for retrieval after forward.
+        """
+        gates_full = torch.softmax(self.gate(x), dim=-1)   # [B, n_experts]
+
+        # top-k mask: zero out all but top-k weights, renormalise
+        if self.top_k < self.n_experts:
+            topk_vals, topk_idx = gates_full.topk(self.top_k, dim=-1)
+            mask  = torch.zeros_like(gates_full)
+            mask.scatter_(1, topk_idx, topk_vals)
+            gates = mask / (mask.sum(dim=-1, keepdim=True) + 1e-8)
+        else:
+            gates = gates_full
+
+        # expert outputs: [B, n_experts, out_features]
+        expert_outs = torch.stack(
+            [exp(x) for exp in self.experts], dim=1)
+
+        # weighted sum: [B, out_features]
+        out = (gates.unsqueeze(-1) * expert_outs).sum(dim=1)
+
+        # load balancing loss uses full (un-masked) gate weights
+        mean_gates     = gates_full.mean(dim=0)             # [n_experts]
+        self._lb_loss  = self.n_experts * (mean_gates ** 2).sum()
+
+        return out
+
+
 class CompNet(nn.Module):
     """
     CompNet = CB1 // CB2 // CB3 + FC(9708→emb_dim) + Dropout + ArcFace.
-    FC input size 9708 is fixed for 128×128 input images.
+
+    Without MoE (use_moe=False):
+      Three parallel CompetitiveBlocks → concat [B, 9708]
+      → FC(9708→512) → Dropout → ArcFace
+
+    With MoE (use_moe=True):
+      Three parallel CompetitiveBlocks → concat [B, 9708]
+      → MoEFC(9708→512, K experts, top-k routing) → Dropout → ArcFace
+
+    The MoEFC replaces the single projection with K low-rank experts.
+    The gate reads the 9708-d multi-scale Gabor feature vector and routes
+    each sample to its top-k experts — learning domain-specific projections
+    from the concatenated texture fingerprint.
+
+    get_moe_lb_loss(): returns load balancing loss after _backbone()
+    is called. Returns zero when use_moe=False.
     """
     def __init__(self, num_classes, embedding_dim=512,
-                 arcface_s=30.0, arcface_m=0.50, dropout=0.25):
+                 arcface_s=30.0, arcface_m=0.50, dropout=0.25,
+                 use_moe=False, n_experts=6, lora_rank=64, moe_top_k=2):
         super().__init__()
         self.cb1 = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
         self.cb2 = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.fc   = nn.Linear(9708, embedding_dim)
+        self.use_moe = use_moe
+        if use_moe:
+            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank, moe_top_k)
+        else:
+            self.fc = nn.Linear(9708, embedding_dim)
         self.drop = nn.Dropout(p=dropout)
         self.arc  = ArcMarginProduct(embedding_dim, num_classes,
                                      s=arcface_s, m=arcface_m)
@@ -131,6 +234,13 @@ class CompNet(nn.Module):
     def get_embedding(self, x):
         """L2-normalised embedding for matching — no ArcFace head."""
         return F.normalize(self._backbone(x), p=2, dim=1)
+
+    def get_moe_lb_loss(self):
+        """Load balancing loss from MoEFC. Zero when use_moe=False."""
+        if not self.use_moe or not hasattr(self.fc, "_lb_loss") \
+                or self.fc._lb_loss is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.fc._lb_loss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -606,6 +716,10 @@ def build_model(cfg, num_classes):
             arcface_s     = cfg["arcface_s"],
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
+            use_moe       = cfg.get("use_moe",    False),
+            n_experts     = cfg.get("n_experts",  6),
+            lora_rank     = cfg.get("lora_rank",  64),
+            moe_top_k     = cfg.get("moe_top_k",  2),
         )
     elif name == "ccnet":
         return CCNet(
