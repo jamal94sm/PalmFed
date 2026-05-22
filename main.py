@@ -335,11 +335,13 @@ class FLServer:
         global_state.update(avg_dict)
         self.global_model.load_state_dict(global_state)
 
-    def evaluate(self):
-        """Evaluate global model on the shared gallery and probe sets."""
+    def evaluate(self, gal_domain_ids=None, prb_domain_ids=None):
+        """Evaluate global model. Pass pre-computed domain IDs for MoE routing."""
         return evaluate_model(
             self.global_model,
-            self.gallery_loader, self.probe_loader, self.device)
+            self.gallery_loader, self.probe_loader, self.device,
+            gal_domain_ids=gal_domain_ids,
+            prb_domain_ids=prb_domain_ids)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -556,16 +558,44 @@ def main():
         print("  Spatial augmentation only — style bank extracted "
               "but not used during training.\n")
 
+    # ── Pre-compute FFT domain descriptors (MoE inference only) ──────────
+    # FFT amplitude is pixel-level and model-independent — extracted once,
+    # reused for all rounds. gallery domain_ids come from splits (known);
+    # probe domain_ids are predicted via nearest-neighbour FFT matching.
+    moe_gal_domain_ids = None
+    moe_prb_domain_ids = None
+    if cfg.get("use_moe", False) and model_key == "compnet":
+        gal_domain_ids_known = server.gallery_loader.dataset.get_domain_ids()
+        if gal_domain_ids_known is not None:
+            moe_gal_domain_ids = gal_domain_ids_known
+            prb_domain_ids_gt  = server.probe_loader.dataset.get_domain_ids()
+            moe_prb_domain_ids = predict_probe_domain_ids(
+                server.probe_loader.dataset.get_paths(),
+                server.gallery_loader.dataset.get_paths(),
+                moe_gal_domain_ids,
+                cfg["img_side"],
+                cfg["fft_beta"],
+                probe_domain_ids_gt=prb_domain_ids_gt,
+            )
+            print(f"  MoE domain IDs cached — "
+                  f"gallery: {len(moe_gal_domain_ids)}  "
+                  f"probe: {len(moe_prb_domain_ids)}\n")
+        else:
+            print("  [MoE] splits.pkl predates domain_id — "
+                  "delete splits.pkl and rerun to enable expert routing.\n")
+
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
-    g_eer_0, g_rank1_0 = server.evaluate()
+    g_eer_0, g_rank1_0 = server.evaluate(
+        gal_domain_ids=moe_gal_domain_ids,
+        prb_domain_ids=moe_prb_domain_ids)
     print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
     with open(results_path, "a") as f:
         f.write(f"0\tInit\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
                 + "\t".join("-1\t-1" for _ in range(n_clients)) + "\n")
 
     g_eer, g_rank1 = g_eer_0, g_rank1_0
-    recent_history = []   # [(g_eer, g_rank1), ...] — last avg_rounds entries
+    recent_history = []
 
     # ── FL rounds ─────────────────────────────────────────────────────────
     for rnd in range(1, cfg["n_rounds"] + 1):
@@ -590,7 +620,9 @@ def main():
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
-                device)
+                device,
+                gal_domain_ids = moe_gal_domain_ids,
+                prb_domain_ids = moe_prb_domain_ids)
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -603,7 +635,9 @@ def main():
 
         # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
-        g_eer, g_rank1 = server.evaluate()
+        g_eer, g_rank1 = server.evaluate(
+            gal_domain_ids=moe_gal_domain_ids,
+            prb_domain_ids=moe_prb_domain_ids)
         elapsed = time.time() - t_start
 
         # keep a rolling window for final average reporting
