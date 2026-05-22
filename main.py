@@ -25,6 +25,7 @@ from datasets import (PalmDataset, AugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
+                      predict_probe_domain_ids,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
@@ -182,7 +183,8 @@ class FLClient:
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
-                                           grayscale=grayscale)
+                                           grayscale=grayscale,
+                                           client_id=self.client_id)
 
         elif model_name == "ccnet":
             # For CCNet, active_style_bank controls FFT on paired views too.
