@@ -134,10 +134,13 @@ class FLClient:
         self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """Return backbone weights only — ArcFace head excluded."""
+        """Return backbone weights for FedAvg — ArcFace head excluded.
+        MoE weights (fc.gate.*, fc.experts.*) excluded when share_moe=False."""
+        share_moe = self.cfg.get("share_moe", True)
         return {k: v.cpu().clone()
                 for k, v in self.model.state_dict().items()
-                if not k.startswith("arc.")}
+                if not k.startswith("arc.")
+                and (share_moe or not k.startswith("fc."))}
 
     # ── local training ──────────────────────────────────────────────────────
 
@@ -160,10 +163,10 @@ class FLClient:
         if model_name in ("compnet", "dinov2"):
             # when use_moe=True, M is overridden to cover all other clients:
             # aug_idx 0 = original, aug_idx 1..N-1 = one per other domain
-            use_moe    = self.cfg.get("use_moe", False) and model_name == "dinov2"
+            use_moe     = self.cfg.get("use_moe", False)
             effective_M = len(self.cfg.get("_n_clients", [0])) \
                           if use_moe else M
-            det_donors  = use_moe    # deterministic per-domain coverage
+            det_donors  = use_moe   # deterministic per-domain coverage
 
             if active_style_bank and effective_M > 1:
                 dataset = FFTAugmentedDataset(
