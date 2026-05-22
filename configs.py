@@ -74,7 +74,7 @@ CONFIG = {
     #   copy per other domain (deterministic, not random), ensuring
     #   systematic cross-domain coverage in every epoch.
     #   Set use_fft_aug=True or use_mixed_aug=True to activate this.
-    "use_moe"            : True,  # True → LoRA MoE in blocks 10-11 (dinov2)
+    "use_moe"            : False,  # True → LoRA MoE in blocks 10-11 (dinov2)
     "n_experts"          : 6,      # number of LoRA experts (= number of domains)
     "lora_rank"          : 16,     # LoRA rank — higher = more capacity
     "lambda_load_balance": 0.1,    # load balancing loss weight
