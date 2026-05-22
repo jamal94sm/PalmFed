@@ -567,6 +567,7 @@ def main():
                 + "\t".join("-1\t-1" for _ in range(n_clients)) + "\n")
 
     g_eer, g_rank1 = g_eer_0, g_rank1_0
+    recent_history = []   # [(g_eer, g_rank1), ...] — last avg_rounds entries
 
     # ── FL rounds ─────────────────────────────────────────────────────────
     for rnd in range(1, cfg["n_rounds"] + 1):
@@ -607,6 +608,12 @@ def main():
         g_eer, g_rank1 = server.evaluate()
         elapsed = time.time() - t_start
 
+        # keep a rolling window for final average reporting
+        avg_rounds = cfg.get("avg_last_rounds", 5)
+        recent_history.append((g_eer, g_rank1))
+        if len(recent_history) > avg_rounds:
+            recent_history.pop(0)
+
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} [{mode_label}] | "
               f"Global EER={g_eer*100:.4f}%  Rank-1={g_rank1:.2f}%  "
@@ -624,15 +631,27 @@ def main():
                     f"\t{client_cols}\n")
 
     # ── Final reporting ───────────────────────────────────────────────────
+    avg_rounds   = cfg.get("avg_last_rounds", 5)
+    n_avg        = len(recent_history)          # may be < avg_rounds if few rounds ran
+    avg_eer      = sum(e for e, _ in recent_history) / n_avg
+    avg_rank1    = sum(r for _, r in recent_history) / n_avg
+
     print(f"\n{'='*62}")
     print(f"  FL COMPLETE — {cfg['n_rounds']} rounds")
     print(f"  Dataset            : {cfg['dataset'].upper()}")
     print(f"  Model              : {cfg['model'].upper()}")
     print(f"  Aug mode           : {aug_mode.upper()}")
-    print(f"  Final Global EER   : {g_eer*100:.4f}%")
-    print(f"  Final Global Rank-1: {g_rank1:.2f}%")
+    print(f"  Avg Global EER     : {avg_eer*100:.4f}%  "
+          f"(last {n_avg} rounds)")
+    print(f"  Avg Global Rank-1  : {avg_rank1:.2f}%  "
+          f"(last {n_avg} rounds)")
     print(f"  Results saved to   : {results_path}")
     print(f"{'='*62}")
+
+    # append average summary line to results file
+    with open(results_path, "a") as f:
+        f.write(f"\n# Average of last {n_avg} rounds\n")
+        f.write(f"avg_{n_avg}\t—\t{avg_eer*100:.4f}\t{avg_rank1:.2f}\n")
 
 
 if __name__ == "__main__":
