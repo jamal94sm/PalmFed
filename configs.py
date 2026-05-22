@@ -90,8 +90,6 @@ CONFIG = {
     "moe_top_k"          : 2,      # top-k active experts per sample
     "share_moe"          : True,   # True → FedAvg MoE | False → keep local
     "lambda_load_balance": 0.1,    # load balancing loss weight
-    "moe_fft_start_round": 10,     # round to expand M to n_clients for MoE
-                                   # (warmup period: standard M before this)
     # CrossEntropy + ArcFace is always active for all models.
 
     
