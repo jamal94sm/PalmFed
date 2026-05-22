@@ -269,68 +269,100 @@ def extract_fft_descriptor(path, img_side=128, beta=0.15):
 
 
 def predict_probe_domain_ids(probe_paths, gallery_paths, gallery_domain_ids,
-                              img_side=128, beta=0.15,
+                              img_side=128, beta=1.0,
                               probe_domain_ids_gt=None):
     """
     Predict domain label for each probe sample by nearest-neighbour search
-    in low-frequency FFT amplitude space against the gallery.
+    against per-domain mean FFT amplitude templates computed from the gallery.
 
-    Each probe inherits the domain label of its nearest gallery sample.
-    Gallery domain labels are known from splits; probe labels are inferred.
+    Gallery processing:
+      For each domain, average the full FFT amplitude spectra of all gallery
+      samples belonging to that domain → one mean template per domain.
+      This suppresses identity-specific texture and retains the domain's
+      characteristic spectral signature.
+
+    Probe matching:
+      For each probe, compute its full FFT amplitude and find the nearest
+      domain mean template (L2 distance). The probe inherits that domain label.
+
+    beta=1.0 uses the full amplitude spectrum (no Gaussian mask) — the
+    complete spectral signature rather than just the low-frequency region.
 
     Parameters
     ----------
-    probe_paths          : list[str]   probe image paths
-    gallery_paths        : list[str]   gallery image paths
-    gallery_domain_ids   : list[int]   known domain index per gallery sample
+    probe_paths          : list[str]
+    gallery_paths        : list[str]
+    gallery_domain_ids   : list[int]   known domain per gallery sample
     img_side             : int
-    beta                 : float       Gaussian mask sigma (same as fft_beta)
-    probe_domain_ids_gt  : list[int] | None
-                           Ground-truth domain labels for probe (if available)
-                           — used to report prediction accuracy.
+    beta                 : float       1.0 = full spectrum (no mask)
+    probe_domain_ids_gt  : list[int] | None  for accuracy reporting
 
     Returns
     -------
     pred_domain_ids : np.ndarray [N_probe] int
     """
-    print("  [MoE] Extracting FFT descriptors for domain prediction …")
-    gal_descs = np.stack(
-        [extract_fft_descriptor(p, img_side, beta) for p in gallery_paths])
-    prb_descs = np.stack(
-        [extract_fft_descriptor(p, img_side, beta) for p in probe_paths])
+    print("  [MoE] Computing domain templates from gallery …")
+    gal_ids  = np.array(gallery_domain_ids, dtype=np.int64)
+    domains  = sorted(np.unique(gal_ids).tolist())
 
-    gal_ids = np.array(gallery_domain_ids, dtype=np.int64)
-    chunk   = 512
-    N_prb   = len(prb_descs)
-    pred    = np.empty(N_prb, dtype=np.int64)
+    # extract full FFT amplitude for all gallery samples
+    if beta >= 1.0:
+        # full spectrum — no mask
+        def _desc(path):
+            img = Image.open(path).convert("L").resize(
+                (img_side, img_side), Image.BILINEAR)
+            img_np = np.array(img, dtype=np.float32) / 255.0
+            amp    = np.abs(np.fft.fft2(img_np))
+            return np.fft.fftshift(amp).flatten().astype(np.float32)
+    else:
+        def _desc(path):
+            return extract_fft_descriptor(path, img_side, beta)
 
+    gal_descs = np.stack([_desc(p) for p in gallery_paths])   # [G, D²]
+
+    # one mean template per domain  [n_domains, D²]
+    domain_templates = np.stack([
+        gal_descs[gal_ids == d].mean(axis=0) for d in domains
+    ])                                                          # [n_domains, D²]
+    domain_labels = np.array(domains, dtype=np.int64)
+
+    print(f"  [MoE] {len(domains)} domain templates built  "
+          f"(each averaged over "
+          + ", ".join(str((gal_ids == d).sum()) for d in domains)
+          + " gallery samples)")
+
+    # probe descriptors and nearest-template matching
+    print("  [MoE] Matching probe samples to domain templates …")
+    prb_descs = np.stack([_desc(p) for p in probe_paths])      # [P, D²]
+
+    chunk = 512
+    N_prb = len(prb_descs)
+    pred  = np.empty(N_prb, dtype=np.int64)
     for start in range(0, N_prb, chunk):
-        end   = min(start + chunk, N_prb)
-        diff  = prb_descs[start:end, None, :] - gal_descs[None, :, :]  # [C,G,D]
-        dists = (diff ** 2).sum(axis=-1)                                 # [C,G]
-        pred[start:end] = gal_ids[dists.argmin(axis=-1)]
+        end  = min(start + chunk, N_prb)
+        diff = prb_descs[start:end, None, :] - \
+               domain_templates[None, :, :]                    # [C, n_d, D²]
+        dists = (diff ** 2).sum(axis=-1)                       # [C, n_d]
+        pred[start:end] = domain_labels[dists.argmin(axis=-1)]
 
-    n_domains = len(np.unique(gal_ids))
     unique, counts = np.unique(pred, return_counts=True)
     dist_str = ", ".join(f"d{d}:{c}" for d, c in zip(unique, counts))
-    print(f"  [MoE] Predicted probe domain distribution: {dist_str}")
+    print(f"  [MoE] Predicted probe distribution: {dist_str}")
 
-    # accuracy report — available when probe ground-truth domain labels are known
+    # accuracy report
     if probe_domain_ids_gt is not None:
-        gt   = np.array(probe_domain_ids_gt, dtype=np.int64)
-        acc  = 100.0 * (pred == gt).sum() / len(pred)
+        gt  = np.array(probe_domain_ids_gt, dtype=np.int64)
+        acc = 100.0 * (pred == gt).sum() / len(pred)
         print(f"  [MoE] Domain prediction accuracy : {acc:.2f}%  "
               f"({(pred == gt).sum()}/{len(pred)} correct, "
-              f"{n_domains} domains)")
-        # per-domain breakdown
+              f"{len(domains)} domains)")
         for d in sorted(np.unique(gt)):
-            mask     = gt == d
-            d_acc    = 100.0 * (pred[mask] == gt[mask]).sum() / mask.sum()
+            mask  = gt == d
+            d_acc = 100.0 * (pred[mask] == gt[mask]).sum() / mask.sum()
             print(f"          Domain {d}: {d_acc:.1f}%  "
                   f"({(pred[mask] == gt[mask]).sum()}/{mask.sum()})")
     else:
-        print("  [MoE] Domain prediction accuracy: N/A "
-              "(probe ground-truth not available in splits)")
+        print("  [MoE] Accuracy: N/A (no GT domain labels in splits)")
 
     return pred
 
