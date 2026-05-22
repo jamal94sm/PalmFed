@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
@@ -250,32 +251,134 @@ def evaluate_model(model, gallery_loader, probe_loader, device,
 
 
 # ══════════════════════════════════════════════════════════════
+#  DOMAIN LABEL PREDICTION FOR PROBE SAMPLES (MoE inference)
+# ══════════════════════════════════════════════════════════════
+
+def extract_fft_descriptor(path, img_side=128, beta=0.15):
+    """
+    Extract the low-frequency FFT amplitude of one image as a flat vector.
+    Uses the same Gaussian mask as apply_style_template so the descriptor
+    captures exactly the frequency region that FFT swapping operates on.
+    """
+    img    = Image.open(path).convert("L").resize(
+        (img_side, img_side), Image.BILINEAR)
+    img_np = np.array(img, dtype=np.float32) / 255.0
+    amp    = np.fft.fftshift(np.abs(np.fft.fft2(img_np)))
+    mask   = gaussian_mask(img_side, img_side, beta)
+    return (amp * mask).flatten().astype(np.float32)
+
+
+def predict_probe_domain_ids(probe_paths, gallery_paths, gallery_domain_ids,
+                              img_side=128, beta=0.15):
+    """
+    Predict domain label for each probe sample by nearest-neighbour search
+    in low-frequency FFT amplitude space against the gallery.
+
+    Each probe inherits the domain label of its nearest gallery sample.
+    Gallery domain labels are known from splits; probe labels are inferred.
+
+    Parameters
+    ----------
+    probe_paths        : list[str]   probe image paths
+    gallery_paths      : list[str]   gallery image paths
+    gallery_domain_ids : list[int]   known domain index per gallery sample
+    img_side           : int
+    beta               : float       Gaussian mask sigma (same as fft_beta)
+
+    Returns
+    -------
+    pred_domain_ids : np.ndarray [N_probe] int
+    """
+    print("  [MoE] Extracting FFT descriptors for domain prediction …")
+    gal_descs = np.stack(
+        [extract_fft_descriptor(p, img_side, beta) for p in gallery_paths])
+    prb_descs = np.stack(
+        [extract_fft_descriptor(p, img_side, beta) for p in probe_paths])
+
+    gal_ids = np.array(gallery_domain_ids, dtype=np.int64)
+    chunk   = 512
+    N_prb   = len(prb_descs)
+    pred    = np.empty(N_prb, dtype=np.int64)
+
+    for start in range(0, N_prb, chunk):
+        end   = min(start + chunk, N_prb)
+        diff  = prb_descs[start:end, None, :] - gal_descs[None, :, :]  # [C,G,D]
+        dists = (diff ** 2).sum(axis=-1)                                 # [C,G]
+        pred[start:end] = gal_ids[dists.argmin(axis=-1)]
+
+    unique, counts = np.unique(pred, return_counts=True)
+    print("  [MoE] Probe domain distribution: "
+          + ", ".join(f"d{d}:{c}" for d, c in zip(unique, counts)))
+    return pred
+
+
+# ══════════════════════════════════════════════════════════════
 #  EVALUATION
 # ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract_features(model, loader, device):
+def extract_features(model, loader, device, domain_ids=None):
     """
-    Extract L2-normalised embeddings using model.get_embedding().
-    Compatible with CompNet, CCNet, and DINOv2 (all expose get_embedding).
-    For DINOv2 with MoE enabled, get_embedding returns the MoE-refined
-    embedding automatically.
+    Extract L2-normalised embeddings using model.get_embedding() or
+    model._backbone() with domain_ids for CompNet MoE inference.
+
+    When domain_ids is provided (list or array of ints, one per sample),
+    embeddings are extracted via model._backbone(img, domain_id_tensor)
+    so the correct expert residual is applied for each sample.
+    When domain_ids is None, model.get_embedding() is used (base FC only
+    for CompNet MoE; standard embedding for all other models).
+
     NaN guard: any NaN row replaced with zero vector.
+
+    Parameters
+    ----------
+    model      : backbone with get_embedding() and optionally _backbone()
+    loader     : DataLoader — returns (img, label) pairs
+    device     : torch.device
+    domain_ids : list[int] | np.ndarray | None  — one per sample in order
 
     Returns
     -------
-    feats  : np.ndarray  [N, D]
-    labels : np.ndarray  [N]
+    feats  : np.ndarray [N, D]
+    labels : np.ndarray [N]
     """
     model.eval()
+    use_domain = (domain_ids is not None
+                  and hasattr(model, "_backbone")
+                  and hasattr(model, "use_moe")
+                  and model.use_moe)
+
+    domain_ids_np = np.array(domain_ids, dtype=np.int64) \
+                    if use_domain else None
+
     feats, labels = [], []
+    sample_idx    = 0
+
     for imgs, labs in loader:
-        batch_np = model.get_embedding(imgs.to(device)).cpu().numpy()
+        B   = imgs.size(0)
+        imgs = imgs.to(device)
+
+        if use_domain:
+            d_ids = torch.tensor(
+                domain_ids_np[sample_idx:sample_idx + B],
+                dtype=torch.long, device=device)
+            try:
+                batch_t = model._backbone(imgs, d_ids)
+            except TypeError:
+                batch_t = model._backbone(imgs)
+            batch_t = F.normalize(batch_t, p=2, dim=1)
+        else:
+            batch_t = model.get_embedding(imgs)
+
+        batch_np = batch_t.cpu().numpy()
         nan_rows = np.isnan(batch_np).any(axis=1)
         if nan_rows.any():
             batch_np[nan_rows] = 0.0
+
         feats.append(batch_np)
         labels.append(labs.numpy())
+        sample_idx += B
+
     return np.concatenate(feats), np.concatenate(labels)
 
 
@@ -300,20 +403,48 @@ def compute_eer(scores_array):
 
 
 def evaluate_model(model, gallery_loader, probe_loader, device,
-                   # kept for backward compat — unused
                    feature_mean_bank=None, global_mean=None,
                    all_protos=None, proto_beta=0.3):
     """
     Cosine-similarity evaluation on gallery and probe sets.
-    Uses model.get_embedding() — MoE-refined for DINOv2 when enabled.
+
+    For CompNet with use_moe=True:
+      Gallery domain_ids are known from splits (stored in PalmDataset).
+      Probe domain_ids are predicted via nearest-neighbour FFT descriptor
+      matching against the gallery — each probe inherits the domain label
+      of its nearest gallery sample.
+      Both gallery and probe features are extracted with domain-conditioned
+      expert residuals (base_FC + expert[domain_id]).
+
+    For all other models: standard embedding extraction, no domain routing.
 
     Returns
     -------
     eer   : float  EER in [0, 1]
     rank1 : float  Rank-1 accuracy in [0, 100]
     """
-    gal_feats, gal_labels = extract_features(model, gallery_loader, device)
-    prb_feats, prb_labels = extract_features(model, probe_loader,   device)
+    use_moe_infer = (hasattr(model, "use_moe") and model.use_moe
+                     and hasattr(gallery_loader.dataset, "get_domain_ids"))
+
+    if use_moe_infer:
+        gal_domain_ids = gallery_loader.dataset.get_domain_ids()   # known
+        gal_paths      = gallery_loader.dataset.get_paths()
+        prb_paths      = probe_loader.dataset.get_paths()
+
+        # predict probe domain labels via FFT descriptor NN search
+        # use img_side from the dataset's transform (resize target)
+        img_side = 128   # CompNet default; EvalDatasetDINO uses 224
+        beta     = 0.15  # default fft_beta — can be passed if needed
+        prb_domain_ids = predict_probe_domain_ids(
+            prb_paths, gal_paths, gal_domain_ids, img_side, beta)
+    else:
+        gal_domain_ids = None
+        prb_domain_ids = None
+
+    gal_feats, gal_labels = extract_features(
+        model, gallery_loader, device, domain_ids=gal_domain_ids)
+    prb_feats, prb_labels = extract_features(
+        model, probe_loader,   device, domain_ids=prb_domain_ids)
 
     sim_matrix = np.nan_to_num(prb_feats @ gal_feats.T, nan=0.0)
 
@@ -459,7 +590,15 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
 
     running_loss = 0.0; correct = 0; total = 0
 
-    for data, labels in loader:
+    for batch in loader:
+        # datasets return (data, label) or (data, label, domain_id)
+        if len(batch) == 3:
+            data, labels, domain_ids = batch
+            domain_ids = domain_ids.to(device)
+        else:
+            data, labels = batch
+            domain_ids   = None
+
         labels = labels.to(device)
 
         if isinstance(data, (list, tuple)):
@@ -475,21 +614,32 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         if use_center:
             center_optimizer.zero_grad()
 
-        # backbone forward — if use_moe=True, LoRA MoE runs inside blocks 10-11
-        # and populates _lb_loss in each LoRAMoEMLP
-        emb_orig = _get_emb(orig)
-        logits   = _get_logits(emb_orig, labels)
-        loss     = criterion(logits, labels)
+        # backbone forward — pass domain_ids for CompNet MoE expert selection
+        if hasattr(model, "_backbone"):
+            try:
+                emb_orig = model._backbone(orig, domain_ids)   # CompNet MoE
+            except TypeError:
+                emb_orig = model._backbone(orig)               # non-MoE
+        else:
+            emb_orig = model.backbone(orig)                    # DINOv2
+
+        logits = _get_logits(emb_orig, labels)
+        loss   = criterion(logits, labels)
 
         if use_style and has_aug:
-            emb_aug = _get_emb(aug)
-            sim     = F.cosine_similarity(
+            if hasattr(model, "_backbone"):
+                try:
+                    emb_aug = model._backbone(aug, domain_ids)
+                except TypeError:
+                    emb_aug = model._backbone(aug)
+            else:
+                emb_aug = model.backbone(aug)
+            sim  = F.cosine_similarity(
                 F.normalize(emb_orig, p=2, dim=1),
                 F.normalize(emb_aug,  p=2, dim=1), dim=1)
             loss = loss + lambda_style * (1.0 - sim.mean())
 
         if use_moe_lb:
-            # collect lb_loss from LoRAMoEMLP._lb_loss of blocks 10 and 11
             lb_loss = model.get_moe_lb_loss()
             loss    = loss + lambda_load_balance * lb_loss
 
