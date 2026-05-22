@@ -269,7 +269,8 @@ def extract_fft_descriptor(path, img_side=128, beta=0.15):
 
 
 def predict_probe_domain_ids(probe_paths, gallery_paths, gallery_domain_ids,
-                              img_side=128, beta=0.15):
+                              img_side=128, beta=0.15,
+                              probe_domain_ids_gt=None):
     """
     Predict domain label for each probe sample by nearest-neighbour search
     in low-frequency FFT amplitude space against the gallery.
@@ -279,11 +280,14 @@ def predict_probe_domain_ids(probe_paths, gallery_paths, gallery_domain_ids,
 
     Parameters
     ----------
-    probe_paths        : list[str]   probe image paths
-    gallery_paths      : list[str]   gallery image paths
-    gallery_domain_ids : list[int]   known domain index per gallery sample
-    img_side           : int
-    beta               : float       Gaussian mask sigma (same as fft_beta)
+    probe_paths          : list[str]   probe image paths
+    gallery_paths        : list[str]   gallery image paths
+    gallery_domain_ids   : list[int]   known domain index per gallery sample
+    img_side             : int
+    beta                 : float       Gaussian mask sigma (same as fft_beta)
+    probe_domain_ids_gt  : list[int] | None
+                           Ground-truth domain labels for probe (if available)
+                           — used to report prediction accuracy.
 
     Returns
     -------
@@ -306,9 +310,28 @@ def predict_probe_domain_ids(probe_paths, gallery_paths, gallery_domain_ids,
         dists = (diff ** 2).sum(axis=-1)                                 # [C,G]
         pred[start:end] = gal_ids[dists.argmin(axis=-1)]
 
+    n_domains = len(np.unique(gal_ids))
     unique, counts = np.unique(pred, return_counts=True)
-    print("  [MoE] Probe domain distribution: "
-          + ", ".join(f"d{d}:{c}" for d, c in zip(unique, counts)))
+    dist_str = ", ".join(f"d{d}:{c}" for d, c in zip(unique, counts))
+    print(f"  [MoE] Predicted probe domain distribution: {dist_str}")
+
+    # accuracy report — available when probe ground-truth domain labels are known
+    if probe_domain_ids_gt is not None:
+        gt   = np.array(probe_domain_ids_gt, dtype=np.int64)
+        acc  = 100.0 * (pred == gt).sum() / len(pred)
+        print(f"  [MoE] Domain prediction accuracy : {acc:.2f}%  "
+              f"({(pred == gt).sum()}/{len(pred)} correct, "
+              f"{n_domains} domains)")
+        # per-domain breakdown
+        for d in sorted(np.unique(gt)):
+            mask     = gt == d
+            d_acc    = 100.0 * (pred[mask] == gt[mask]).sum() / mask.sum()
+            print(f"          Domain {d}: {d_acc:.1f}%  "
+                  f"({(pred[mask] == gt[mask]).sum()}/{mask.sum()})")
+    else:
+        print("  [MoE] Domain prediction accuracy: N/A "
+              "(probe ground-truth not available in splits)")
+
     return pred
 
 
@@ -403,20 +426,17 @@ def compute_eer(scores_array):
 
 
 def evaluate_model(model, gallery_loader, probe_loader, device,
+                   gal_domain_ids=None, prb_domain_ids=None,
                    feature_mean_bank=None, global_mean=None,
                    all_protos=None, proto_beta=0.3):
     """
     Cosine-similarity evaluation on gallery and probe sets.
 
-    For CompNet with use_moe=True:
-      Gallery domain_ids are known from splits (stored in PalmDataset).
-      Probe domain_ids are predicted via nearest-neighbour FFT descriptor
-      matching against the gallery — each probe inherits the domain label
-      of its nearest gallery sample.
-      Both gallery and probe features are extracted with domain-conditioned
-      expert residuals (base_FC + expert[domain_id]).
-
-    For all other models: standard embedding extraction, no domain routing.
+    For CompNet with use_moe=True, pass pre-computed gal_domain_ids and
+    prb_domain_ids (computed once before the training loop in main.py):
+      gallery: base_FC + expert[gal_domain_id]
+      probe:   base_FC + expert[prb_domain_id]  (predicted via FFT NN)
+    When None: standard base FC only.
 
     Returns
     -------
@@ -424,37 +444,15 @@ def evaluate_model(model, gallery_loader, probe_loader, device,
     rank1 : float  Rank-1 accuracy in [0, 100]
     """
     use_moe_infer = (hasattr(model, "use_moe") and model.use_moe
-                     and hasattr(gallery_loader.dataset, "get_domain_ids"))
-
-    if use_moe_infer:
-        gal_domain_ids = gallery_loader.dataset.get_domain_ids()
-        # gal_domain_ids is None when splits were saved before 3-tuple format
-        # → domain_ids unavailable, fall back to base FC only
-        if gal_domain_ids is None:
-            print("  [MoE] WARNING: splits missing domain_ids — "
-                  "delete splits.pkl and rerun to enable expert routing. "
-                  "Falling back to base FC only.")
-            use_moe_infer = False
-
-    if use_moe_infer:
-        gal_domain_ids = gallery_loader.dataset.get_domain_ids()   # known
-        gal_paths      = gallery_loader.dataset.get_paths()
-        prb_paths      = probe_loader.dataset.get_paths()
-
-        # predict probe domain labels via FFT descriptor NN search
-        # use img_side from the dataset's transform (resize target)
-        img_side = 128   # CompNet default; EvalDatasetDINO uses 224
-        beta     = 0.15  # default fft_beta — can be passed if needed
-        prb_domain_ids = predict_probe_domain_ids(
-            prb_paths, gal_paths, gal_domain_ids, img_side, beta)
-    else:
-        gal_domain_ids = None
-        prb_domain_ids = None
+                     and gal_domain_ids is not None
+                     and prb_domain_ids is not None)
 
     gal_feats, gal_labels = extract_features(
-        model, gallery_loader, device, domain_ids=gal_domain_ids)
+        model, gallery_loader, device,
+        domain_ids=gal_domain_ids if use_moe_infer else None)
     prb_feats, prb_labels = extract_features(
-        model, probe_loader,   device, domain_ids=prb_domain_ids)
+        model, probe_loader, device,
+        domain_ids=prb_domain_ids if use_moe_infer else None)
 
     sim_matrix = np.nan_to_num(prb_feats @ gal_feats.T, nan=0.0)
 
