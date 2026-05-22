@@ -427,6 +427,16 @@ def evaluate_model(model, gallery_loader, probe_loader, device,
                      and hasattr(gallery_loader.dataset, "get_domain_ids"))
 
     if use_moe_infer:
+        gal_domain_ids = gallery_loader.dataset.get_domain_ids()
+        # gal_domain_ids is None when splits were saved before 3-tuple format
+        # → domain_ids unavailable, fall back to base FC only
+        if gal_domain_ids is None:
+            print("  [MoE] WARNING: splits missing domain_ids — "
+                  "delete splits.pkl and rerun to enable expert routing. "
+                  "Falling back to base FC only.")
+            use_moe_infer = False
+
+    if use_moe_infer:
         gal_domain_ids = gallery_loader.dataset.get_domain_ids()   # known
         gal_paths      = gallery_loader.dataset.get_paths()
         prb_paths      = probe_loader.dataset.get_paths()
