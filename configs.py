@@ -84,12 +84,11 @@ CONFIG = {
     #   False → MoE kept local per client (not shared).
     #     Gate only sees one domain → cannot learn universal routing.
     #     Degenerates to a domain-specific projection — defeats the purpose.
-    "use_moe"            : True,   # True → MoE FC for compnet | LoRA MoE for dinov2
+    "use_moe"            : False,  # True → domain-label MoE for compnet
     "n_experts"          : 6,      # number of experts (= number of FL domains)
-    "lora_rank"          : 64,     # expert bottleneck rank (64 for compnet, 16 for dinov2)
-    "moe_top_k"          : 1,      # top-k active experts per sample
+    "lora_rank"          : 64,     # LoRA rank per expert
     "share_moe"          : True,   # True → FedAvg MoE | False → keep local
-    "lambda_load_balance": 0.1,    # load balancing loss weight
+    "lambda_load_balance": 0.0,    # unused (no gate); kept for interface compat
     # CrossEntropy + ArcFace is always active for all models.
 
     
