@@ -66,7 +66,9 @@ class NormSingleROI:
 class PalmDataset(Dataset):
     """
     Plain dataset for gallery/probe evaluation — no augmentation.
-    Used by FLServer gallery/probe loaders and evaluate_model().
+    Samples can be (path, label) or (path, label, domain_id).
+    Returns (img, label) — domain_id is not returned here;
+    it is extracted separately via get_domain_ids().
     """
     def __init__(self, samples, img_side=128):
         self.samples   = samples
@@ -79,30 +81,40 @@ class PalmDataset(Dataset):
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
-        path, label = self.samples[idx]
+        path, label = self.samples[idx][0], self.samples[idx][1]
         return self.transform(Image.open(path).convert("L")), label
+
+    def get_paths(self):
+        """Return list of image paths (for FFT descriptor extraction)."""
+        return [s[0] for s in self.samples]
+
+    def get_domain_ids(self):
+        """Return domain_id list if stored, else None."""
+        if len(self.samples[0]) >= 3:
+            return [s[2] for s in self.samples]
+        return None
 
 
 class AugmentedDataset(Dataset):
     """
     Training dataset with standard spatial/photometric augmentation.
-    Returns ([orig, aug], label):
-      orig — original image, resize + normalise only (no augmentation).
-      aug  — same image with random spatial augmentation applied.
+    Returns ([orig, aug], label, domain_id):
+      orig      — original image, resize + normalise only
+      aug       — spatially augmented copy
+      domain_id — this client's domain index (same for all samples)
 
-    The pair enables style consistency loss in train_compnet_epoch:
-      loss += lambda_style * (1 - cosine_sim(emb_orig, emb_aug))
-    ArcFace classification uses orig only.
+    domain_id is used by MoEFC to activate the correct expert.
+    For non-MoE training it is ignored.
 
     Parameters
     ----------
+    client_id : int   this client's index — used as domain_id
     grayscale : bool
-        True  → grayscale + NormSingleROI  (CompNet, CCNet)
-        False → RGB + ImageNet norm        (DINOv2)
     """
-    def __init__(self, samples, img_side=128, grayscale=True):
+    def __init__(self, samples, img_side=128, grayscale=True, client_id=0):
         self.samples   = samples
         self.grayscale = grayscale
+        self.client_id = client_id
 
         aug_transforms = [
             T.Resize((img_side, img_side)),
@@ -126,8 +138,7 @@ class AugmentedDataset(Dataset):
                               T.Normalize(mean=[0.485, 0.456, 0.406],
                                           std =[0.229, 0.224, 0.225])])
 
-        self.transform_orig = T.Compose([T.Resize((img_side, img_side))] +
-                                         [norm])
+        self.transform_orig = T.Compose([T.Resize((img_side, img_side))] + [norm])
         self.transform_aug  = T.Compose(aug_transforms + [norm])
 
     def __len__(self): return len(self.samples)
@@ -136,7 +147,9 @@ class AugmentedDataset(Dataset):
         path, label = self.samples[idx]
         mode = "L" if self.grayscale else "RGB"
         img  = Image.open(path).convert(mode)
-        return [self.transform_orig(img), self.transform_aug(img)], label
+        return ([self.transform_orig(img), self.transform_aug(img)],
+                label,
+                self.client_id)   # domain_id = own client index
 
 
 class PairedDataset(Dataset):
@@ -351,12 +364,11 @@ class FFTAugmentedDataset(Dataset):
         img_np = self._load_np(path)
 
         if aug_idx == 0 or not self.other_ids:
-            return self._to_tensor(img_np), label
+            # original — domain is this client's own domain
+            return self._to_tensor(img_np), label, self.client_id
 
         # donor client selection
         if self.deterministic_donors:
-            # aug_idx 1 → donor_order[0], aug_idx 2 → donor_order[1], ...
-            # ensures systematic coverage of all other domains each epoch
             donor_idx   = (aug_idx - 1) % len(self.donor_order)
             rand_client = self.donor_order[donor_idx]
         elif self.donor_order and self.mean_bank:
@@ -372,7 +384,8 @@ class FFTAugmentedDataset(Dataset):
             rand_template = random.choice(self.style_bank[rand_client])
 
         img_syn = apply_style_template(img_np, rand_template, self.beta)
-        return self._to_tensor(img_syn), label
+        # domain_id = donor client index (the domain this sample was styled as)
+        return self._to_tensor(img_syn), label, rand_client
 
 
 # ══════════════════════════════════════════════════════════════
@@ -482,17 +495,20 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
               f"train IDs={min_ids}  samples={len(local_train)}")
 
     # fixed global test set — split within each (spectrum, identity) pair
+    # Each sample is (path, identity_label, domain_id) where domain_id is
+    # the spectrum index (0..n_spectra-1). Known for gallery; predicted for
+    # probe via FFT descriptor matching at inference.
     gallery_samples, probe_samples = [], []
-    for sp in spectra:
+    for sp_idx, sp in enumerate(spectra):
         for ident in test_ids:
             paths = list(data[sp][ident])
             rng.shuffle(paths)
             label = test_label_map[ident]
             n_gal = max(1, round(len(paths) * gallery_ratio))
             for p in paths[:n_gal]:
-                gallery_samples.append((p, label))
+                gallery_samples.append((p, label, sp_idx))
             for p in paths[n_gal:]:
-                probe_samples.append((p, label))
+                probe_samples.append((p, label, sp_idx))   # sp_idx stored but not used at eval
 
     print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
     return (client_data, gallery_samples, probe_samples,
@@ -639,16 +655,16 @@ def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42
 
     # fixed global test set — split within each (domain, identity) pair
     gallery_samples, probe_samples = [], []
-    for dom in domains:
+    for dom_idx, dom in enumerate(domains):
         for ident in test_ids:
             paths = list(data[dom][ident])
             rng.shuffle(paths)
             label = test_label_map[ident]
             n_gal = max(1, round(len(paths) * gallery_ratio))
             for p in paths[:n_gal]:
-                gallery_samples.append((p, label))
+                gallery_samples.append((p, label, dom_idx))
             for p in paths[n_gal:]:
-                probe_samples.append((p, label))
+                probe_samples.append((p, label, dom_idx))
 
     print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
     return (client_data, gallery_samples, probe_samples,
