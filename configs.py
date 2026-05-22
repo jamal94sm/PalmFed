@@ -17,7 +17,7 @@ CONFIG = {
     "dataset"          : "casiams",
 
     # ── Model selection ────────────────────────────────────────
-    "model"            : "dinov2",  # "compnet" | "ccnet" | "dinov2"
+    "model"            : "compnet",  # "compnet" | "ccnet" | "dinov2"
 
     # ── Paths ──────────────────────────────────────────────────
     # CASIA-MS
@@ -62,21 +62,33 @@ CONFIG = {
     "use_mean_template"   : True,  # True → use donor's mean template
                                      # False → random sample from donor's bank
 
-    # ── Mixture of Experts with LoRA (DINOv2 only) ────────────
-    # Replaces the MLP inside transformer blocks 10 and 11 with a
-    # LoRA MoE MLP. Each expert is a low-rank adapter (A·B) injected
-    # into the fc1 output. The gating network reads the CLS token and
-    # produces soft routing weights over all experts.
-    # Only active when model="dinov2". Ignored for compnet and ccnet.
+    # ── Mixture of Experts (CompNet and DINOv2) ───────────────
+    # CompNet:  MoEFC replaces the single FC(9708→512) bottleneck.
+    #   Each expert is a low-rank 2-layer projection (9708→rank→512).
+    #   The gate reads the 9708-d multi-scale Gabor feature vector and
+    #   routes each sample to its top-k experts via soft top-k gating.
+    #   Best position: the FC bottleneck where all three Gabor scales merge.
     #
-    # When use_moe=True, FFT augmentation is also changed:
-    #   M is auto-set to n_clients so each sample gets one synthetic
-    #   copy per other domain (deterministic, not random), ensuring
-    #   systematic cross-domain coverage in every epoch.
-    #   Set use_fft_aug=True or use_mixed_aug=True to activate this.
-    "use_moe"            : False,  # True → LoRA MoE in blocks 10-11 (dinov2)
-    "n_experts"          : 6,      # number of LoRA experts (= number of domains)
-    "lora_rank"          : 16,     # LoRA rank — higher = more capacity
+    # DINOv2:   LoRA MoE adapters inside transformer blocks 10-11.
+    #   Each expert is a low-rank LoRA adapter injected into fc1.
+    #
+    # When use_moe=True, FFT augmentation is changed for both models:
+    #   M is auto-set to n_clients so each sample gets one synthetic copy
+    #   per other domain (deterministic), ensuring systematic cross-domain
+    #   coverage in every epoch. Requires use_fft_aug or use_mixed_aug.
+    #
+    # share_moe toggle:
+    #   True  (recommended) → MoE gate + experts shared via FedAvg.
+    #     Gate learns universal domain routing from all clients.
+    #     Experts specialise per domain through cross-client gradients.
+    #   False → MoE kept local per client (not shared).
+    #     Gate only sees one domain → cannot learn universal routing.
+    #     Degenerates to a domain-specific projection — defeats the purpose.
+    "use_moe"            : False,  # True → MoE FC for compnet | LoRA MoE for dinov2
+    "n_experts"          : 6,      # number of experts (= number of FL domains)
+    "lora_rank"          : 64,     # expert bottleneck rank (64 for compnet, 16 for dinov2)
+    "moe_top_k"          : 2,      # top-k active experts per sample
+    "share_moe"          : True,   # True → FedAvg MoE | False → keep local
     "lambda_load_balance": 0.1,    # load balancing loss weight
     # CrossEntropy + ArcFace is always active for all models.
 
