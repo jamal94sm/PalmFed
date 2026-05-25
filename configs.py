@@ -79,7 +79,10 @@ CONFIG = {
     # donor domain (aug_idx≥1) — so all 6 domains appear in every client's
     # batch after FFT augmentation, giving the GRL meaningful cross-domain signal.
 
-
+    "use_whitening"    : True,  # True → ZCA whiten gallery+probe at evaluation
+    # Whitening matrix estimated from gallery, applied to both gallery and probe.
+    # Suppresses domain-induced variance in embedding space before cosine matching.
+    # Zero training cost — inference-time only.
 
     
     # CrossEntropy + ArcFace is always active for all models.
