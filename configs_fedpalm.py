@@ -83,7 +83,7 @@ CONFIG_FEDPALM = {
     "fedavg_weights"   : "uniform",   # only "uniform" supported
 
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 100,
+    "n_rounds"         : 50,
     "local_epochs"     : 1,      # E: local training epochs per round
     #   Note: FedPalm trains local and anchor models for local_epochs
     #   on each client per round before aggregation.
