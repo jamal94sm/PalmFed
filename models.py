@@ -102,37 +102,109 @@ class ArcMarginProduct(nn.Module):
         return self.s * cosine
 
 
+class _ResidualExpert(nn.Module):
+    """
+    Low-rank domain-specific residual adapter: Linear(in→rank) → ReLU → Linear(rank→out).
+    B initialised to zero → zero contribution at round 0, learned from training.
+    """
+    def __init__(self, in_features, out_features, rank):
+        super().__init__()
+        self.A = nn.Linear(in_features, rank, bias=False)
+        self.B = nn.Linear(rank, out_features, bias=False)
+        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
+        nn.init.zeros_(self.B.weight)
+
+    def forward(self, x):
+        return self.B(F.relu(self.A(x)))
+
+
+class MoEFC(nn.Module):
+    """
+    Mixture-of-Experts FC bottleneck for CompNet.
+    Replaces the single nn.Linear(9708→512) with:
+        output = base_FC(x) + expert[domain_id](x)
+
+    base_FC  — shared across all clients via FedAvg; learns domain-invariant projection.
+    expert[d] — low-rank residual (9708→rank→512); learns domain-specific correction.
+
+    Domain routing:
+      Training:  domain_ids tensor [B] selects one expert per sample (exact routing).
+      Inference: domain_ids=None → base_FC only (no residual). Base FC carries the
+                 full domain-invariant representation; residuals are training-time only.
+
+    experts[k] after FedAvg:
+      Client k contributes the strongest gradient to expert[k] (its own domain).
+      Other clients contribute via FFT-augmented copies styled as domain k.
+      Expert[k] converges toward the domain-k-specific correction, informed
+      primarily by the client that owns that domain.
+    """
+    def __init__(self, in_features=9708, out_features=512,
+                 n_experts=6, rank=64):
+        super().__init__()
+        self.n_experts = n_experts
+        self.base      = nn.Linear(in_features, out_features)
+        self.experts   = nn.ModuleList([
+            _ResidualExpert(in_features, out_features, rank)
+            for _ in range(n_experts)
+        ])
+
+    def forward(self, x, domain_ids=None):
+        base_out = self.base(x)                              # [B, 512]
+        if domain_ids is None:
+            return base_out                                  # inference: base only
+        residual = torch.zeros_like(base_out)
+        for d in range(self.n_experts):
+            mask = (domain_ids == d)
+            if mask.any():
+                residual[mask] = self.experts[d](x[mask])
+        return base_out + residual
+
+
 class CompNet(nn.Module):
     """
     CompNet = CB1 // CB2 // CB3 + FC(9708→512) + Dropout + ArcFace.
-    Three parallel Gabor competitive blocks → concat [B, 9708]
-    → FC(9708→512) → Dropout → ArcFace.
-    FC input size 9708 is fixed for 128×128 input images.
+
+    Without MoE (use_moe=False, default):
+      Three parallel Gabor competitive blocks → concat [B, 9708]
+      → nn.Linear(9708→512) → Dropout → ArcFace
+
+    With MoE (use_moe=True):
+      Three parallel Gabor competitive blocks → concat [B, 9708]
+      → MoEFC: base_FC(x) + expert[domain_id](x) → Dropout → ArcFace
+      domain_ids passed during training; at inference domain_ids=None
+      so only the base FC is used.
     """
     def __init__(self, num_classes, embedding_dim=512,
-                 arcface_s=30.0, arcface_m=0.50, dropout=0.25):
+                 arcface_s=30.0, arcface_m=0.50, dropout=0.25,
+                 use_moe=False, n_experts=6, lora_rank=64):
         super().__init__()
-        self.cb1 = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
-        self.cb2 = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
-        self.cb3 = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.fc   = nn.Linear(9708, embedding_dim)
+        self.cb1     = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
+        self.cb2     = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
+        self.cb3     = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
+        self.use_moe = use_moe
+        if use_moe:
+            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank)
+        else:
+            self.fc = nn.Linear(9708, embedding_dim)
         self.drop = nn.Dropout(p=dropout)
         self.arc  = ArcMarginProduct(embedding_dim, num_classes,
                                      s=arcface_s, m=arcface_m)
 
-    def _backbone(self, x):
-        x1 = self.cb1(x).flatten(1)
-        x2 = self.cb2(x).flatten(1)
-        x3 = self.cb3(x).flatten(1)
-        return self.fc(torch.cat([x1, x2, x3], dim=1))
+    def _backbone(self, x, domain_ids=None):
+        feat = torch.cat([self.cb1(x).flatten(1),
+                          self.cb2(x).flatten(1),
+                          self.cb3(x).flatten(1)], dim=1)   # [B, 9708]
+        if self.use_moe:
+            return self.fc(feat, domain_ids)
+        return self.fc(feat)
 
-    def forward(self, x, y=None):
-        return self.arc(self.drop(self._backbone(x)), y)
+    def forward(self, x, y=None, domain_ids=None):
+        return self.arc(self.drop(self._backbone(x, domain_ids)), y)
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 512-d embedding for cosine matching."""
-        return F.normalize(self._backbone(x), p=2, dim=1)
+        """L2-normalised 512-d embedding — base FC only (no MoE residual)."""
+        return F.normalize(self._backbone(x, domain_ids=None), p=2, dim=1)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -417,6 +489,9 @@ def build_model(cfg, num_classes):
             arcface_s     = cfg["arcface_s"],
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
+            use_moe       = cfg.get("use_moe",   False),
+            n_experts     = cfg.get("n_experts",  6),
+            lora_rank     = cfg.get("lora_rank",  64),
         )
     elif name == "ccnet":
         return CCNet(
