@@ -98,13 +98,18 @@ class PalmDataset(Dataset):
 class AugmentedDataset(Dataset):
     """
     Training dataset with standard spatial/photometric augmentation.
-    Returns ([orig, aug], label):
-      orig — original image, resize + normalise only (anchor for losses)
-      aug  — spatially augmented copy
+    Returns ([orig, aug], label, domain_id):
+      orig      — original image, resize + normalise only
+      aug       — spatially augmented copy
+      domain_id — this client's domain index (same for all samples)
 
-    Enables style consistency loss in train_compnet_epoch:
-      loss += lambda_style × (1 - cosine_sim(emb(orig), emb(aug)))
-    ArcFace uses orig only.
+    domain_id is used by MoEFC to activate the correct expert.
+    For non-MoE training it is ignored.
+
+    Parameters
+    ----------
+    client_id : int   this client's index — used as domain_id
+    grayscale : bool
     """
     def __init__(self, samples, img_side=128, grayscale=True, client_id=0):
         self.samples   = samples
@@ -139,12 +144,12 @@ class AugmentedDataset(Dataset):
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
-        path, label = self.samples[idx][0], self.samples[idx][1]
+        path, label = self.samples[idx]
         mode = "L" if self.grayscale else "RGB"
         img  = Image.open(path).convert(mode)
         return ([self.transform_orig(img), self.transform_aug(img)],
                 label,
-                self.client_id)
+                self.client_id)   # domain_id = own client index
 
 
 class PairedDataset(Dataset):
@@ -239,46 +244,46 @@ class PairedDataset(Dataset):
 
 class FFTAugmentedDataset(Dataset):
     """
-    Training dataset with FFT style augmentation.
-    Returns ([orig, aug], label) — always a pair per index.
+    Training dataset with FFT style augmentation + spatial augmentation.
+    Used for CompNet and DINOv2 when use_fft_aug=True.
 
+    Returns (img, label) — single image per index.
     Index layout with M multiplier:
       indices [i*M .. i*M+M-1] map to sample i.
-      aug_idx == 0  → ([orig, spatial_aug(orig)], label)
-      aug_idx >= 1  → ([orig, fft_aug(orig)],     label)
+      aug_idx == 0  → original + spatial augmentation
+      aug_idx >= 1  → FFT styled + spatial augmentation
 
-    orig is always the clean, unaugmented image — it anchors ArcFace,
-    CenterLoss, and the style consistency loss.
-    aug is either spatial-only (aug_idx=0) or FFT-styled (aug_idx>=1).
-
-    Style consistency loss is now directly applicable:
-      loss += λ_style × (1 - cosine_sim(emb(orig), emb(fft_aug)))
-    This explicitly enforces that embeddings are invariant to domain style
-    transfer — the feature-level complement of FFT augmentation.
+    Domain-aware donor selection (optional):
+      If mean_bank is provided (domain_aware_mixing=True), donors are
+      pre-ranked by L2 distance of mean low-frequency templates.
+      prefer_distant=True  → most different domain first
+      prefer_distant=False → most similar domain first
+      use_mean_template    → use donor's mean template vs random sample
 
     Notes
     ─────
-    • Grayscale for CompNet/CCNet; RGB for DINOv2.
-    • Domain-aware donor selection via mean_bank + prefer_distant.
+    • Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2.
+    • Foreground mask and per-channel logic live in apply_style_template.
     """
 
     def __init__(self, samples, style_bank, client_id, M, beta, img_side,
                  grayscale=True, mean_bank=None,
                  prefer_distant=True, use_mean_template=False,
                  deterministic_donors=False):
-        self.samples              = samples
-        self.style_bank           = style_bank
-        self.client_id            = client_id
-        self.M                    = M
-        self.beta                 = beta
-        self.img_side             = img_side
-        self.grayscale            = grayscale
-        self.other_ids            = [cid for cid in style_bank if cid != client_id]
-        self.mean_bank            = mean_bank
-        self.prefer_distant       = prefer_distant
-        self.use_mean_template    = use_mean_template
+        self.samples             = samples
+        self.style_bank          = style_bank
+        self.client_id           = client_id
+        self.M                   = M
+        self.beta                = beta
+        self.img_side            = img_side
+        self.grayscale           = grayscale
+        self.other_ids           = [cid for cid in style_bank if cid != client_id]
+        self.mean_bank           = mean_bank
+        self.prefer_distant      = prefer_distant
+        self.use_mean_template   = use_mean_template
         self.deterministic_donors = deterministic_donors
 
+        # pre-compute donor ranking once at construction
         self.donor_order = self._rank_donors()
 
         self.spatial_aug = T.RandomChoice([
@@ -293,89 +298,94 @@ class FFTAugmentedDataset(Dataset):
             ]),
         ])
 
+        # no T.Resize — _load_np already resizes to img_side
         if grayscale:
-            norm_base = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
+            self.norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
         else:
-            norm_base = T.Compose([
+            self.norm = T.Compose([
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406],
                             std =[0.229, 0.224, 0.225]),
             ])
 
-        # orig: resize to img_side, no spatial randomness
-        self.norm_orig = T.Compose([T.Resize((img_side, img_side)), norm_base])
-        # aug: _load_np already resizes, apply spatial aug before norm
-        self.norm_aug  = norm_base
-
     def __len__(self):
         return len(self.samples) * self.M
 
     def _load_np(self, path):
+        """Load and resize. Returns float32 in [0, 1].
+        Grayscale (H, W) for CompNet/CCNet; RGB (H, W, 3) for DINOv2."""
         mode = "L" if self.grayscale else "RGB"
         img  = Image.open(path).convert(mode).resize(
             (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
-    def _to_orig_tensor(self, path):
-        """Clean original — resize + normalise only, no spatial aug."""
-        mode = "L" if self.grayscale else "RGB"
-        return self.norm_orig(Image.open(path).convert(mode))
-
-    def _to_aug_tensor(self, img_np):
+    def _to_tensor(self, img_np):
         """numpy → PIL → spatial aug → normalised tensor."""
         mode = "L" if self.grayscale else "RGB"
         pil  = Image.fromarray((img_np * 255).astype(np.uint8), mode=mode)
-        return self.norm_aug(self.spatial_aug(pil))
+        return self.norm(self.spatial_aug(pil))
 
     def _rank_donors(self):
+        """
+        Rank other clients by L2 distance of mean low-freq template patch.
+        Uses inner 25% patch of fftshifted amplitude — the region the
+        Gaussian mask targets. Falls back to unordered list when
+        mean_bank is unavailable (domain_aware_mixing=False).
+        """
         if not self.mean_bank or self.client_id not in self.mean_bank:
             return list(self.other_ids)
+
         own_mean = self.mean_bank[self.client_id]
         H, W     = own_mean.shape[:2]
         ch, cw   = H // 2, W // 2
         ph, pw   = H // 8, W // 8
+
         def _lf_patch(arr):
             return arr[ch-ph:ch+ph, cw-pw:cw+pw].flatten()
+
         own_lf    = _lf_patch(own_mean)
-        distances = {cid: float(np.linalg.norm(
-                         own_lf - _lf_patch(self.mean_bank[cid])))
-                     for cid in self.other_ids if cid in self.mean_bank}
+        distances = {}
+        for cid in self.other_ids:
+            if cid in self.mean_bank:
+                distances[cid] = float(
+                    np.linalg.norm(own_lf - _lf_patch(self.mean_bank[cid])))
+            else:
+                distances[cid] = 0.0
+
         return sorted(self.other_ids,
-                      key=lambda c: distances.get(c, 0.0),
+                      key=lambda c: distances[c],
                       reverse=self.prefer_distant)
 
     def __getitem__(self, idx):
         sample_idx = idx // self.M
         aug_idx    = idx  % self.M
 
-        path, label = self.samples[sample_idx][0], self.samples[sample_idx][1]
-
-        # orig is always the clean image — anchor for ArcFace + style loss
-        orig = self._to_orig_tensor(path)
+        path, label = self.samples[sample_idx]
+        img_np = self._load_np(path)
 
         if aug_idx == 0 or not self.other_ids:
-            # spatial augmentation only — domain is own client
-            img_np = self._load_np(path)
-            return [orig, self._to_aug_tensor(img_np)], label, self.client_id
+            # original — domain is this client's own domain
+            return self._to_tensor(img_np), label, self.client_id
 
-        # FFT style augmentation — select donor
+        # donor client selection
         if self.deterministic_donors:
-            rand_client = self.donor_order[(aug_idx - 1) % len(self.donor_order)]
+            donor_idx   = (aug_idx - 1) % len(self.donor_order)
+            rand_client = self.donor_order[donor_idx]
         elif self.donor_order and self.mean_bank:
             rand_client = self.donor_order[0]
         else:
             rand_client = random.choice(self.other_ids)
 
+        # template selection from chosen donor
         if self.use_mean_template and self.mean_bank \
                 and rand_client in self.mean_bank:
             rand_template = self.mean_bank[rand_client]
         else:
             rand_template = random.choice(self.style_bank[rand_client])
 
-        img_np  = self._load_np(path)
         img_syn = apply_style_template(img_np, rand_template, self.beta)
-        # domain_id = donor client (domain this sample was styled as)
-        return [orig, self._to_aug_tensor(img_syn)], label, rand_client
+        # domain_id = donor client index (the domain this sample was styled as)
+        return self._to_tensor(img_syn), label, rand_client
 
 
 # ══════════════════════════════════════════════════════════════
