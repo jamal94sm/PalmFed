@@ -92,7 +92,7 @@ CONFIG = {
     #   stay close to their original counterparts via cosine similarity.
     #   Loss = 1 - cosine_sim(emb_orig, emb_aug).  Range [0, 2]; 0 = perfect.
     #   No NaN risk — always has exactly one positive pair per sample.
-    "lambda_style"     : 0,    # StyleConsistencyLoss weight (0.0 = disabled)
+    "lambda_style"     : 1,    # StyleConsistencyLoss weight (0.0 = disabled)
 
     # SupConLoss — CCNet only (between paired same-identity views):
     "ce_weight"        : 0.8,    # CE loss weight (CCNet only; CompNet/DINOv2 use 1.0)
