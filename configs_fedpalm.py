@@ -87,7 +87,12 @@ CONFIG_FEDPALM = {
     "local_epochs"     : 1,      # E: local training epochs per round
     #   Note: FedPalm trains local and anchor models for local_epochs
     #   on each client per round before aggregation.
-
+    "M"                : 2,      # spatial augmentation multiplier — matches
+    #   proposed method's FFTAugmentedDataset M=2 for fair comparison.
+    #   Each training sample appears M times per epoch, each with independent
+    #   random spatial augmentation. No FFT — spatial aug only.
+    #   on each client per round before aggregation.
+    
     # ── Training ───────────────────────────────────────────────
     "batch_size"       : 64,
     "lr"               : 0.001,
