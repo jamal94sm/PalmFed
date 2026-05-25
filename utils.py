@@ -21,6 +21,7 @@ from PIL import Image
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
+from scipy.linalg import sqrtm
 
 from models import SupConLoss, GRL
 
@@ -162,10 +163,56 @@ def compute_eer(scores_array):
         return 1.0
 
 
-def evaluate_model(model, gallery_loader, probe_loader, device):
+def whiten_features(gal_feats, prb_feats, eps=1e-4):
+    """
+    ZCA whitening — estimated from gallery, applied to both gallery and probe.
+
+    Whitening removes the directions of high variance in the gallery embedding
+    space. Domain-induced variance (e.g. 940nm images consistently occupy a
+    different region than 460nm images) is suppressed, bringing cross-domain
+    matching scores closer to within-domain scores.
+
+    Steps:
+      1. Estimate global mean from gallery.
+      2. Centre both gallery and probe on that mean.
+      3. Compute gallery covariance + εI regularisation.
+      4. W = inv(sqrtm(cov)) — ZCA whitening matrix.
+      5. Project both sets: feats_w = centred @ W.
+      6. L2-normalise for cosine similarity.
+
+    Parameters
+    ----------
+    gal_feats : np.ndarray [N_gal, D]
+    prb_feats : np.ndarray [N_prb, D]
+    eps       : float  covariance regularisation (prevents rank-deficiency)
+
+    Returns
+    -------
+    gal_w : np.ndarray [N_gal, D]  whitened + L2-normalised gallery
+    prb_w : np.ndarray [N_prb, D]  whitened + L2-normalised probe
+    """
+    global_mean  = gal_feats.mean(axis=0)                      # [D]
+    centred_gal  = gal_feats - global_mean                     # [N_gal, D]
+    cov          = (centred_gal.T @ centred_gal) / len(centred_gal)
+    cov         += eps * np.eye(cov.shape[0], dtype=np.float32)
+    W            = np.linalg.inv(sqrtm(cov)).real.astype(np.float32)
+
+    gal_w = (gal_feats - global_mean) @ W
+    prb_w = (prb_feats - global_mean) @ W
+
+    # L2-normalise so cosine similarity remains the matching metric
+    gal_w = gal_w / (np.linalg.norm(gal_w, axis=1, keepdims=True) + 1e-8)
+    prb_w = prb_w / (np.linalg.norm(prb_w, axis=1, keepdims=True) + 1e-8)
+    return gal_w, prb_w
+
+
+def evaluate_model(model, gallery_loader, probe_loader, device,
+                   use_whitening=False):
     """
     Cosine-similarity evaluation on gallery and probe sets.
-    Uses model.get_embedding() — compatible with all models.
+
+    If use_whitening=True, applies ZCA whitening to embeddings before
+    scoring — suppresses domain-induced variance estimated from the gallery.
 
     Returns
     -------
@@ -174,6 +221,10 @@ def evaluate_model(model, gallery_loader, probe_loader, device):
     """
     gal_feats, gal_labels = extract_features(model, gallery_loader, device)
     prb_feats, prb_labels = extract_features(model, probe_loader,   device)
+
+    if use_whitening:
+        gal_feats, prb_feats = whiten_features(gal_feats, prb_feats)
+
     sim_matrix = np.nan_to_num(prb_feats @ gal_feats.T, nan=0.0)
 
     scores_list, labels_list = [], []
