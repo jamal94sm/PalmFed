@@ -106,9 +106,10 @@ class AugmentedDataset(Dataset):
       loss += lambda_style × (1 - cosine_sim(emb(orig), emb(aug)))
     ArcFace uses orig only.
     """
-    def __init__(self, samples, img_side=128, grayscale=True):
+    def __init__(self, samples, img_side=128, grayscale=True, client_id=0):
         self.samples   = samples
         self.grayscale = grayscale
+        self.client_id = client_id
 
         aug_transforms = [
             T.Resize((img_side, img_side)),
@@ -141,7 +142,9 @@ class AugmentedDataset(Dataset):
         path, label = self.samples[idx][0], self.samples[idx][1]
         mode = "L" if self.grayscale else "RGB"
         img  = Image.open(path).convert(mode)
-        return [self.transform_orig(img), self.transform_aug(img)], label
+        return ([self.transform_orig(img), self.transform_aug(img)],
+                label,
+                self.client_id)
 
 
 class PairedDataset(Dataset):
@@ -347,13 +350,13 @@ class FFTAugmentedDataset(Dataset):
 
         path, label = self.samples[sample_idx][0], self.samples[sample_idx][1]
 
-        # orig is always the clean image — anchor for all losses
+        # orig is always the clean image — anchor for ArcFace + style loss
         orig = self._to_orig_tensor(path)
 
         if aug_idx == 0 or not self.other_ids:
-            # spatial augmentation only
+            # spatial augmentation only — domain is own client
             img_np = self._load_np(path)
-            return [orig, self._to_aug_tensor(img_np)], label
+            return [orig, self._to_aug_tensor(img_np)], label, self.client_id
 
         # FFT style augmentation — select donor
         if self.deterministic_donors:
@@ -371,7 +374,8 @@ class FFTAugmentedDataset(Dataset):
 
         img_np  = self._load_np(path)
         img_syn = apply_style_template(img_np, rand_template, self.beta)
-        return [orig, self._to_aug_tensor(img_syn)], label
+        # domain_id = donor client (domain this sample was styled as)
+        return [orig, self._to_aug_tensor(img_syn)], label, rand_client
 
 
 # ══════════════════════════════════════════════════════════════
