@@ -87,8 +87,8 @@ CONFIG = {
     # CenterLoss — all models (optional):
     #   Minimises distance between embeddings and per-client class centres.
     #   Centres are kept local and carried over across rounds (never shared).
-    "use_center_loss"    : True,  # True → add CenterLoss to training
-    "center_loss_weight" : 1,  # λ_c — keep small so ArcFace dominates
+    "use_center_loss"    : False,  # True → add CenterLoss to training
+    "center_loss_weight" : 0.5,  # λ_c — keep small so ArcFace dominates
     "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
 
     # ── CompNet hyperparameters ────────────────────────────────
