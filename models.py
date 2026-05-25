@@ -102,153 +102,37 @@ class ArcMarginProduct(nn.Module):
         return self.s * cosine
 
 
-class MoEFC(nn.Module):
-    """
-    Base FC + domain-label-conditioned residual experts.
-
-    Architecture:
-      output = base_FC(x) + expert[domain_id](x)
-
-    The shared base FC (9708→512) is identical to the original nn.Linear
-    and is the domain-invariant component shared via FedAvg.
-
-    Each expert is a low-rank residual adapter (9708→rank→512) indexed by
-    domain label. B is zero-initialised so at round 0 the output equals
-    base_FC(x) exactly — identical to non-MoE CompNet, no degradation.
-
-    Domain label routing:
-      Training: each sample's domain label is known explicitly.
-        Original samples → local client's domain index.
-        FFT-augmented samples → donor client's domain index.
-        Expert[domain_id] is activated for that sample.
-      Inference: domain label unknown → only base_FC used (domain_id=None).
-        Residuals are training-time signals; at inference the base FC
-        carries the full domain-invariant representation.
-
-    FedAvg aggregation:
-      base.*    → averaged across all clients (domain-invariant projection)
-      experts.k → averaged across all clients' expert k
-                  Client 0 (940nm) trains expert[0] on 940nm originals
-                  + other domains' FFT copies lightly.
-                  Client 1 (850nm) trains expert[1] on 850nm originals.
-                  After FedAvg, expert[k] = 940nm-specialised adapter
-                  averaged with light contributions from other clients.
-                  This is coherent because corresponding experts aggregate.
-
-    No gating network, no load balancing loss — domain routing is exact.
-    get_moe_lb_loss() returns 0.0 (kept for interface compatibility).
-
-    Parameters
-    ----------
-    in_features  : int  9708
-    out_features : int  512
-    n_experts    : int  number of domain experts (= number of FL clients)
-    rank         : int  LoRA rank for each expert
-    """
-    def __init__(self, in_features=9708, out_features=512,
-                 n_experts=6, rank=64):
-        super().__init__()
-        self.n_experts = n_experts
-
-        # shared base — domain-invariant, identical to original FC
-        self.base = nn.Linear(in_features, out_features)
-
-        # one residual expert per domain — zero-init B → zero initial output
-        self.experts = nn.ModuleList([
-            _ResidualExpert(in_features, out_features, rank)
-            for _ in range(n_experts)
-        ])
-
-    def forward(self, x, domain_ids=None):
-        """
-        x          : [B, 9708]
-        domain_ids : LongTensor [B] | None
-                     Domain index per sample (0..n_experts-1).
-                     None at inference → base FC only, no residual.
-        Returns    : [B, 512]
-        """
-        base_out = self.base(x)                          # [B, 512]
-
-        if domain_ids is None:
-            return base_out                              # inference: base only
-
-        residual = torch.zeros_like(base_out)            # [B, 512]
-        for d in range(self.n_experts):
-            mask = (domain_ids == d)                     # [B] bool
-            if mask.any():
-                residual[mask] = self.experts[d](x[mask])
-
-        return base_out + residual
-
-
-class _ResidualExpert(nn.Module):
-    """Low-rank residual adapter: Linear(in→rank) → ReLU → Linear(rank→out).
-    B initialised to zero — zero contribution at start, learned from training."""
-    def __init__(self, in_features, out_features, rank):
-        super().__init__()
-        self.A = nn.Linear(in_features, rank, bias=False)
-        self.B = nn.Linear(rank, out_features, bias=False)
-        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
-        nn.init.zeros_(self.B.weight)
-
-    def forward(self, x):
-        return self.B(F.relu(self.A(x)))
-
-
 class CompNet(nn.Module):
     """
     CompNet = CB1 // CB2 // CB3 + FC(9708→512) + Dropout + ArcFace.
-
-    Without MoE (use_moe=False):
-      Three parallel CompetitiveBlocks → concat [B, 9708]
-      → nn.Linear(9708→512) → Dropout → ArcFace
-
-    With MoE (use_moe=True):
-      Three parallel CompetitiveBlocks → concat [B, 9708]
-      → MoEFC: base_FC(x) + expert[domain_id](x) → Dropout → ArcFace
-
-    _backbone(x, domain_ids=None):
-      domain_ids passed during training so each sample activates its
-      domain-specific expert. At inference (get_embedding), domain_ids=None
-      so only the base FC is used.
+    Three parallel Gabor competitive blocks → concat [B, 9708]
+    → FC(9708→512) → Dropout → ArcFace.
+    FC input size 9708 is fixed for 128×128 input images.
     """
     def __init__(self, num_classes, embedding_dim=512,
-                 arcface_s=30.0, arcface_m=0.50, dropout=0.25,
-                 use_moe=False, n_experts=6, lora_rank=64):
+                 arcface_s=30.0, arcface_m=0.50, dropout=0.25):
         super().__init__()
         self.cb1 = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
         self.cb2 = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.use_moe = use_moe
-        if use_moe:
-            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank)
-        else:
-            self.fc = nn.Linear(9708, embedding_dim)
+        self.fc   = nn.Linear(9708, embedding_dim)
         self.drop = nn.Dropout(p=dropout)
         self.arc  = ArcMarginProduct(embedding_dim, num_classes,
                                      s=arcface_s, m=arcface_m)
 
-    def _backbone(self, x, domain_ids=None):
-        x1   = self.cb1(x).flatten(1)
-        x2   = self.cb2(x).flatten(1)
-        x3   = self.cb3(x).flatten(1)
-        feat = torch.cat([x1, x2, x3], dim=1)       # [B, 9708]
-        if self.use_moe:
-            return self.fc(feat, domain_ids)         # domain-conditioned
-        return self.fc(feat)                         # standard FC
+    def _backbone(self, x):
+        x1 = self.cb1(x).flatten(1)
+        x2 = self.cb2(x).flatten(1)
+        x3 = self.cb3(x).flatten(1)
+        return self.fc(torch.cat([x1, x2, x3], dim=1))
 
-    def forward(self, x, y=None, domain_ids=None):
-        return self.arc(self.drop(self._backbone(x, domain_ids)), y)
+    def forward(self, x, y=None):
+        return self.arc(self.drop(self._backbone(x)), y)
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised embedding — base FC only (no residual).
-        Domain label unknown at inference, base carries domain-invariant repr."""
-        return F.normalize(self._backbone(x, domain_ids=None), p=2, dim=1)
-
-    def get_moe_lb_loss(self):
-        """No load balancing needed — domain routing is exact. Returns 0."""
-        return torch.tensor(0.0, device=next(self.parameters()).device)
+        """L2-normalised 512-d embedding for cosine matching."""
+        return F.normalize(self._backbone(x), p=2, dim=1)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -494,209 +378,29 @@ class DINOBackbone(nn.Module):
 
 
 class LoRAExpert(nn.Module):
-    """
-    Single LoRA adapter: a low-rank decomposition A·B applied to one linear layer.
-    B is initialised to zero so the initial contribution to the base layer is
-    exactly zero — LoRA starts as an identity pass-through and learns from there.
-
-    Parameters
-    ----------
-    in_dim  : int  input dimensionality  (384 for DINOv2 ViT-S fc1 input)
-    out_dim : int  output dimensionality (1536 for DINOv2 ViT-S fc1 output)
-    rank    : int  LoRA rank — controls capacity vs. parameter count
-    """
-    def __init__(self, in_dim, out_dim, rank):
-        super().__init__()
-        self.A = nn.Linear(in_dim,  rank,    bias=False)
-        self.B = nn.Linear(rank,    out_dim, bias=False)
-        nn.init.normal_(self.A.weight, std=0.02)
-        nn.init.zeros_(self.B.weight)          # zero init → zero initial output
-
-    def forward(self, x):
-        return self.B(self.A(x))
-
-
-class LoRAMoEMLP(nn.Module):
-    """
-    LoRA Mixture-of-Experts wrapper for a ViT MLP block.
-
-    Replaces the MLP inside transformer blocks 10 and 11 of DINOv2.
-    Instead of adding a separate module after all blocks (which operates on
-    an already-formed CLS token), this integrates domain-specific adaptation
-    directly into the intermediate feature transformation, where the model
-    can still modulate both patch and CLS representations.
-
-    Architecture:
-      h = fc1(x) + scale × Σ_k gate_k(CLS) × LoRA_k(x)
-      h = act(h)
-      h = fc2(h)
-
-    The gating network reads the CLS token (x[:, 0, :]) and produces soft
-    routing weights over all n_experts LoRA adapters. The same gates apply
-    to all N tokens — domain routing is image-level, not token-level.
-
-    Load balancing:
-      After each forward pass, _lb_loss stores the load balance penalty:
-        n_experts × Σ(mean_gate_k²)
-      DINOv2Model.get_moe_lb_loss() collects this from both blocks 10 and 11.
-
-    Parameters
-    ----------
-    original_mlp : nn.Module  the original MLP from the ViT block (kept intact)
-    n_experts    : int        number of LoRA adapters
-    rank         : int        LoRA rank
-    embed_dim    : int        ViT embedding dim (384 for ViT-S)
-    """
-    def __init__(self, original_mlp, n_experts, rank, embed_dim):
-        super().__init__()
-        self.mlp       = original_mlp
-        self.n_experts = n_experts
-        fc1_out        = original_mlp.fc1.out_features   # 1536 for ViT-S
-
-        self.lora_experts = nn.ModuleList([
-            LoRAExpert(embed_dim, fc1_out, rank)
-            for _ in range(n_experts)
-        ])
-        self.gate  = nn.Linear(embed_dim, n_experts)
-        self.scale = nn.Parameter(torch.ones(1))   # learnable LoRA scaling
-        self._lb_loss = None                        # populated each forward pass
-
-    def forward(self, x):
-        """
-        Parameters
-        ----------
-        x : Tensor [B, N_tokens, embed_dim]  token sequence (patch + CLS)
-
-        Returns
-        -------
-        Tensor [B, N_tokens, embed_dim]  MLP output with LoRA MoE injection
-        """
-        # gate on CLS token (index 0) — image-level domain routing
-        cls   = x[:, 0, :]                                 # [B, D]
-        gates = torch.softmax(self.gate(cls), dim=-1)      # [B, n_experts]
-
-        # all expert outputs for all tokens: stack → [B, n_experts, N, fc1_out]
-        lora_out = torch.stack(
-            [exp(x) for exp in self.lora_experts], dim=1)
-
-        # weighted sum over experts: [B, N, fc1_out]
-        weighted = (gates[:, :, None, None] * lora_out).sum(dim=1)
-
-        # inject into fc1 output
-        h = self.mlp.fc1(x) + self.scale * weighted
-        h = self.mlp.act(h)
-        h = self.mlp.drop1(h) if hasattr(self.mlp, "drop1") else h
-        h = self.mlp.fc2(h)
-        h = self.mlp.drop2(h) if hasattr(self.mlp, "drop2") else h
-
-        # load balancing loss — stored for extraction by get_moe_lb_loss()
-        mean_gates    = gates.mean(dim=0)                  # [n_experts]
-        self._lb_loss = self.n_experts * (mean_gates ** 2).sum()
-
-        return h
-
-
-class DINOBackbone(nn.Module):
-    """
-    DINOv2 ViT-S/14 backbone with selective unfreezing and optional LoRA MoE.
-
-    Without LoRA MoE (use_moe=False):
-      Blocks 0–9   frozen (ImageNet features)
-      Blocks 10–11 unfrozen (fine-tuned for palmprint)
-      forward() → L2-normalised 384-d CLS token
-
-    With LoRA MoE (use_moe=True):
-      Blocks 0–9   frozen
-      Blocks 10–11 attention layers: unfrozen
-      Blocks 10–11 MLP: replaced with LoRAMoEMLP
-        base MLP weights stay unfrozen (as before)
-        LoRA adapters (A, B) and gating: new trainable parameters
-      The LoRA adapters inject domain-specific transformations directly into
-      the MLP intermediate representations, operating on all tokens rather
-      than only the final CLS token.
-    """
-    EMBED_DIM = 384
-
-    def __init__(self, use_moe=False, n_experts=6, lora_rank=16):
-        super().__init__()
-        backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
-                                  verbose=False)
-
-        # freeze all, unfreeze last two blocks
-        for name, p in backbone.named_parameters():
-            p.requires_grad = False
-            if "blocks.10" in name or "blocks.11" in name:
-                p.requires_grad = True
-
-        # inject LoRA MoE into the MLP of blocks 10 and 11
-        if use_moe:
-            for blk_idx in [10, 11]:
-                original_mlp = backbone.blocks[blk_idx].mlp
-                backbone.blocks[blk_idx].mlp = LoRAMoEMLP(
-                    original_mlp, n_experts, lora_rank, self.EMBED_DIM)
-
-        self.backbone = backbone
-        self.use_moe  = use_moe
-
-    def forward(self, x):
-        """Returns L2-normalised 384-d CLS token.
-        If use_moe=True, LoRA MoE is applied inside blocks 10-11 during
-        forward_features(), populating _lb_loss in each LoRAMoEMLP."""
-        out = self.backbone.forward_features(x)
-        cls = out["x_norm_clstoken"]
-        return F.normalize(cls, p=2, dim=1)
-
-    def get_moe_lb_loss(self):
-        """
-        Collect and sum load-balancing losses from both LoRA MoE blocks.
-        Called after forward() — _lb_loss is populated during forward_features().
-        Returns zero tensor when use_moe=False.
-        """
-        if not self.use_moe:
-            return torch.tensor(0.0,
-                                device=next(self.parameters()).device)
-        total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for blk_idx in [10, 11]:
-            mlp = self.backbone.blocks[blk_idx].mlp
-            if hasattr(mlp, "_lb_loss") and mlp._lb_loss is not None:
-                total = total + mlp._lb_loss
-        return total
+    pass  # kept as placeholder — remove after confirming no external references
 
 
 class DINOv2Model(nn.Module):
     """
-    DINOv2 FL model = DINOBackbone (+ optional LoRA MoE inside blocks) + ArcFace.
-
-    Without LoRA MoE: identical to the original — backbone CLS → ArcFace.
-    With LoRA MoE:    LoRA adapters inside blocks 10-11 MLPs refine the
-                      intermediate token representations domain-specifically,
-                      producing a better CLS token before ArcFace.
-
-    Weight sharing in FL:
-      backbone.* (including lora_experts, gate, scale) → shared via FedAvg
-      arc.*                                            → kept local
-
+    DINOv2 FL model = DINOBackbone + ArcFace.
+    backbone(x) → L2-normalised 384-d CLS token → ArcFace → logits.
+    Weight sharing: backbone.* via FedAvg; arc.* kept local.
     Input: RGB 224×224 with ImageNet normalisation.
     """
-    def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30,
-                 use_moe=False, n_experts=6, lora_rank=16):
+    def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30):
         super().__init__()
-        self.backbone = DINOBackbone(use_moe, n_experts, lora_rank)
+        self.backbone = DINOBackbone()
         self.arc      = ArcMarginProduct(DINOBackbone.EMBED_DIM, num_classes,
                                          s=arcface_s, m=arcface_m)
 
     def forward(self, x, y=None):
-        emb = self.backbone(x)         # LoRA MoE applied inside if enabled
-        return self.arc(emb, y)        # [B, num_classes] logits
+        return self.arc(self.backbone(x), y)
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 384-d CLS embedding — LoRA-refined when use_moe=True."""
+        """L2-normalised 384-d CLS embedding."""
         return self.backbone(x)
-
-    def get_moe_lb_loss(self):
-        """Sum of load-balancing losses from LoRA MoE blocks. Zero if disabled."""
-        return self.backbone.get_moe_lb_loss()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -704,18 +408,7 @@ class DINOv2Model(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 def build_model(cfg, num_classes):
-    """
-    Instantiate and return the model specified in cfg["model"].
-
-    Parameters
-    ----------
-    cfg        : dict  CONFIG dictionary
-    num_classes: int   number of training identities for this client
-
-    Returns
-    -------
-    model : nn.Module  (CompNet | CCNet | DINOv2Model)
-    """
+    """Instantiate and return the model specified in cfg["model"]."""
     name = cfg["model"].strip().lower()
     if name == "compnet":
         return CompNet(
@@ -724,9 +417,6 @@ def build_model(cfg, num_classes):
             arcface_s     = cfg["arcface_s"],
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
-            use_moe       = cfg.get("use_moe",    False),
-            n_experts     = cfg.get("n_experts",  6),
-            lora_rank     = cfg.get("lora_rank",  64),
         )
     elif name == "ccnet":
         return CCNet(
@@ -741,9 +431,6 @@ def build_model(cfg, num_classes):
             num_classes = num_classes,
             arcface_s   = cfg.get("dino_scale",  16.0),
             arcface_m   = cfg.get("dino_margin",  0.30),
-            use_moe     = cfg.get("use_moe",      False),
-            n_experts   = cfg.get("n_experts",    6),
-            lora_rank   = cfg.get("lora_rank",    16),
         )
     else:
         raise ValueError(f"Unknown model: '{cfg['model']}'. "
