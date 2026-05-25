@@ -331,11 +331,12 @@ class FLServer:
         global_state.update(avg_dict)
         self.global_model.load_state_dict(global_state)
 
-    def evaluate(self):
+    def evaluate(self, use_whitening=False):
         """Evaluate global model on the shared gallery and probe sets."""
         return evaluate_model(
             self.global_model,
-            self.gallery_loader, self.probe_loader, self.device)
+            self.gallery_loader, self.probe_loader, self.device,
+            use_whitening=use_whitening)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -565,9 +566,11 @@ def main():
         print("  Spatial augmentation only — style bank extracted "
               "but not used during training.\n")
 
+    use_whitening = cfg.get("use_whitening", False)
+
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
-    g_eer_0, g_rank1_0 = server.evaluate()
+    g_eer_0, g_rank1_0 = server.evaluate(use_whitening=use_whitening)
     print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
     with open(results_path, "a") as f:
         f.write(f"0\tInit\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
@@ -599,7 +602,8 @@ def main():
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
-                device)
+                device,
+                use_whitening=use_whitening)
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -612,7 +616,7 @@ def main():
 
         # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
-        g_eer, g_rank1 = server.evaluate()
+        g_eer, g_rank1 = server.evaluate(use_whitening=use_whitening)
         elapsed = time.time() - t_start
 
         # keep a rolling window for final average reporting
