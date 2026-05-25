@@ -21,7 +21,6 @@ from PIL import Image
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
-from scipy.linalg import sqrtm
 
 from models import SupConLoss, GRL
 
@@ -163,44 +162,66 @@ def compute_eer(scores_array):
         return 1.0
 
 
-def whiten_features(gal_feats, prb_feats, eps=1e-4):
+def whiten_features(gal_feats, prb_feats, eps=1e-4, n_components=None):
     """
-    ZCA whitening — estimated from gallery, applied to both gallery and probe.
+    PCA whitening — projects to principal components, whitens, then L2-normalises.
 
-    Whitening removes the directions of high variance in the gallery embedding
-    space. Domain-induced variance (e.g. 940nm images consistently occupy a
-    different region than 460nm images) is suppressed, bringing cross-domain
-    matching scores closer to within-domain scores.
+    Safer than ZCA for gallery/probe evaluation because it only operates on
+    directions with meaningful variance. ZCA on 241 gallery samples in 512-d
+    space is rank-deficient: 271 near-zero eigenvalue directions get amplified
+    by 1/sqrt(eps) ≈ 100x, drowning out the genuine matching signal.
+
+    PCA whitening avoids this by keeping only the top-k principal components
+    (default: min(n_gallery - 1, embedding_dim) capped at 256). The null-space
+    directions are simply discarded rather than amplified.
 
     Steps:
-      1. Estimate global mean from gallery.
-      2. Centre both gallery and probe on that mean.
-      3. Compute gallery covariance + εI regularisation.
-      4. W = inv(sqrtm(cov)) — ZCA whitening matrix.
-      5. Project both sets: feats_w = centred @ W.
-      6. L2-normalise for cosine similarity.
+      1. Estimate global mean and PCA basis from gallery (SVD).
+      2. Project both gallery and probe to top-k PCs.
+      3. Whiten each PC dimension: divide by sqrt(eigenvalue + eps).
+      4. L2-normalise for cosine similarity.
 
     Parameters
     ----------
-    gal_feats : np.ndarray [N_gal, D]
-    prb_feats : np.ndarray [N_prb, D]
-    eps       : float  covariance regularisation (prevents rank-deficiency)
+    gal_feats    : np.ndarray [N_gal, D]
+    prb_feats    : np.ndarray [N_prb, D]
+    eps          : float  eigenvalue floor for numerical stability
+    n_components : int | None  number of PCs to keep (None → auto)
 
     Returns
     -------
-    gal_w : np.ndarray [N_gal, D]  whitened + L2-normalised gallery
-    prb_w : np.ndarray [N_prb, D]  whitened + L2-normalised probe
+    gal_w : np.ndarray [N_gal, k]  whitened + L2-normalised gallery
+    prb_w : np.ndarray [N_prb, k]  whitened + L2-normalised probe
     """
-    global_mean  = gal_feats.mean(axis=0)                      # [D]
-    centred_gal  = gal_feats - global_mean                     # [N_gal, D]
-    cov          = (centred_gal.T @ centred_gal) / len(centred_gal)
-    cov         += eps * np.eye(cov.shape[0], dtype=np.float32)
-    W            = np.linalg.inv(sqrtm(cov)).real.astype(np.float32)
+    N, D = gal_feats.shape
 
-    gal_w = (gal_feats - global_mean) @ W
-    prb_w = (prb_feats - global_mean) @ W
+    # auto: keep at most min(N-1, D, 256) components — safe rank estimate
+    if n_components is None:
+        n_components = min(N - 1, D, 256)
 
-    # L2-normalise so cosine similarity remains the matching metric
+    global_mean = gal_feats.mean(axis=0)                     # [D]
+    centred_gal = gal_feats - global_mean                    # [N, D]
+
+    # SVD of centred gallery — U [N,N], s [min(N,D)], Vt [min(N,D), D]
+    # Vt rows are the principal component directions
+    _, s, Vt = np.linalg.svd(centred_gal, full_matrices=False)
+
+    # keep top-k components
+    Vt_k = Vt[:n_components]                                  # [k, D]
+    s_k  = s[:n_components]                                   # [k]
+
+    # eigenvalues of cov = s² / N
+    eigvals = (s_k ** 2) / N                                  # [k]
+    scale   = 1.0 / np.sqrt(eigvals + eps)                   # [k]
+
+    # project and whiten
+    gal_proj = (gal_feats - global_mean) @ Vt_k.T            # [N_gal, k]
+    prb_proj = (prb_feats - global_mean) @ Vt_k.T            # [N_prb, k]
+
+    gal_w = gal_proj * scale                                  # [N_gal, k]
+    prb_w = prb_proj * scale                                  # [N_prb, k]
+
+    # L2-normalise for cosine similarity
     gal_w = gal_w / (np.linalg.norm(gal_w, axis=1, keepdims=True) + 1e-8)
     prb_w = prb_w / (np.linalg.norm(prb_w, axis=1, keepdims=True) + 1e-8)
     return gal_w, prb_w
