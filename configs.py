@@ -57,6 +57,19 @@ CONFIG = {
     "n_rounds"         : 50,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
+    # ── Mixture of Experts — CompNet only ─────────────────────
+    # When use_moe=True, the single FC(9708→512) bottleneck in CompNet
+    # is replaced by MoEFC: base_FC(x) + expert[domain_id](x).
+    # base_FC learns the domain-invariant projection (shared via FedAvg).
+    # Each expert[d] is a low-rank residual (9708→rank→512) that learns
+    # the domain-d-specific correction on top of the shared base.
+    # Domain routing uses explicit domain_id labels during training;
+    # at inference domain_ids=None so only base_FC is used.
+    # Requires use_fft_aug=True to generate cross-domain training signal.
+    "use_moe"          : False,  # True → MoEFC for CompNet
+    "n_experts"        : 6,      # number of domain experts (= n_clients)
+    "lora_rank"        : 64,     # expert bottleneck rank
+
     # CrossEntropy + ArcFace is always active for all models.
     #
     # Style Consistency Loss — CompNet and DINOv2:
