@@ -123,13 +123,17 @@ class FLClient:
 
     def set_weights(self, state_dict):
         """
-        Load aggregated global weights into local model.
-        Includes ArcFace (arc.*) — after FedAvg with global labels each row
-        maps to a unique identity trained by exactly one client, so the
-        aggregated ArcFace is coherent and well-trained across all 156 rows.
+        Load aggregated global weights into local model — backbone only.
+        ArcFace (arc.*) is excluded: each client keeps its own local ArcFace
+        trained on its own 26 identities. The global ArcFace assembled on the
+        server is not useful for local training (it contains rows for 130
+        identities the client has never seen) and is never used at evaluation
+        (get_embedding uses backbone only).
         """
         local_state = self.model.state_dict()
         for key, val in state_dict.items():
+            if key.startswith("arc."):
+                continue                  # keep local ArcFace intact
             if key in local_state and local_state[key].shape == val.shape:
                 local_state[key] = val.clone()
         self.model.load_state_dict(local_state)
@@ -546,13 +550,13 @@ def main():
             print(f"  INFO: {len(missing)} new key(s) not in checkpoint "
                   f"(fresh init): {missing[:4]}{'...' if len(missing)>4 else ''}")
         for client in clients:
-            client.set_weights(init_state)
+            client.set_weights(init_state)   # set_weights skips arc.* automatically
         print("  Initial weights loaded.")
     else:
         print(f"\nSaving initial weights to: {init_weights_path}")
         torch.save(server.global_model.state_dict(), init_weights_path)
         for client in clients:
-            client.set_weights(server.global_model.state_dict())
+            client.set_weights(server.global_model.state_dict())  # backbone only
         print("  Initial weights saved.")
 
     # ── results file ──────────────────────────────────────────────────────
