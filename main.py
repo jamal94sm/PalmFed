@@ -25,6 +25,7 @@ from datasets import (PalmDataset, AugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
+                      predict_probe_domain_ids,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
@@ -134,10 +135,13 @@ class FLClient:
         self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """Return backbone weights for FedAvg — ArcFace head excluded."""
+        """Return backbone weights for FedAvg — ArcFace head excluded.
+        MoE weights (fc.gate.*, fc.experts.*) excluded when share_moe=False."""
+        share_moe = self.cfg.get("share_moe", True)
         return {k: v.cpu().clone()
                 for k, v in self.model.state_dict().items()
-                if not k.startswith("arc.")}
+                if not k.startswith("arc.")
+                and (share_moe or not k.startswith("fc."))}
 
     # ── local training ──────────────────────────────────────────────────────
 
@@ -179,7 +183,8 @@ class FLClient:
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
-                                           grayscale=grayscale)
+                                           grayscale=grayscale,
+                                           client_id=self.client_id)
 
         elif model_name == "ccnet":
             # For CCNet, active_style_bank controls FFT on paired views too.
@@ -225,10 +230,13 @@ class FLClient:
             if model_name in ("compnet", "dinov2"):
                 avg_loss, accuracy = train_compnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device,
-                    center_loss      = self.center_loss,
-                    center_optimizer = self.center_optimizer,
-                    lambda_center    = lambda_c,
-                    lambda_style     = self.cfg.get("lambda_style", 0.0),
+                    center_loss         = self.center_loss,
+                    center_optimizer    = self.center_optimizer,
+                    lambda_center       = lambda_c,
+                    lambda_style        = self.cfg.get("lambda_style", 0.0),
+                    lambda_load_balance = self.cfg.get("lambda_load_balance", 0.0)
+                                          if self.cfg.get("use_moe", False)
+                                          else 0.0,
                 )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
@@ -316,7 +324,7 @@ class FLServer:
                 if not k.startswith("arc.")}
 
     def aggregate(self, client_weight_dicts):
-        """FedAvg on backbone parameters — arc.* never aggregated."""
+        """FedAvg on backbone parameters only — arc.* never aggregated."""
         n        = len(client_weight_dicts)
         avg_dict = {}
         for key in client_weight_dicts[0].keys():
@@ -327,11 +335,13 @@ class FLServer:
         global_state.update(avg_dict)
         self.global_model.load_state_dict(global_state)
 
-    def evaluate(self):
-        """Evaluate global model on the shared gallery and probe sets."""
+    def evaluate(self, gal_domain_ids=None, prb_domain_ids=None):
+        """Evaluate global model. Pass pre-computed domain IDs for MoE routing."""
         return evaluate_model(
             self.global_model,
-            self.gallery_loader, self.probe_loader, self.device)
+            self.gallery_loader, self.probe_loader, self.device,
+            gal_domain_ids=gal_domain_ids,
+            prb_domain_ids=prb_domain_ids)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -457,13 +467,6 @@ def main():
     print(f"  Test  classes  : {len(test_label_map)}")
     print(f"  Gallery        : {len(gallery_samples)}  "
           f"Probe : {len(probe_samples)}\n")
-    # Local label mapping (0..num_classes-1 per client) — correct for our method.
-    # ArcFace is local and never sent back from the server, so each client
-    # must train a fully-dense head. Global label mapping would create a
-    # 156-class head where 130 rows stay random throughout — permanent noise
-    # in the softmax denominator that degrades the embedding space.
-    # Global mapping is only beneficial when the assembled global ArcFace is
-    # distributed back to all clients each round (FedPalm anchor model).
 
     # ── Step 0b: initialise server ────────────────────────────────────────
     print("Initialising server …")
@@ -478,34 +481,28 @@ def main():
             spectrum      = cd["spectrum"],
             train_samples = cd["train_samples"],
             label_map     = cd["label_map"],
-            num_classes   = num_classes,
+            num_classes   = cd["num_classes"],
             cfg           = cfg,
             device        = device,
         ))
-    # expose n_clients count
+    # expose n_clients so local_train can auto-set M when use_moe=True
     cfg["_n_clients"] = list(range(n_clients))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
-    # Validate arc.weight shape — if checkpoint was saved with a different
-    # num_classes (e.g. during global-label-map experiments), regenerate.
-    if os.path.exists(init_weights_path):
-        _probe    = torch.load(init_weights_path, map_location="cpu")
-        _ckpt_arc = _probe.get("arc.weight", None)
-        _mod_arc  = server.global_model.state_dict()["arc.weight"]
-        if _ckpt_arc is None or _ckpt_arc.shape != _mod_arc.shape:
-            print(f"\nInit weights arc.weight shape mismatch "
-                  f"({tuple(_ckpt_arc.shape) if _ckpt_arc is not None else 'missing'} "
-                  f"→ {tuple(_mod_arc.shape)}) — regenerating.")
-            os.remove(init_weights_path)
-
     if os.path.exists(init_weights_path):
         print(f"\nLoading existing initial weights from: {init_weights_path}")
         init_state = torch.load(init_weights_path, map_location=device)
+        # strict=False: allows new architecture keys (e.g. moe.*) that are
+        # absent from a previously saved checkpoint to be initialised from
+        # the freshly built model rather than raising an error.
         missing, unexpected = server.global_model.load_state_dict(
             init_state, strict=False)
         if missing:
             print(f"  INFO: {len(missing)} new key(s) not in checkpoint "
-                  f"(fresh init): {missing[:4]}{'...' if len(missing)>4 else ''}")
+                  f"(initialised from scratch): {missing[:4]}{'...' if len(missing)>4 else ''}")
+        if unexpected:
+            print(f"  INFO: {len(unexpected)} key(s) in checkpoint not in "
+                  f"current model (ignored): {unexpected[:4]}")
         backbone_init = {k: v for k, v in init_state.items()
                          if not k.startswith("arc.")}
         for client in clients:
@@ -561,9 +558,37 @@ def main():
         print("  Spatial augmentation only — style bank extracted "
               "but not used during training.\n")
 
+    # ── Pre-compute FFT domain descriptors (MoE inference only) ──────────
+    # FFT amplitude is pixel-level and model-independent — extracted once,
+    # reused for all rounds. gallery domain_ids come from splits (known);
+    # probe domain_ids are predicted via nearest-neighbour FFT matching.
+    moe_gal_domain_ids = None
+    moe_prb_domain_ids = None
+    if cfg.get("use_moe", False) and model_key == "compnet":
+        gal_domain_ids_known = server.gallery_loader.dataset.get_domain_ids()
+        if gal_domain_ids_known is not None:
+            moe_gal_domain_ids = gal_domain_ids_known
+            prb_domain_ids_gt  = server.probe_loader.dataset.get_domain_ids()
+            moe_prb_domain_ids = predict_probe_domain_ids(
+                server.probe_loader.dataset.get_paths(),
+                server.gallery_loader.dataset.get_paths(),
+                moe_gal_domain_ids,
+                cfg["img_side"],
+                beta=0.1,   # hard-crop low-freq patch, Mahalanobis matching
+                probe_domain_ids_gt=prb_domain_ids_gt,
+            )
+            print(f"  MoE domain IDs cached — "
+                  f"gallery: {len(moe_gal_domain_ids)}  "
+                  f"probe: {len(moe_prb_domain_ids)}\n")
+        else:
+            print("  [MoE] splits.pkl predates domain_id — "
+                  "delete splits.pkl and rerun to enable expert routing.\n")
+
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
-    g_eer_0, g_rank1_0 = server.evaluate()
+    g_eer_0, g_rank1_0 = server.evaluate(
+        gal_domain_ids=moe_gal_domain_ids,
+        prb_domain_ids=moe_prb_domain_ids)
     print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
     with open(results_path, "a") as f:
         f.write(f"0\tInit\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
@@ -595,7 +620,9 @@ def main():
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
-                device)
+                device,
+                gal_domain_ids = moe_gal_domain_ids,
+                prb_domain_ids = moe_prb_domain_ids)
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -608,7 +635,9 @@ def main():
 
         # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
-        g_eer, g_rank1 = server.evaluate()
+        g_eer, g_rank1 = server.evaluate(
+            gal_domain_ids=moe_gal_domain_ids,
+            prb_domain_ids=moe_prb_domain_ids)
         elapsed = time.time() - t_start
 
         # keep a rolling window for final average reporting
@@ -659,3 +688,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
