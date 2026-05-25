@@ -69,10 +69,10 @@ from datasets import (build_federated_splits, build_federated_splits_xjtu,
 from utils import compute_eer
 
 # ── FedPalm model (verbatim from original paper repo) ─────────
-from models.compnet_original import compnet_fedpalm
+from model_fedpalm import compnet_fedpalm
 
 # ── FedPalm loss (verbatim from original paper repo) ──────────
-from loss import SupConLoss
+from loss_fedpalm import SupConLoss
 
 
 # ══════════════════════════════════════════════════════════════
