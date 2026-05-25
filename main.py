@@ -122,35 +122,20 @@ class FLClient:
     # ── weight management ───────────────────────────────────────────────────
 
     def set_weights(self, state_dict):
-        """
-        Load aggregated global weights into local model — backbone only.
-        ArcFace (arc.*) is excluded: each client keeps its own local ArcFace
-        trained on its own 26 identities. The global ArcFace assembled on the
-        server is not useful for local training (it contains rows for 130
-        identities the client has never seen) and is never used at evaluation
-        (get_embedding uses backbone only).
-        """
+        """Load global backbone weights — ArcFace excluded (kept local)."""
         local_state = self.model.state_dict()
         for key, val in state_dict.items():
             if key.startswith("arc."):
-                continue                  # keep local ArcFace intact
+                continue
             if key in local_state and local_state[key].shape == val.shape:
                 local_state[key] = val.clone()
         self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """
-        Return all model weights for FedAvg — including ArcFace (arc.*).
-        With global labels, each client trains a disjoint subset of ArcFace
-        rows (26 out of 156). FedAvg assembles the complete 156-row matrix
-        from all clients' partial contributions — identical to FedPalm.
-        ArcFace is not used at evaluation (get_embedding uses backbone only),
-        so sharing it has no effect on inference but improves training signal:
-        each client's backbone is trained against all 156 prototypes, not
-        just its own 26, producing richer identity discrimination gradients.
-        """
+        """Return backbone weights for FedAvg — ArcFace excluded."""
         return {k: v.cpu().clone()
-                for k, v in self.model.state_dict().items()}
+                for k, v in self.model.state_dict().items()
+                if not k.startswith("arc.")}
 
     # ── local training ──────────────────────────────────────────────────────
 
@@ -323,12 +308,13 @@ class FLServer:
               f"gallery: {len(gallery_samples)}  probe: {len(probe_samples)}")
 
     def get_global_weights(self):
-        """Return all global model weights including ArcFace."""
+        """Return backbone weights only (arc.* excluded)."""
         return {k: v.cpu().clone()
-                for k, v in self.global_model.state_dict().items()}
+                for k, v in self.global_model.state_dict().items()
+                if not k.startswith("arc.")}
 
     def aggregate(self, client_weight_dicts):
-        """FedAvg on all parameters including ArcFace."""
+        """FedAvg on backbone parameters — arc.* never aggregated."""
         n        = len(client_weight_dicts)
         avg_dict = {}
         for key in client_weight_dicts[0].keys():
@@ -462,48 +448,20 @@ def main():
         print(f"  Splits saved to: {splits_path}")
         client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
 
-    num_classes_per_client = client_data[0]["num_classes"]
+    num_classes = client_data[0]["num_classes"]
     n_clients   = len(client_data)
     print(f"\n  Clients        : {n_clients}  ({domain_names})")
-    print(f"  IDs per client : {num_classes_per_client}")
+    print(f"  IDs per client : {num_classes}")
     print(f"  Test  classes  : {len(test_label_map)}")
     print(f"  Gallery        : {len(gallery_samples)}  "
           f"Probe : {len(probe_samples)}\n")
-
-    # ── Global label remapping ────────────────────────────────────────────
-    # Each client gets local labels 0..n-1 from build_federated_splits.
-    # ArcFace is now shared via FedAvg (like FedPalm), so all clients must
-    # use the same global integer for the same identity. Without this, FedAvg
-    # would average unrelated identity prototypes at the same row index.
-    #
-    # With global labels: client 0 trains rows 0–25, client 1 trains rows
-    # 26–51, ..., client 5 trains rows 130–155. FedAvg assembles the full
-    # 156-row ArcFace from each client's disjoint contribution. Each row is
-    # trained by exactly one client — no averaging of unrelated prototypes.
-    #
-    # At evaluation, get_embedding() uses only the backbone — ArcFace is
-    # never called. Sharing it costs nothing at inference and improves the
-    # training signal: the backbone is optimised against all 156 prototypes
-    # simultaneously, learning richer inter-identity discrimination.
-    all_identities = set()
-    for cd in client_data:
-        all_identities.update(cd["label_map"].keys())
-    global_label_map = {ident: i
-                        for i, ident in enumerate(sorted(all_identities))}
-    num_classes = len(global_label_map)
-
-    for cd in client_data:
-        local_to_ident = {v: k for k, v in cd["label_map"].items()}
-        cd["train_samples"] = [
-            (path, global_label_map[local_to_ident[local_lab]])
-            for path, local_lab in cd["train_samples"]
-        ]
-        cd["label_map"]   = {ident: global_label_map[ident]
-                              for ident in cd["label_map"]}
-        cd["num_classes"] = num_classes
-
-    print(f"  Global label map : {num_classes} unique training IDs "
-          f"(~{num_classes_per_client} per client, disjoint)")
+    # Local label mapping (0..num_classes-1 per client) — correct for our method.
+    # ArcFace is local and never sent back from the server, so each client
+    # must train a fully-dense head. Global label mapping would create a
+    # 156-class head where 130 rows stay random throughout — permanent noise
+    # in the softmax denominator that degrades the embedding space.
+    # Global mapping is only beneficial when the assembled global ArcFace is
+    # distributed back to all clients each round (FedPalm anchor model).
 
     # ── Step 0b: initialise server ────────────────────────────────────────
     print("Initialising server …")
