@@ -121,23 +121,32 @@ class FLClient:
 
     # ── weight management ───────────────────────────────────────────────────
 
-    def set_weights(self, backbone_state_dict):
+    def set_weights(self, state_dict):
         """
-        Load global backbone weights into local model.
-        ArcFace head (arc.*) is never in backbone_state_dict and is
-        therefore preserved unchanged — local identity prototypes are kept.
+        Load aggregated global weights into local model.
+        Includes ArcFace (arc.*) — after FedAvg with global labels each row
+        maps to a unique identity trained by exactly one client, so the
+        aggregated ArcFace is coherent and well-trained across all 156 rows.
         """
         local_state = self.model.state_dict()
-        for key, val in backbone_state_dict.items():
+        for key, val in state_dict.items():
             if key in local_state and local_state[key].shape == val.shape:
                 local_state[key] = val.clone()
         self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """Return backbone weights for FedAvg — ArcFace head excluded."""
+        """
+        Return all model weights for FedAvg — including ArcFace (arc.*).
+        With global labels, each client trains a disjoint subset of ArcFace
+        rows (26 out of 156). FedAvg assembles the complete 156-row matrix
+        from all clients' partial contributions — identical to FedPalm.
+        ArcFace is not used at evaluation (get_embedding uses backbone only),
+        so sharing it has no effect on inference but improves training signal:
+        each client's backbone is trained against all 156 prototypes, not
+        just its own 26, producing richer identity discrimination gradients.
+        """
         return {k: v.cpu().clone()
-                for k, v in self.model.state_dict().items()
-                if not k.startswith("arc.")}
+                for k, v in self.model.state_dict().items()}
 
     # ── local training ──────────────────────────────────────────────────────
 
@@ -310,13 +319,12 @@ class FLServer:
               f"gallery: {len(gallery_samples)}  probe: {len(probe_samples)}")
 
     def get_global_weights(self):
-        """Return backbone weights only (arc.* excluded)."""
+        """Return all global model weights including ArcFace."""
         return {k: v.cpu().clone()
-                for k, v in self.global_model.state_dict().items()
-                if not k.startswith("arc.")}
+                for k, v in self.global_model.state_dict().items()}
 
     def aggregate(self, client_weight_dicts):
-        """FedAvg on backbone parameters only — arc.* never aggregated."""
+        """FedAvg on all parameters including ArcFace."""
         n        = len(client_weight_dicts)
         avg_dict = {}
         for key in client_weight_dicts[0].keys():
@@ -459,25 +467,26 @@ def main():
           f"Probe : {len(probe_samples)}\n")
 
     # ── Global label remapping ────────────────────────────────────────────
-    # Each client receives LOCAL labels 0..n_client-1 from build_federated_splits.
-    # Client 0's "label 5" and client 1's "label 5" refer to DIFFERENT people.
-    # FedAvg of the backbone is fine (domain-invariant features).
-    # However ArcFace is kept LOCAL per client and never shared, so there
-    # is no FedAvg issue with the identity head.
+    # Each client gets local labels 0..n-1 from build_federated_splits.
+    # ArcFace is now shared via FedAvg (like FedPalm), so all clients must
+    # use the same global integer for the same identity. Without this, FedAvg
+    # would average unrelated identity prototypes at the same row index.
     #
-    # We still apply a global label map for correctness and future-proofing:
-    # if any loss or metric ever compares labels across clients (e.g. SupCon
-    # in a multi-client batch), the integers must refer to unique identities.
+    # With global labels: client 0 trains rows 0–25, client 1 trains rows
+    # 26–51, ..., client 5 trains rows 130–155. FedAvg assembles the full
+    # 156-row ArcFace from each client's disjoint contribution. Each row is
+    # trained by exactly one client — no averaging of unrelated prototypes.
     #
-    # label_map in client_data: {identity_string: local_int}
-    # We build a global sorted map {identity_string: global_int} and remap
-    # each client's train_samples accordingly.
+    # At evaluation, get_embedding() uses only the backbone — ArcFace is
+    # never called. Sharing it costs nothing at inference and improves the
+    # training signal: the backbone is optimised against all 156 prototypes
+    # simultaneously, learning richer inter-identity discrimination.
     all_identities = set()
     for cd in client_data:
         all_identities.update(cd["label_map"].keys())
     global_label_map = {ident: i
                         for i, ident in enumerate(sorted(all_identities))}
-    num_classes = len(global_label_map)          # total unique training IDs
+    num_classes = len(global_label_map)
 
     for cd in client_data:
         local_to_ident = {v: k for k, v in cd["label_map"].items()}
@@ -485,12 +494,12 @@ def main():
             (path, global_label_map[local_to_ident[local_lab]])
             for path, local_lab in cd["train_samples"]
         ]
-        cd["label_map"]    = {ident: global_label_map[ident]
-                               for ident in cd["label_map"]}
-        cd["num_classes"]  = num_classes         # uniform across all clients
+        cd["label_map"]   = {ident: global_label_map[ident]
+                              for ident in cd["label_map"]}
+        cd["num_classes"] = num_classes
 
     print(f"  Global label map : {num_classes} unique training IDs "
-          f"(was {num_classes_per_client} per client)")
+          f"(~{num_classes_per_client} per client, disjoint)")
 
     # ── Step 0b: initialise server ────────────────────────────────────────
     print("Initialising server …")
@@ -513,19 +522,16 @@ def main():
     cfg["_n_clients"] = list(range(n_clients))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
-    # Validate that a saved checkpoint was built with the same num_classes.
-    # After the global label map change, arc.weight is [num_classes×512].
-    # If the checkpoint has a different shape, it is stale — delete and
-    # regenerate so all clients start from a consistent shared init.
+    # Validate arc.weight shape — if the checkpoint predates global label map
+    # (shape [26,512]) but current model expects [156,512], regenerate.
     if os.path.exists(init_weights_path):
-        init_state  = torch.load(init_weights_path, map_location=device)
-        ckpt_arc    = init_state.get("arc.weight", None)
-        model_arc   = server.global_model.state_dict()["arc.weight"]
-        shape_ok    = (ckpt_arc is not None and ckpt_arc.shape == model_arc.shape)
-        if not shape_ok:
-            print(f"\nInit weights at {init_weights_path} have stale shape "
-                  f"(arc.weight {tuple(ckpt_arc.shape) if ckpt_arc is not None else 'missing'} "
-                  f"vs current {tuple(model_arc.shape)}) — regenerating.")
+        _probe     = torch.load(init_weights_path, map_location="cpu")
+        _ckpt_arc  = _probe.get("arc.weight", None)
+        _model_arc = server.global_model.state_dict()["arc.weight"]
+        if _ckpt_arc is None or _ckpt_arc.shape != _model_arc.shape:
+            print(f"\nInit weights shape mismatch "
+                  f"(arc.weight {tuple(_ckpt_arc.shape) if _ckpt_arc is not None else 'missing'} "
+                  f"→ {tuple(_model_arc.shape)}) — regenerating.")
             os.remove(init_weights_path)
 
     if os.path.exists(init_weights_path):
@@ -538,22 +544,15 @@ def main():
             compatible, strict=False)
         if missing:
             print(f"  INFO: {len(missing)} new key(s) not in checkpoint "
-                  f"(initialised from scratch): {missing[:4]}{'...' if len(missing)>4 else ''}")
-        if unexpected:
-            print(f"  INFO: {len(unexpected)} key(s) in checkpoint not in "
-                  f"current model (ignored): {unexpected[:4]}")
-        backbone_init = {k: v for k, v in init_state.items()
-                         if not k.startswith("arc.")}
+                  f"(fresh init): {missing[:4]}{'...' if len(missing)>4 else ''}")
         for client in clients:
-            client.set_weights(backbone_init)
+            client.set_weights(init_state)
         print("  Initial weights loaded.")
     else:
         print(f"\nSaving initial weights to: {init_weights_path}")
         torch.save(server.global_model.state_dict(), init_weights_path)
-        backbone_init = {k: v for k, v in server.global_model.state_dict().items()
-                         if not k.startswith("arc.")}
         for client in clients:
-            client.set_weights(backbone_init)
+            client.set_weights(server.global_model.state_dict())
         print("  Initial weights saved.")
 
     # ── results file ──────────────────────────────────────────────────────
