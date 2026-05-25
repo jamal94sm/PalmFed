@@ -121,18 +121,20 @@ class FLClient:
 
     # ── weight management ───────────────────────────────────────────────────
 
-    def set_weights(self, state_dict):
-        """Load global backbone weights — ArcFace excluded (kept local)."""
+    def set_weights(self, backbone_state_dict):
+        """
+        Load global backbone weights into local model.
+        ArcFace head (arc.*) is never in backbone_state_dict and is
+        therefore preserved unchanged — local identity prototypes are kept.
+        """
         local_state = self.model.state_dict()
-        for key, val in state_dict.items():
-            if key.startswith("arc."):
-                continue
+        for key, val in backbone_state_dict.items():
             if key in local_state and local_state[key].shape == val.shape:
                 local_state[key] = val.clone()
         self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """Return backbone weights for FedAvg — ArcFace excluded."""
+        """Return backbone weights for FedAvg — ArcFace head excluded."""
         return {k: v.cpu().clone()
                 for k, v in self.model.state_dict().items()
                 if not k.startswith("arc.")}
@@ -484,37 +486,38 @@ def main():
     cfg["_n_clients"] = list(range(n_clients))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
-    # Validate arc.weight shape — if the checkpoint predates global label map
-    # (shape [26,512]) but current model expects [156,512], regenerate.
+    # Validate arc.weight shape — if checkpoint was saved with a different
+    # num_classes (e.g. during global-label-map experiments), regenerate.
     if os.path.exists(init_weights_path):
-        _probe     = torch.load(init_weights_path, map_location="cpu")
-        _ckpt_arc  = _probe.get("arc.weight", None)
-        _model_arc = server.global_model.state_dict()["arc.weight"]
-        if _ckpt_arc is None or _ckpt_arc.shape != _model_arc.shape:
-            print(f"\nInit weights shape mismatch "
-                  f"(arc.weight {tuple(_ckpt_arc.shape) if _ckpt_arc is not None else 'missing'} "
-                  f"→ {tuple(_model_arc.shape)}) — regenerating.")
+        _probe    = torch.load(init_weights_path, map_location="cpu")
+        _ckpt_arc = _probe.get("arc.weight", None)
+        _mod_arc  = server.global_model.state_dict()["arc.weight"]
+        if _ckpt_arc is None or _ckpt_arc.shape != _mod_arc.shape:
+            print(f"\nInit weights arc.weight shape mismatch "
+                  f"({tuple(_ckpt_arc.shape) if _ckpt_arc is not None else 'missing'} "
+                  f"→ {tuple(_mod_arc.shape)}) — regenerating.")
             os.remove(init_weights_path)
 
     if os.path.exists(init_weights_path):
         print(f"\nLoading existing initial weights from: {init_weights_path}")
-        init_state  = torch.load(init_weights_path, map_location=device)
-        model_state = server.global_model.state_dict()
-        compatible  = {k: v for k, v in init_state.items()
-                       if k in model_state and model_state[k].shape == v.shape}
+        init_state = torch.load(init_weights_path, map_location=device)
         missing, unexpected = server.global_model.load_state_dict(
-            compatible, strict=False)
+            init_state, strict=False)
         if missing:
             print(f"  INFO: {len(missing)} new key(s) not in checkpoint "
                   f"(fresh init): {missing[:4]}{'...' if len(missing)>4 else ''}")
+        backbone_init = {k: v for k, v in init_state.items()
+                         if not k.startswith("arc.")}
         for client in clients:
-            client.set_weights(init_state)   # set_weights skips arc.* automatically
+            client.set_weights(backbone_init)
         print("  Initial weights loaded.")
     else:
         print(f"\nSaving initial weights to: {init_weights_path}")
         torch.save(server.global_model.state_dict(), init_weights_path)
+        backbone_init = {k: v for k, v in server.global_model.state_dict().items()
+                         if not k.startswith("arc.")}
         for client in clients:
-            client.set_weights(server.global_model.state_dict())  # backbone only
+            client.set_weights(backbone_init)
         print("  Initial weights saved.")
 
     # ── results file ──────────────────────────────────────────────────────
