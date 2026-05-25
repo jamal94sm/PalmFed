@@ -68,13 +68,12 @@ from datasets import (build_federated_splits, build_federated_splits_xjtu,
                       PalmDataset, NormSingleROI)
 from utils import compute_eer
 
-# ── FedPalm model — import directly to avoid conflict with local models.py ──
-# Copy compnet_original.py from the FedPalm repo into your project root,
-# then import it as a top-level module.
-from compnet_original import compnet_fedpalm
+
+# ── FedPalm model (verbatim from original paper repo) ─────────
+from model_fedpalm import compnet_fedpalm
 
 # ── FedPalm loss (verbatim from original paper repo) ──────────
-from loss import SupConLoss
+from loss_fedpalm import SupConLoss
 
 
 # ══════════════════════════════════════════════════════════════
