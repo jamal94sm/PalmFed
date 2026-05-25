@@ -68,11 +68,13 @@ from datasets import (build_federated_splits, build_federated_splits_xjtu,
                       PalmDataset, NormSingleROI)
 from utils import compute_eer
 
-# ── FedPalm model (verbatim from original paper repo) ─────────
-from model_fedpalm import compnet_fedpalm
+# ── FedPalm model — import directly to avoid conflict with local models.py ──
+# Copy compnet_original.py from the FedPalm repo into your project root,
+# then import it as a top-level module.
+from compnet_original import compnet_fedpalm
 
 # ── FedPalm loss (verbatim from original paper repo) ──────────
-from loss_fedpalm import SupConLoss
+from loss import SupConLoss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -311,7 +313,47 @@ def evaluate_split(embedding_fn, gallery_loader, probe_loader, device):
 
 # ── three embedding functions (one per evaluation mode) ───────
 
-def emb_global(server_model, x):
+@torch.no_grad()
+def score_statistics(embedding_fn, gallery_loader, probe_loader, device):
+    """
+    Compute genuine vs impostor cosine similarity statistics.
+    If genuine mean drops over rounds → backbone is diverging.
+    """
+    gal_f, gal_l = extract(embedding_fn, gallery_loader, device)
+    prb_f, prb_l = extract(embedding_fn, probe_loader,   device)
+    sim = np.nan_to_num(prb_f @ gal_f.T, nan=0.0)
+
+    genuine, impostor = [], []
+    for i in range(len(prb_f)):
+        for j in range(len(gal_f)):
+            (genuine if prb_l[i] == gal_l[j] else impostor).append(sim[i, j])
+
+    genuine  = np.array(genuine)
+    impostor = np.array(impostor)
+    return (genuine.mean(),  genuine.std(),
+            impostor.mean(), impostor.std())
+
+
+@torch.no_grad()
+def backbone_weight_norm(model):
+    """L2 norm of fc_brand (the identity-projection layer) weights."""
+    return model.fc_brand.weight.data.norm().item()
+
+
+@torch.no_grad()
+def arcface_weight_drift(models):
+    """
+    Max pairwise cosine distance between clients' ArcFace weight matrices.
+    High drift = clients' identity spaces have diverged significantly.
+    Zero would mean all ArcFace heads are identical (no personalisation).
+    """
+    ws = [F.normalize(m.arclayer_brand.weight.data.view(-1), p=2, dim=0)
+          for m in models]
+    dists = []
+    for i in range(len(ws)):
+        for j in range(i+1, len(ws)):
+            dists.append((1 - (ws[i] * ws[j]).sum()).item())
+    return max(dists) if dists else 0.0
     """(a) Global model: aggregated anchor Φ only."""
     server_model.eval()
     _, fe, _ = server_model(x, None, None)
@@ -446,15 +488,38 @@ def main():
                 f"{'LocalAvg EER':>14}\t{'LocalAvg R1':>12}\t"
                 f"{'Full EER':>10}\t{'Full R1':>8}\n")
 
+    # ── Round 0: true random-init baseline ──────────────────
+    print("\n--- Round 0 (random init) ---")
+    server_model.eval()
+    g0_eer, g0_r1 = evaluate_split(
+        lambda x: emb_global(server_model, x),
+        gallery_loader, probe_loader, device)
+    gm, gs, im, is_ = score_statistics(
+        lambda x: emb_global(server_model, x),
+        gallery_loader, probe_loader, device)
+    print(f"  Global init  EER={g0_eer*100:.4f}%  Rank-1={g0_r1:.2f}%")
+    print(f"  Score stats  genuine={gm:.4f}\u00b1{gs:.4f}  "
+          f"impostor={im:.4f}\u00b1{is_:.4f}  sep={gm-im:.4f}")
+    print(f"  fc_brand norm: {backbone_weight_norm(server_model):.4f}")
+    server_model.train()
+
     recent_global = []
 
     # ── 5. FL rounds ─────────────────────────────────────────
     for rnd in range(1, cfg["n_rounds"] + 1):
         t0 = time.time()
 
-        # Step 1: local training per client
-        round_losses = []
+        # Step 1: local training per client — fix train/eval modes
+        round_losses, round_accs = [], []
         for i in range(n_clients):
+            # set correct modes explicitly before each client
+            local_models[i].train()
+            anchor_models[i].train()
+            for j in range(n_clients):
+                if j != i:
+                    local_models[j].eval()
+                    anchor_models[j].eval()
+
             others = [local_models[j] for j in range(n_clients) if j != i]
             loss, acc = train_one_round(
                 local_models[i], anchor_models[i], others,
@@ -463,6 +528,7 @@ def main():
             local_scheds[i].step()
             anchor_scheds[i].step()
             round_losses.append(loss)
+            round_accs.append(acc)
 
         # Step 2: FedAvg of anchor models only
         server_model, anchor_models = fedavg_anchors(server_model,
@@ -496,13 +562,38 @@ def main():
         if len(recent_global) > cfg["avg_last_rounds"]:
             recent_global.pop(0)
 
+        # ── Diagnostics ───────────────────────────────────────
         avg_loss = sum(round_losses) / len(round_losses)
+        avg_acc  = sum(round_accs)  / len(round_accs)
         ts = time.strftime("%H:%M:%S")
+
+        # per-client training accuracy — rising fast = memorising local IDs
+        acc_str = "  ".join(f"c{i}:{round_accs[i]:.0f}%"
+                             for i in range(n_clients))
+
+        # genuine/impostor separation — drop = backbone diverging
+        gm, gs, im, is_ = score_statistics(
+            lambda x: emb_global(server_model, x),
+            gallery_loader, probe_loader, device)
+
+        # ArcFace divergence across clients — diagnoses ID-space conflict
+        arc_drift = arcface_weight_drift(local_models)
+
+        # backbone projection norms
+        fc_norms = "  ".join(f"c{i}:{backbone_weight_norm(local_models[i]):.3f}"
+                              for i in range(n_clients))
+
         print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
-              f"loss={avg_loss:.4f}  ({elapsed:.1f}s)\n"
-              f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%\n"
-              f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%\n"
-              f"  Full FedPalm EER={fp_eer*100:.4f}%  Rank-1={fp_r1:.2f}%")
+              f"loss={avg_loss:.4f}  acc={avg_acc:.1f}%  ({elapsed:.1f}s)")
+        print(f"  Per-client acc     : {acc_str}")
+        print(f"  Score sep (gen-imp): {gm-im:.4f}  "
+              f"gen={gm:.4f}\u00b1{gs:.4f}  imp={im:.4f}\u00b1{is_:.4f}")
+        print(f"  ArcFace drift      : {arc_drift:.4f}  "
+              f"(high = ID-space divergence between clients)")
+        print(f"  fc_brand norms     : {fc_norms}")
+        print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
+        print(f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
+        print(f"  Full FedPalm EER={fp_eer*100:.4f}%  Rank-1={fp_r1:.2f}%")
 
         with open(results_path, "a") as f:
             f.write(f"{rnd:>6}\t"
