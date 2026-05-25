@@ -70,6 +70,18 @@ CONFIG = {
     "n_experts"        : 6,      # number of domain experts (= n_clients)
     "lora_rank"        : 64,     # expert bottleneck rank
 
+    # ── GRL ─────────────────────
+    "use_grl"          : True,  # True → domain adversarial training (GRL)
+    "lambda_grl"       : 0.1,   # GRL loss weight (start small, e.g. 0.05–0.2)
+    "n_domains"        : 6,     # number of domains = n_clients (6 CASIA-MS, 4 XJTU)
+    # GRL shares domain_classifier via FedAvg alongside backbone.
+    # domain_ids come from the 3-tuple batch — own domain (aug_idx=0) and
+    # donor domain (aug_idx≥1) — so all 6 domains appear in every client's
+    # batch after FFT augmentation, giving the GRL meaningful cross-domain signal.
+
+
+
+    
     # CrossEntropy + ArcFace is always active for all models.
     #
     # Style Consistency Loss — CompNet and DINOv2:
