@@ -25,7 +25,6 @@ from datasets import (PalmDataset, AugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
 from utils    import (extract_style_template, evaluate_model,
-                      predict_probe_domain_ids,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
@@ -135,13 +134,10 @@ class FLClient:
         self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """Return backbone weights for FedAvg — ArcFace head excluded.
-        MoE weights (fc.gate.*, fc.experts.*) excluded when share_moe=False."""
-        share_moe = self.cfg.get("share_moe", True)
+        """Return backbone weights for FedAvg — ArcFace head excluded."""
         return {k: v.cpu().clone()
                 for k, v in self.model.state_dict().items()
-                if not k.startswith("arc.")
-                and (share_moe or not k.startswith("fc."))}
+                if not k.startswith("arc.")}
 
     # ── local training ──────────────────────────────────────────────────────
 
@@ -183,8 +179,7 @@ class FLClient:
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
-                                           grayscale=grayscale,
-                                           client_id=self.client_id)
+                                           grayscale=grayscale)
 
         elif model_name == "ccnet":
             # For CCNet, active_style_bank controls FFT on paired views too.
@@ -230,13 +225,10 @@ class FLClient:
             if model_name in ("compnet", "dinov2"):
                 avg_loss, accuracy = train_compnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device,
-                    center_loss         = self.center_loss,
-                    center_optimizer    = self.center_optimizer,
-                    lambda_center       = lambda_c,
-                    lambda_style        = self.cfg.get("lambda_style", 0.0),
-                    lambda_load_balance = self.cfg.get("lambda_load_balance", 0.0)
-                                          if self.cfg.get("use_moe", False)
-                                          else 0.0,
+                    center_loss      = self.center_loss,
+                    center_optimizer = self.center_optimizer,
+                    lambda_center    = lambda_c,
+                    lambda_style     = self.cfg.get("lambda_style", 0.0),
                 )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
@@ -335,13 +327,11 @@ class FLServer:
         global_state.update(avg_dict)
         self.global_model.load_state_dict(global_state)
 
-    def evaluate(self, gal_domain_ids=None, prb_domain_ids=None):
-        """Evaluate global model. Pass pre-computed domain IDs for MoE routing."""
+    def evaluate(self):
+        """Evaluate global model on the shared gallery and probe sets."""
         return evaluate_model(
             self.global_model,
-            self.gallery_loader, self.probe_loader, self.device,
-            gal_domain_ids=gal_domain_ids,
-            prb_domain_ids=prb_domain_ids)
+            self.gallery_loader, self.probe_loader, self.device)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -460,13 +450,47 @@ def main():
         print(f"  Splits saved to: {splits_path}")
         client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
 
-    num_classes = client_data[0]["num_classes"]
+    num_classes_per_client = client_data[0]["num_classes"]
     n_clients   = len(client_data)
     print(f"\n  Clients        : {n_clients}  ({domain_names})")
-    print(f"  IDs per client : {num_classes}")
+    print(f"  IDs per client : {num_classes_per_client}")
     print(f"  Test  classes  : {len(test_label_map)}")
     print(f"  Gallery        : {len(gallery_samples)}  "
           f"Probe : {len(probe_samples)}\n")
+
+    # ── Global label remapping ────────────────────────────────────────────
+    # Each client receives LOCAL labels 0..n_client-1 from build_federated_splits.
+    # Client 0's "label 5" and client 1's "label 5" refer to DIFFERENT people.
+    # FedAvg of the backbone is fine (domain-invariant features).
+    # However ArcFace is kept LOCAL per client and never shared, so there
+    # is no FedAvg issue with the identity head.
+    #
+    # We still apply a global label map for correctness and future-proofing:
+    # if any loss or metric ever compares labels across clients (e.g. SupCon
+    # in a multi-client batch), the integers must refer to unique identities.
+    #
+    # label_map in client_data: {identity_string: local_int}
+    # We build a global sorted map {identity_string: global_int} and remap
+    # each client's train_samples accordingly.
+    all_identities = set()
+    for cd in client_data:
+        all_identities.update(cd["label_map"].keys())
+    global_label_map = {ident: i
+                        for i, ident in enumerate(sorted(all_identities))}
+    num_classes = len(global_label_map)          # total unique training IDs
+
+    for cd in client_data:
+        local_to_ident = {v: k for k, v in cd["label_map"].items()}
+        cd["train_samples"] = [
+            (path, global_label_map[local_to_ident[local_lab]])
+            for path, local_lab in cd["train_samples"]
+        ]
+        cd["label_map"]    = {ident: global_label_map[ident]
+                               for ident in cd["label_map"]}
+        cd["num_classes"]  = num_classes         # uniform across all clients
+
+    print(f"  Global label map : {num_classes} unique training IDs "
+          f"(was {num_classes_per_client} per client)")
 
     # ── Step 0b: initialise server ────────────────────────────────────────
     print("Initialising server …")
@@ -481,11 +505,11 @@ def main():
             spectrum      = cd["spectrum"],
             train_samples = cd["train_samples"],
             label_map     = cd["label_map"],
-            num_classes   = cd["num_classes"],
+            num_classes   = num_classes,
             cfg           = cfg,
             device        = device,
         ))
-    # expose n_clients so local_train can auto-set M when use_moe=True
+    # expose n_clients count
     cfg["_n_clients"] = list(range(n_clients))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
@@ -558,37 +582,9 @@ def main():
         print("  Spatial augmentation only — style bank extracted "
               "but not used during training.\n")
 
-    # ── Pre-compute FFT domain descriptors (MoE inference only) ──────────
-    # FFT amplitude is pixel-level and model-independent — extracted once,
-    # reused for all rounds. gallery domain_ids come from splits (known);
-    # probe domain_ids are predicted via nearest-neighbour FFT matching.
-    moe_gal_domain_ids = None
-    moe_prb_domain_ids = None
-    if cfg.get("use_moe", False) and model_key == "compnet":
-        gal_domain_ids_known = server.gallery_loader.dataset.get_domain_ids()
-        if gal_domain_ids_known is not None:
-            moe_gal_domain_ids = gal_domain_ids_known
-            prb_domain_ids_gt  = server.probe_loader.dataset.get_domain_ids()
-            moe_prb_domain_ids = predict_probe_domain_ids(
-                server.probe_loader.dataset.get_paths(),
-                server.gallery_loader.dataset.get_paths(),
-                moe_gal_domain_ids,
-                cfg["img_side"],
-                beta=0.1,   # hard-crop low-freq patch, Mahalanobis matching
-                probe_domain_ids_gt=prb_domain_ids_gt,
-            )
-            print(f"  MoE domain IDs cached — "
-                  f"gallery: {len(moe_gal_domain_ids)}  "
-                  f"probe: {len(moe_prb_domain_ids)}\n")
-        else:
-            print("  [MoE] splits.pkl predates domain_id — "
-                  "delete splits.pkl and rerun to enable expert routing.\n")
-
     # ── Round 0: random init evaluation ──────────────────────────────────
     print("\n--- Round 0 (random init) ---")
-    g_eer_0, g_rank1_0 = server.evaluate(
-        gal_domain_ids=moe_gal_domain_ids,
-        prb_domain_ids=moe_prb_domain_ids)
+    g_eer_0, g_rank1_0 = server.evaluate()
     print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
     with open(results_path, "a") as f:
         f.write(f"0\tInit\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
@@ -620,9 +616,7 @@ def main():
             c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
-                device,
-                gal_domain_ids = moe_gal_domain_ids,
-                prb_domain_ids = moe_prb_domain_ids)
+                device)
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -635,9 +629,7 @@ def main():
 
         # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
-        g_eer, g_rank1 = server.evaluate(
-            gal_domain_ids=moe_gal_domain_ids,
-            prb_domain_ids=moe_prb_domain_ids)
+        g_eer, g_rank1 = server.evaluate()
         elapsed = time.time() - t_start
 
         # keep a rolling window for final average reporting
@@ -688,4 +680,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
