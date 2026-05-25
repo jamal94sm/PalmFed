@@ -72,7 +72,7 @@ CONFIG = {
 
     # ── GRL ─────────────────────
     "use_grl"          : True,  # True → domain adversarial training (GRL)
-    "lambda_grl"       : 1,   # GRL loss weight (start small, e.g. 0.05–0.2)
+    "lambda_grl"       : 0.3,   # GRL loss weight (start small, e.g. 0.05–0.2)
     "n_domains"        : 6,     # number of domains = n_clients (6 CASIA-MS, 4 XJTU)
     # GRL shares domain_classifier via FedAvg alongside backbone.
     # domain_ids come from the 3-tuple batch — own domain (aug_idx=0) and
