@@ -68,13 +68,13 @@ from datasets import (build_federated_splits, build_federated_splits_xjtu,
                       PalmDataset, NormSingleROI)
 from utils import compute_eer
 
-
-# ── FedPalm model (verbatim from original paper repo) ─────────
-from model_fedpalm import compnet_fedpalm
+# ── FedPalm model — import directly to avoid conflict with local models.py ──
+# Copy compnet_original.py from the FedPalm repo into your project root,
+# then import it as a top-level module.
+from compnet_original import compnet_fedpalm
 
 # ── FedPalm loss (verbatim from original paper repo) ──────────
-from loss_fedpalm import SupConLoss
-
+from loss import SupConLoss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -85,16 +85,18 @@ class FedPalmDataset(Dataset):
     """
     Paired dataset for FedPalm contrastive training with M-fold augmentation.
 
-    The virtual dataset has M×N entries:
-      aug_idx=0 → original sample  (resize + normalise only)
-      aug_idx=1 → augmented sample (spatial aug + normalise)
-    Both are treated as independent samples — matching the proposed method's
-    FFTAugmentedDataset where FFT-styled copies are treated as originals.
+    Virtual dataset has M×N entries — each original sample appears M times
+    per epoch, each time with independently sampled random spatial augmentation.
+    This doubles (M=2) the effective dataset size to match the proposed method's
+    FFTAugmentedDataset M=2, making the comparison fair.
 
-    For each idx, [img1, img2] are drawn from the M×N pool:
-      img1 — current entry (original or augmented based on its aug_idx)
-      img2 — random entry from same identity (original or augmented)
-    Either or both views can be original or augmented — no constraint.
+    Both img1 and img2 are always spatially augmented — matching the original
+    FedPalm MyDataset_general_FL which applies the same augmentation pipeline
+    to every sample unconditionally.
+
+    Returns ([img1, img2], label):
+      img1 — spatially augmented view of sample i
+      img2 — spatially augmented view of a sample from the same identity
     """
     def __init__(self, samples, img_side=128, M=1):
         self.samples  = samples
@@ -107,15 +109,7 @@ class FedPalmDataset(Dataset):
             for m in range(M):
                 self.label2idxs[lab].append(i * M + m)
 
-        # original: resize + normalise only (no random aug)
-        self.transform_orig = T.Compose([
-            T.Resize(img_side),
-            T.ToTensor(),
-            NormSingleROI(outchannels=1),
-        ])
-
-        # augmented: spatial aug + normalise
-        self.transform_aug = T.Compose([
+        self.transforms = T.Compose([
             T.Resize(img_side),
             T.RandomChoice([
                 T.ColorJitter(brightness=0, contrast=0.05,
@@ -137,27 +131,15 @@ class FedPalmDataset(Dataset):
     def __len__(self):
         return len(self.samples) * self.M
 
-    def _load(self, path, augment):
-        """Load image with or without spatial augmentation."""
-        img = Image.open(path).convert("L")
-        return self.transform_aug(img) if augment else self.transform_orig(img)
+    def _load(self, path):
+        return self.transforms(Image.open(path).convert("L"))
 
     def __getitem__(self, idx):
         sample_idx  = idx // self.M
-        aug_idx     = idx  % self.M
         path, label = self.samples[sample_idx]
-
-        # img1: original if aug_idx=0, spatially augmented if aug_idx≥1
-        img1 = self._load(path, augment=(aug_idx > 0))
-
-        # img2: drawn from full M×N pool of same identity
-        # — can be original (aug_idx2=0) or augmented (aug_idx2≥1)
-        idx2     = random.choice(self.label2idxs[label])
-        aug_idx2 = idx2 % self.M
-        path2, _ = self.samples[idx2 // self.M]
-        img2     = self._load(path2, augment=(aug_idx2 > 0))
-
-        return [img1, img2], label
+        idx2        = random.choice(self.label2idxs[label])
+        path2, _    = self.samples[idx2 // self.M]
+        return [self._load(path), self._load(path2)], label
 
 
 # ══════════════════════════════════════════════════════════════
