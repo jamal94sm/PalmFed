@@ -358,6 +358,13 @@ def arcface_weight_drift(models):
     return fe                                     # already L2-normed
 
 
+def emb_global(server_model, x):
+    """(a) Global model: aggregated anchor Φ only."""
+    server_model.eval()
+    _, fe, _ = server_model(x, None, None)
+    return fe   # already L2-normed in compnet_fedpalm
+
+
 def emb_local_avg(local_models, x):
     """(b) Local-average: mean embedding across all personalized experts."""
     for m in local_models:
@@ -575,7 +582,6 @@ def main():
             gallery_loader, probe_loader, device)
 
         # ArcFace divergence across clients — diagnoses ID-space conflict
-        arc_drift = arcface_weight_drift(local_models)
 
         # backbone projection norms
         fc_norms = "  ".join(f"c{i}:{backbone_weight_norm(local_models[i]):.3f}"
@@ -586,8 +592,6 @@ def main():
         print(f"  Per-client acc     : {acc_str}")
         print(f"  Score sep (gen-imp): {gm-im:.4f}  "
               f"gen={gm:.4f}\u00b1{gs:.4f}  imp={im:.4f}\u00b1{is_:.4f}")
-        print(f"  ArcFace drift      : {arc_drift:.4f}  "
-              f"(high = ID-space divergence between clients)")
         print(f"  fc_brand norms     : {fc_norms}")
         print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
         print(f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
