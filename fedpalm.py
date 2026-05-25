@@ -313,18 +313,24 @@ def evaluate_split(embedding_fn, gallery_loader, probe_loader, device):
 
 def emb_global(server_model, x):
     """(a) Global model: aggregated anchor Φ only."""
+    server_model.eval()
     _, fe, _ = server_model(x, None, None)
     return fe                                     # already L2-normed
 
 
 def emb_local_avg(local_models, x):
     """(b) Local-average: mean embedding across all personalized experts."""
+    for m in local_models:
+        m.eval()
     fes = torch.stack([m(x, None, None)[1] for m in local_models])
     return F.normalize(fes.mean(dim=0), p=2, dim=1)
 
 
 def emb_full(server_model, local_models, x):
     """(c) Full FedPalm: w_anch×Φ(x) + w_side×TEIM({θ_k(x)})."""
+    server_model.eval()
+    for m in local_models:
+        m.eval()
     w_anch = cfg["teim_blend_anchor"]
     w_side = cfg["teim_blend_side"]
     _, fe_anch, _ = server_model(x, None, None)
@@ -480,6 +486,11 @@ def main():
             fp_eer, fp_r1 = evaluate_split(
                 lambda x: emb_full(server_model, local_models, x),
                 gallery_loader, probe_loader, device)
+
+        # restore train mode for next round
+        server_model.train()
+        for m in local_models + anchor_models:
+            m.train()
 
         recent_global.append((g_eer, g_r1))
         if len(recent_global) > cfg["avg_last_rounds"]:
