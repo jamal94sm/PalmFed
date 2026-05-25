@@ -71,7 +71,7 @@ CONFIG = {
     "lora_rank"        : 64,     # expert bottleneck rank
 
     # ── GRL ─────────────────────
-    "use_grl"          : True,  # True → domain adversarial training (GRL)
+    "use_grl"          : False,  # True → domain adversarial training (GRL)
     "lambda_grl"       : 0.05,   # GRL loss weight (start small, e.g. 0.05–0.2)
     "n_domains"        : 6,     # number of domains = n_clients (6 CASIA-MS, 4 XJTU)
     # GRL shares domain_classifier via FedAvg alongside backbone.
