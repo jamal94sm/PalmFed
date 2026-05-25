@@ -68,11 +68,13 @@ from datasets import (build_federated_splits, build_federated_splits_xjtu,
                       PalmDataset, NormSingleROI)
 from utils import compute_eer
 
-# ── FedPalm model (verbatim from original paper repo) ─────────
-from model_fedpalm import compnet_fedpalm
+# ── FedPalm model — import directly to avoid conflict with local models.py ──
+# Copy compnet_original.py from the FedPalm repo into your project root,
+# then import it as a top-level module.
+from compnet_original import compnet_fedpalm
 
 # ── FedPalm loss (verbatim from original paper repo) ──────────
-from loss_fedpalm import SupConLoss
+from loss import SupConLoss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -196,25 +198,27 @@ def train_one_round(local_model, anchor_model, other_models,
                     loader, local_opt, anchor_opt,
                     criterion, con_criterion, device):
     """
-    One communication round of local training for a single client.
-    Mirrors fit_fedpalm() from the original FedPalm code.
+    One communication round of local training — original FedPalm algorithm.
 
     For each mini-batch (x, x') — two augmented views of same-class pairs:
-      1. local model forward on x  → fe_orig
-      2. other clients' locals on x (frozen) → fes; TEIM → sim_fe
+      1. local model forward on x  → fe_orig (local expert feature)
+      2. other clients' locals on x (frozen, no_grad) → fes
+         TEIM(fe_orig, fes) → sim_fe  (cross-expert routed feature)
       3. anchor model forward on x → ancho_fe
       4. final_fe = w_anch×ancho_fe + w_side×sim_fe
       5. repeat for x' → final_fe'
-      6. L = w1×CE(local) + w2×SupCon([final_fe, final_fe']) + w1×CE(anchor)
-      7. backprop through local_model AND anchor_model jointly
+      6. L = w1×CE(local,y) + w2×SupCon([final_fe,final_fe'],y)
+           + w1×CE(anchor,y)
+      7. backprop through local_model AND anchor_model jointly.
+         Other models are frozen (no_grad) — no gradient flows to them.
     """
     local_model.train()
     anchor_model.train()
     for m in other_models:
         m.eval()
 
-    w1 = cfg["w1"]
-    w2 = cfg["w2"]
+    w1     = cfg["w1"]
+    w2     = cfg["w2"]
     w_anch = cfg["teim_blend_anchor"]
     w_side = cfg["teim_blend_side"]
 
@@ -233,7 +237,7 @@ def train_one_round(local_model, anchor_model, other_models,
         if other_models:
             with torch.no_grad():
                 fes = torch.stack([m(x, None, None)[1]
-                                   for m in other_models])      # [n-1, B, D]
+                                   for m in other_models])   # [n-1, B, D]
             sim_fe = teim(fe_orig, fes)
         else:
             sim_fe = fe_orig
@@ -256,9 +260,9 @@ def train_one_round(local_model, anchor_model, other_models,
         final_fe2 = w_anch * ancho_fe2 + w_side * sim_fe2
 
         # ── losses ──────────────────────────────────────────
-        fe_pair    = torch.stack([final_fe, final_fe2], dim=1) # [B, 2, D]
-        loss_local  = criterion(out_local,  y)
-        loss_anchor = criterion(out_anch,   y)
+        fe_pair     = torch.stack([final_fe, final_fe2], dim=1)  # [B, 2, D]
+        loss_local  = criterion(out_local, y)
+        loss_anchor = criterion(out_anch,  y)
         loss_contra = con_criterion(fe_pair, y)
 
         loss = w1 * loss_local + w2 * loss_contra + w1 * loss_anchor
@@ -446,7 +450,45 @@ def main():
     bs        = cfg["batch_size"]
     nw        = cfg["num_workers"]
 
-    # ── 2. DataLoaders ───────────────────────────────────────
+    # ── 2. Global label remapping ─────────────────────────────
+    # Original FedPalm: num_classes = total training IDs across all clients
+    # (e.g. 378 for PolyU with 8 clients). All models share the same ArcFace
+    # output dimension so FedAvg is well-defined. Each client only trains on
+    # its own ~26 rows; the other rows receive zero gradient from that client.
+    #
+    # Our splits give each client LOCAL labels 0..n_client-1, meaning
+    # client 0's "label 5" and client 1's "label 5" are DIFFERENT people.
+    # FedAvg would incorrectly mix their ArcFace prototypes.
+    #
+    # Fix: create a GLOBAL label map {identity_string: global_int} so that
+    # each unique person gets a unique integer across all clients, then
+    # remap each client's samples accordingly.
+    #
+    # label_map in client_data: {identity_string: local_int}
+    # We build a reverse map (local_int → identity_string) per client,
+    # then assign global integers.
+
+    all_identities = set()
+    for cd in client_data:
+        all_identities.update(cd["label_map"].keys())
+    global_label_map = {ident: i for i, ident in enumerate(sorted(all_identities))}
+    num_classes = len(global_label_map)
+
+    # remap each client's train_samples to global labels
+    for cd in client_data:
+        local_to_ident = {v: k for k, v in cd["label_map"].items()}
+        cd["train_samples"] = [
+            (path, global_label_map[local_to_ident[local_lab]])
+            for path, local_lab in cd["train_samples"]
+        ]
+
+    print(f"\n  Clients        : {n_clients}")
+    print(f"  Total train IDs: {num_classes}  "
+          f"(per-client count: ~{num_classes // n_clients})")
+    print(f"  Gallery        : {len(gallery_samples)}  Probe: {len(probe_samples)}")
+    print(f"  Device         : {device}\n")
+
+    # ── 3. DataLoaders ───────────────────────────────────────
     train_loaders = [
         DataLoader(FedPalmDataset(cd["train_samples"], img_side),
                    batch_size=bs, shuffle=True, num_workers=nw,
@@ -457,13 +499,6 @@ def main():
                                 batch_size=bs, shuffle=False, num_workers=nw)
     probe_loader   = DataLoader(PalmDataset(probe_samples,   img_side),
                                 batch_size=bs, shuffle=False, num_workers=nw)
-
-    # ── 3. Models ────────────────────────────────────────────
-    num_classes  = max(cd["num_classes"] for cd in client_data)
-    print(f"\n  Clients     : {n_clients}")
-    print(f"  num_classes : {num_classes}")
-    print(f"  Gallery     : {len(gallery_samples)}  Probe: {len(probe_samples)}")
-    print(f"  Device      : {device}\n")
 
     server_model  = compnet_fedpalm(num_classes=num_classes).to(device)
     local_models  = [copy.deepcopy(server_model) for _ in range(n_clients)]
