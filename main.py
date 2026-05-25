@@ -513,14 +513,29 @@ def main():
     cfg["_n_clients"] = list(range(n_clients))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
+    # Validate that a saved checkpoint was built with the same num_classes.
+    # After the global label map change, arc.weight is [num_classes×512].
+    # If the checkpoint has a different shape, it is stale — delete and
+    # regenerate so all clients start from a consistent shared init.
+    if os.path.exists(init_weights_path):
+        init_state  = torch.load(init_weights_path, map_location=device)
+        ckpt_arc    = init_state.get("arc.weight", None)
+        model_arc   = server.global_model.state_dict()["arc.weight"]
+        shape_ok    = (ckpt_arc is not None and ckpt_arc.shape == model_arc.shape)
+        if not shape_ok:
+            print(f"\nInit weights at {init_weights_path} have stale shape "
+                  f"(arc.weight {tuple(ckpt_arc.shape) if ckpt_arc is not None else 'missing'} "
+                  f"vs current {tuple(model_arc.shape)}) — regenerating.")
+            os.remove(init_weights_path)
+
     if os.path.exists(init_weights_path):
         print(f"\nLoading existing initial weights from: {init_weights_path}")
-        init_state = torch.load(init_weights_path, map_location=device)
-        # strict=False: allows new architecture keys (e.g. moe.*) that are
-        # absent from a previously saved checkpoint to be initialised from
-        # the freshly built model rather than raising an error.
+        init_state  = torch.load(init_weights_path, map_location=device)
+        model_state = server.global_model.state_dict()
+        compatible  = {k: v for k, v in init_state.items()
+                       if k in model_state and model_state[k].shape == v.shape}
         missing, unexpected = server.global_model.load_state_dict(
-            init_state, strict=False)
+            compatible, strict=False)
         if missing:
             print(f"  INFO: {len(missing)} new key(s) not in checkpoint "
                   f"(initialised from scratch): {missing[:4]}{'...' if len(missing)>4 else ''}")
