@@ -68,11 +68,13 @@ from datasets import (build_federated_splits, build_federated_splits_xjtu,
                       PalmDataset, NormSingleROI)
 from utils import compute_eer
 
-# ── FedPalm model (verbatim from original paper repo) ─────────
-from model_fedpalm import compnet_fedpalm
+# ── FedPalm model — import directly to avoid conflict with local models.py ──
+# Copy compnet_original.py from the FedPalm repo into your project root,
+# then import it as a top-level module.
+from compnet_original import compnet_fedpalm
 
 # ── FedPalm loss (verbatim from original paper repo) ──────────
-from loss_fedpalm import SupConLoss
+from loss import SupConLoss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -367,12 +369,24 @@ def emb_global(server_model, x):
     return fe   # already L2-normed in compnet_fedpalm
 
 
-def emb_local_avg(local_models, x):
-    """(b) Local-average: mean embedding across all personalized experts."""
+def evaluate_local_avg(local_models, gallery_loader, probe_loader, device):
+    """
+    Evaluate each local model independently, then average EER and Rank-1.
+    This is the correct "average performance of local models" metric:
+      avg_EER   = mean(EER_0, EER_1, ..., EER_N)
+      avg_Rank1 = mean(Rank1_0, Rank1_1, ..., Rank1_N)
+
+    Distinct from embedding-level ensemble (averaging embeddings before scoring).
+    """
+    eers, r1s = [], []
     for m in local_models:
         m.eval()
-    fes = torch.stack([m(x, None, None)[1] for m in local_models])
-    return F.normalize(fes.mean(dim=0), p=2, dim=1)
+        eer, r1 = evaluate_split(
+            lambda x, _m=m: _m(x, None, None)[1],
+            gallery_loader, probe_loader, device)
+        eers.append(eer)
+        r1s.append(r1)
+    return sum(eers) / len(eers), sum(r1s) / len(r1s)
 
 
 def emb_full(server_model, local_models, x):
@@ -582,9 +596,8 @@ def main():
                 gallery_loader, probe_loader, device)
 
         if cfg["eval_local_avg"]:
-            la_eer, la_r1 = evaluate_split(
-                lambda x: emb_local_avg(local_models, x),
-                gallery_loader, probe_loader, device)
+            la_eer, la_r1 = evaluate_local_avg(
+                local_models, gallery_loader, probe_loader, device)
 
         if cfg["eval_full"]:
             fp_eer, fp_r1 = evaluate_split(
