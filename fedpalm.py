@@ -68,11 +68,13 @@ from datasets import (build_federated_splits, build_federated_splits_xjtu,
                       PalmDataset, NormSingleROI)
 from utils import compute_eer
 
-# ── FedPalm model (verbatim from original paper repo) ─────────
-from model_fedpalm import compnet_fedpalm
+# ── FedPalm model — import directly to avoid conflict with local models.py ──
+# Copy compnet_original.py from the FedPalm repo into your project root,
+# then import it as a top-level module.
+from compnet_original import compnet_fedpalm
 
 # ── FedPalm loss (verbatim from original paper repo) ──────────
-from loss_fedpalm import SupConLoss
+from loss import SupConLoss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -81,26 +83,39 @@ from loss_fedpalm import SupConLoss
 
 class FedPalmDataset(Dataset):
     """
-    Paired dataset matching MyDataset_general_FL from the original paper.
+    Paired dataset for FedPalm contrastive training with M-fold augmentation.
 
-    Returns ([img_anchor, img_pair], label):
-      img_anchor — spatially augmented view of sample i
-      img_pair   — spatially augmented view of a (possibly same) sample
-                   from the SAME identity (positive pair for SupCon)
+    The virtual dataset has M×N entries:
+      aug_idx=0 → original sample  (resize + normalise only)
+      aug_idx=1 → augmented sample (spatial aug + normalise)
+    Both are treated as independent samples — matching the proposed method's
+    FFTAugmentedDataset where FFT-styled copies are treated as originals.
 
-    Augmentation identical to the original paper's MyDataset_general_FL.
-    Input: list of (path, label_int) tuples from build_federated_splits.
+    For each idx, [img1, img2] are drawn from the M×N pool:
+      img1 — current entry (original or augmented based on its aug_idx)
+      img2 — random entry from same identity (original or augmented)
+    Either or both views can be original or augmented — no constraint.
     """
-    def __init__(self, samples, img_side=128):
+    def __init__(self, samples, img_side=128, M=1):
         self.samples  = samples
         self.img_side = img_side
+        self.M        = M
 
         from collections import defaultdict
         self.label2idxs = defaultdict(list)
         for i, (_, lab) in enumerate(samples):
-            self.label2idxs[lab].append(i)
+            for m in range(M):
+                self.label2idxs[lab].append(i * M + m)
 
-        self.transforms = T.Compose([
+        # original: resize + normalise only (no random aug)
+        self.transform_orig = T.Compose([
+            T.Resize(img_side),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+
+        # augmented: spatial aug + normalise
+        self.transform_aug = T.Compose([
             T.Resize(img_side),
             T.RandomChoice([
                 T.ColorJitter(brightness=0, contrast=0.05,
@@ -120,16 +135,29 @@ class FedPalmDataset(Dataset):
         ])
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) * self.M
 
-    def _load(self, path):
-        return self.transforms(Image.open(path).convert("L"))
+    def _load(self, path, augment):
+        """Load image with or without spatial augmentation."""
+        img = Image.open(path).convert("L")
+        return self.transform_aug(img) if augment else self.transform_orig(img)
 
     def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        idx2   = random.choice(self.label2idxs[label])
-        path2, _ = self.samples[idx2]
-        return [self._load(path), self._load(path2)], label
+        sample_idx  = idx // self.M
+        aug_idx     = idx  % self.M
+        path, label = self.samples[sample_idx]
+
+        # img1: original if aug_idx=0, spatially augmented if aug_idx≥1
+        img1 = self._load(path, augment=(aug_idx > 0))
+
+        # img2: drawn from full M×N pool of same identity
+        # — can be original (aug_idx2=0) or augmented (aug_idx2≥1)
+        idx2     = random.choice(self.label2idxs[label])
+        aug_idx2 = idx2 % self.M
+        path2, _ = self.samples[idx2 // self.M]
+        img2     = self._load(path2, augment=(aug_idx2 > 0))
+
+        return [img1, img2], label
 
 
 # ══════════════════════════════════════════════════════════════
@@ -496,11 +524,13 @@ def main():
     print(f"  Total train IDs: {num_classes}  "
           f"(per-client count: ~{num_classes // n_clients})")
     print(f"  Gallery        : {len(gallery_samples)}  Probe: {len(probe_samples)}")
+    print(f"  Aug multiplier : M={cfg.get('M', 2)} (spatial aug only, no FFT)")
     print(f"  Device         : {device}\n")
 
     # ── 3. DataLoaders ───────────────────────────────────────
+    M         = cfg.get("M", 2)
     train_loaders = [
-        DataLoader(FedPalmDataset(cd["train_samples"], img_side),
+        DataLoader(FedPalmDataset(cd["train_samples"], img_side, M=M),
                    batch_size=bs, shuffle=True, num_workers=nw,
                    pin_memory=True)
         for cd in client_data
