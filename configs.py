@@ -52,7 +52,7 @@ CONFIG = {
     #                 Transfers spectral decay rate (domain-discriminative) only.
     #                 Preserves 2D spatial amplitude structure (identity content).
     #                 Requires extract_radial_template() instead of extract_style_template().
-    "fft_aug_method"      : "radial",  # "amplitude" | "radial"
+    "fft_aug_method"      : "amplitude",  # "amplitude" | "radial"
  
     # FFT donor mode:
     #   False — cross-domain (default): donor templates from OTHER clients.
@@ -62,7 +62,7 @@ CONFIG = {
     #           Ablation: if local_only ≈ cross-domain, the benefit comes from
     #           augmentation volume, not domain transfer. If cross-domain >> local,
     #           the cross-domain style transfer itself is the key contribution.
-    "fft_local_only"      : False,
+    "fft_local_only"      : True,
     # FFT augmentation parameters
     "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
