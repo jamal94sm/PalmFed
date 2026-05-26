@@ -94,6 +94,17 @@ CONFIG = {
     #   No NaN risk — always has exactly one positive pair per sample.
     "lambda_style"     : 1,    # StyleConsistencyLoss weight (0.0 = disabled)
 
+    # ── Supervised Contrastive Loss ────────────────────────────
+    # SupCon operates on the paired embeddings [emb_orig, emb_aug] already
+    # produced by FFTAugmentedDataset. No dataset change needed.
+    # emb_orig = backbone(spatial_aug(fft_styled))
+    # emb_aug  = backbone(spatial_aug(clean))   (when aug_idx≥1)
+    # SupCon pulls same-identity pairs together across the two views,
+    # complementing ArcFace which operates at the classification logit level.
+    "use_supcon"       : True,  # True → add SupCon to training loss
+    "lambda_supcon"    : 0.2,    # SupCon weight (paper uses 0.15–0.2)
+    "temperature"      : 0.07,   # SupCon temperature
+
     # SupConLoss — CCNet only (between paired same-identity views):
     "ce_weight"        : 0.8,    # CE loss weight (CCNet only; CompNet/DINOv2 use 1.0)
     "con_weight"       : 0.2,    # SupConLoss weight (CCNet only)
