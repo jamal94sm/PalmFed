@@ -295,19 +295,19 @@ def fit(local_model, anchor_model, server_model,
         supcon  = con_criterion(fe, y)
         mse     = cri_mse(fe1, fe3.detach())
 
-        # FedProx to global server model
-        w_diff = torch.tensor(0., device=device)
+        # FedProx to global server model (standard: mu/2 * ||θ - Φ||²)
+        w_diff_server = torch.tensor(0., device=device)
         for w, w_t in zip(server_model.parameters(),
                           local_model.parameters()):
-            w_diff += torch.pow(torch.norm(w - w_t), 2)
-        prox_server = mu / 2. * torch.sqrt(w_diff)
+            w_diff_server += torch.pow(torch.norm(w - w_t), 2)
+        prox_server = mu / 2. * w_diff_server
 
         # FedProx to cross-spectrum anchor model
-        w_diff = torch.tensor(0., device=device)
+        w_diff_anchor = torch.tensor(0., device=device)
         for w, w_t in zip(anchor_model.parameters(),
                           local_model.parameters()):
-            w_diff += torch.pow(torch.norm(w - w_t), 2)
-        prox_anchor = mu / 2. * torch.sqrt(w_diff)
+            w_diff_anchor += torch.pow(torch.norm(w - w_t), 2)
+        prox_anchor = mu / 2. * w_diff_anchor
 
         loss = w1 * ce + w2 * supcon + w3 * mse + prox_server + prox_anchor
 
