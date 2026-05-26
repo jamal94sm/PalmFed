@@ -54,7 +54,7 @@ CONFIG = {
     "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
 
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 50,    # R: total communication rounds
+    "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
     # ── Mixture of Experts — CompNet only ─────────────────────
