@@ -233,6 +233,9 @@ class FLClient:
                                        if self.cfg.get("use_grl", False) else 0.0,
                     lambda_load_balance = self.cfg.get("lambda_load_balance", 0.0)
                                          if self.cfg.get("use_moe", False) else 0.0,
+                    lambda_supcon    = self.cfg.get("lambda_supcon", 0.0)
+                                       if self.cfg.get("use_supcon", False) else 0.0,
+                    temperature      = self.cfg.get("temperature", 0.07),
                 )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
