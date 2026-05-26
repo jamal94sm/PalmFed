@@ -93,17 +93,18 @@ from loss_fedpalm import SupConLoss
 class PSFedDataset(Dataset):
     """
     Paired dataset for PSFed-Palm SupCon training with M-fold augmentation.
-    Identical to FedPalmDataset — included here for self-containment.
 
-    Virtual dataset has M×N entries:
-      aug_idx=0 → original  (resize + normalise only)
-      aug_idx≥1 → augmented (spatial aug + normalise)
-    Both treated as independent samples, matching the proposed method's
-    FFTAugmentedDataset where FFT copies are also treated as originals.
+    Virtual dataset has M×N entries — each original sample appears M times
+    per epoch, each time as a spatially augmented view. With M=2 the effective
+    dataset size doubles, matching the proposed method's FFTAugmentedDataset
+    M=2 for fair comparison.
 
-    Returns ([img1, img2], label):
-      img1 — current entry (original or augmented based on aug_idx)
-      img2 — random entry from same identity (original or augmented)
+    Both img1 and img2 are always spatially augmented — matching the original
+    PSFed-Palm MyDataset which applies augmentation unconditionally to all
+    samples. img2 is drawn from any of the M×N virtual entries of the same
+    identity so both original and augmented occurrences can be paired.
+
+    Returns ([img1, img2], label).
     """
     def __init__(self, samples, img_side=128, M=1):
         self.samples  = samples
@@ -115,13 +116,7 @@ class PSFedDataset(Dataset):
             for m in range(M):
                 self.label2idxs[lab].append(i * M + m)
 
-        self.transform_orig = T.Compose([
-            T.Resize(img_side),
-            T.ToTensor(),
-            NormSingleROI(outchannels=1),
-        ])
-
-        self.transform_aug = T.Compose([
+        self.transforms = T.Compose([
             T.Resize(img_side),
             T.RandomChoice([
                 T.ColorJitter(brightness=0, contrast=0.05,
@@ -143,21 +138,17 @@ class PSFedDataset(Dataset):
     def __len__(self):
         return len(self.samples) * self.M
 
-    def _load(self, path, augment):
-        img = Image.open(path).convert("L")
-        return self.transform_aug(img) if augment else self.transform_orig(img)
+    def _load(self, path):
+        return self.transforms(Image.open(path).convert("L"))
 
     def __getitem__(self, idx):
         sample_idx  = idx // self.M
-        aug_idx     = idx  % self.M
         path, label = self.samples[sample_idx]
+        img1        = self._load(path)
 
-        img1 = self._load(path, augment=(aug_idx > 0))
-
-        idx2     = random.choice(self.label2idxs[label])
-        aug_idx2 = idx2 % self.M
-        path2, _ = self.samples[idx2 // self.M]
-        img2     = self._load(path2, augment=(aug_idx2 > 0))
+        idx2        = random.choice(self.label2idxs[label])
+        path2, _    = self.samples[idx2 // self.M]
+        img2        = self._load(path2)
 
         return [img1, img2], label
 
@@ -502,8 +493,9 @@ def main():
     with open(results_path, "w") as f:
         f.write(f"PSFed-Palm — {dataset.upper()}\n")
         f.write(f"{'Round':>6}\t"
-                f"{'Global EER':>12}\t{'Global R1':>10}\t"
-                f"{'LocalAvg EER':>14}\t{'LocalAvg R1':>12}\n")
+                f"{'Short EER':>10}\t{'Short R1':>9}\t"
+                f"{'Long EER':>9}\t{'Long R1':>8}\t"
+                f"{'Global EER':>11}\t{'Global R1':>10}\n")
 
     # ── Round 0: random-init baseline ─────────────────────────
     print("\n--- Round 0 (random init) ---")
@@ -520,10 +512,10 @@ def main():
         t0 = time.time()
 
         # Step 1: local training
-        round_losses, round_accs = [], []
+        round_losses = []
         for i in range(n_clients):
             anchor = get_anchor(i)
-            loss, acc = fit(
+            loss, _ = fit(
                 local_model   = local_models[i],
                 anchor_model  = anchor,
                 server_model  = server_model,
@@ -536,17 +528,14 @@ def main():
             )
             schedulers[i].step()
             round_losses.append(loss)
-            round_accs.append(acc)
 
         # Step 2a: sub-group aggregation
-        # visib_net ← FedAvg of SHORT clients' local models
         if short_ids:
             fedavg(visib_net, [local_models[i] for i in short_ids])
-        # invis_net ← FedAvg of LONG clients' local models
         if long_ids:
             fedavg(invis_net, [local_models[i] for i in long_ids])
 
-        # Step 2b: global aggregation — server ← FedAvg of all local models
+        # Step 2b: global aggregation
         fedavg(server_model, local_models)
 
         # Step 2c: broadcast global model to all local models
@@ -554,39 +543,40 @@ def main():
 
         elapsed = time.time() - t0
 
-        # Step 3: evaluation
-        g_eer = g_r1 = la_eer = la_r1 = 0.0
+        # Step 3: evaluation — 3 pairs
+        # (1) Short group model (visib_net)
+        sh_eer, sh_r1 = evaluate_split(
+            lambda x: emb_global(visib_net, x),
+            gallery_loader, probe_loader, device)
 
-        if cfg["eval_global"]:
-            g_eer, g_r1 = evaluate_split(
-                lambda x: emb_global(server_model, x),
-                gallery_loader, probe_loader, device)
+        # (2) Long group model (invis_net)
+        lo_eer, lo_r1 = evaluate_split(
+            lambda x: emb_global(invis_net, x),
+            gallery_loader, probe_loader, device)
 
-        if cfg["eval_local_avg"]:
-            la_eer, la_r1 = evaluate_local_avg(
-                local_models, gallery_loader, probe_loader, device)
+        # (3) Global model (FedAvg of all clients)
+        g_eer, g_r1 = evaluate_split(
+            lambda x: emb_global(server_model, x),
+            gallery_loader, probe_loader, device)
 
         recent.append((g_eer, g_r1))
         if len(recent) > cfg["avg_last_rounds"]:
             recent.pop(0)
 
         avg_loss = sum(round_losses) / len(round_losses)
-        avg_acc  = sum(round_accs)  / len(round_accs)
         ts       = time.strftime("%H:%M:%S")
-        acc_str  = "  ".join(
-            f"c{i}[{client_data[i]['spectrum']}]:{round_accs[i]:.0f}%"
-            for i in range(n_clients))
 
         print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
-              f"loss={avg_loss:.4f}  acc={avg_acc:.1f}%  ({elapsed:.1f}s)")
-        print(f"  Per-client acc : {acc_str}")
-        print(f"  Global         EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
-        print(f"  Local avg      EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
+              f"loss={avg_loss:.4f}  ({elapsed:.1f}s)")
+        print(f"  Short group  EER={sh_eer*100:.4f}%  Rank-1={sh_r1:.2f}%")
+        print(f"  Long  group  EER={lo_eer*100:.4f}%  Rank-1={lo_r1:.2f}%")
+        print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
 
         with open(results_path, "a") as f:
             f.write(f"{rnd:>6}\t"
-                    f"{g_eer*100:.4f}\t{g_r1:.2f}\t"
-                    f"{la_eer*100:.4f}\t{la_r1:.2f}\n")
+                    f"{sh_eer*100:.4f}\t{sh_r1:.2f}\t"
+                    f"{lo_eer*100:.4f}\t{lo_r1:.2f}\t"
+                    f"{g_eer*100:.4f}\t{g_r1:.2f}\n")
 
     # ── 8. Final summary ──────────────────────────────────────
     n_avg   = len(recent)
@@ -604,7 +594,8 @@ def main():
 
     with open(results_path, "a") as f:
         f.write(f"\n# Average of last {n_avg} rounds (global model)\n")
-        f.write(f"avg_{n_avg}\t{avg_eer*100:.4f}\t{avg_r1:.2f}\t—\t—\n")
+        f.write(f"avg_{n_avg}\t—\t—\t—\t—\t"
+                f"{avg_eer*100:.4f}\t{avg_r1:.2f}\n")
 
 
 if __name__ == "__main__":
