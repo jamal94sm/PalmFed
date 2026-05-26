@@ -24,7 +24,8 @@ from datasets import (PalmDataset, AugmentedDataset,
                       PairedDataset, FFTAugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
-from utils    import (extract_style_template, evaluate_model,
+from utils    import (extract_style_template, extract_radial_template,
+                      evaluate_model,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
@@ -162,6 +163,8 @@ class FLClient:
             effective_M = M
 
             if active_style_bank and effective_M > 1:
+                fft_method  = self.cfg.get("fft_aug_method", "amplitude")
+                local_only  = self.cfg.get("fft_local_only", False)
                 dataset = FFTAugmentedDataset(
                     samples              = self.train_samples,
                     style_bank           = active_style_bank,
@@ -176,6 +179,8 @@ class FLClient:
                     prefer_distant       = self.cfg.get("prefer_distant_domain", True),
                     use_mean_template    = self.cfg.get("use_mean_template", False),
                     deterministic_donors = det_donors,
+                    fft_method           = fft_method,
+                    local_only           = local_only,
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
@@ -254,29 +259,38 @@ class FLClient:
 
     def extract_style_templates(self):
         """
-        Extract FFT amplitude templates from all local training samples.
-        Always called regardless of aug mode so random state is identical
-        across spatial, FFT, and mixed runs.
+        Extract FFT templates from all local training samples.
 
-        Grayscale models (CompNet, CCNet): load as L → (H, W) template.
-        DINOv2: load as RGB → (H, W, 3) per-channel template.
-        Both formats are handled by extract_style_template() in utils.py.
+        fft_aug_method="amplitude": extract full 2D fftshifted amplitude
+            via extract_style_template() — original behaviour.
+        fft_aug_method="radial": extract compact 1D radial log-amplitude
+            profile via extract_radial_template() — domain-discriminative,
+            matches spectral decay rate only (not 2D amplitude layout).
+
+        Always called regardless of aug mode so random state is identical
+        across runs. DINOv2 radial mode is not supported (grayscale only).
         """
         model_name = self.cfg["model"].strip().lower()
         is_dino    = model_name == "dinov2"
         img_side   = self.cfg.get("dino_img_side", 224) if is_dino \
                      else self.cfg["img_side"]
         mode       = "RGB" if is_dino else "L"
+        fft_method = self.cfg.get("fft_aug_method", "amplitude")
 
         templates = []
         for path, _ in self.train_samples:
             img    = Image.open(path).convert(mode).resize(
                 (img_side, img_side), Image.BILINEAR)
             img_np = np.array(img, dtype=np.float32) / 255.0
-            templates.append(extract_style_template(img_np))
+            if fft_method == "radial" and not is_dino:
+                templates.append(extract_radial_template(img_np))
+            else:
+                templates.append(extract_style_template(img_np))
+
+        method_label = f"radial({self.cfg.get('fft_beta',0.1)})" \
+                       if fft_method == "radial" else "amplitude"
         print(f"  Client {self.client_id} [{self.spectrum}] "
-              f"— extracted {len(templates)} {'RGB' if is_dino else 'grayscale'} "
-              f"style templates")
+              f"— {len(templates)} templates  [{method_label}]")
         return templates
 
 
@@ -432,6 +446,13 @@ def main():
     else:
         print(f"  Aug mode : {aug_mode.upper()}   "
               f"M={cfg['M']}   beta={cfg['fft_beta']}")
+    if aug_mode in ("fft", "mixed"):
+        method     = cfg.get("fft_aug_method", "amplitude")
+        local_only = cfg.get("fft_local_only", False)
+        print(f"  FFT method : {method}   "
+              f"local_only={local_only}"
+              + (" ← ablation: no cross-domain sharing" if local_only else
+                 " ← cross-domain style transfer"))
     print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
     print(f"{'='*62}\n")
 
