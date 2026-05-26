@@ -52,7 +52,7 @@ CONFIG = {
     #                 Transfers spectral decay rate (domain-discriminative) only.
     #                 Preserves 2D spatial amplitude structure (identity content).
     #                 Requires extract_radial_template() instead of extract_style_template().
-    "fft_aug_method"      : "amplitude",  # "amplitude" | "radial"
+    "fft_aug_method"      : "radial",  # "amplitude" | "radial"
  
     # FFT donor mode:
     #   False — cross-domain (default): donor templates from OTHER clients.
