@@ -102,7 +102,7 @@ CONFIG = {
     # SupCon pulls same-identity pairs together across the two views,
     # complementing ArcFace which operates at the classification logit level.
     "use_supcon"       : True,  # True → add SupCon to training loss
-    "lambda_supcon"    : 0.2,    # SupCon weight (paper uses 0.15–0.2)
+    "lambda_supcon"    : 0.5,    # SupCon weight (paper uses 0.15–0.2)
     "temperature"      : 0.07,   # SupCon temperature
 
     # SupConLoss — CCNet only (between paired same-identity views):
