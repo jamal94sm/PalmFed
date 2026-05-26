@@ -328,35 +328,43 @@ class CenterLoss(nn.Module):
 def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         center_loss=None, center_optimizer=None,
                         lambda_center=0.0, lambda_style=0.0,
-                        lambda_grl=0.0, lambda_load_balance=0.0):
+                        lambda_grl=0.0, lambda_load_balance=0.0,
+                        lambda_supcon=0.0, temperature=0.07):
     """
     Train CompNet (or DINOv2) for one epoch.
 
     Loss : CE(ArcFace, emb_orig)
-         + lambda_style  × StyleConsistencyLoss   (optional)
-         + lambda_grl    × DomainAdversarialLoss  (optional, GRL)
-         + lambda_center × CenterLoss             (optional)
+         + lambda_style   × StyleConsistencyLoss    (optional)
+         + lambda_supcon  × SupConLoss               (optional)
+         + lambda_grl     × DomainAdversarialLoss   (optional, GRL)
+         + lambda_center  × CenterLoss              (optional)
 
-    GRL (Gradient Reversal Layer):
-      emb_orig → GRL(λ_grl) → DomainClassifier → CE(domain_pred, domain_id)
-      The reversed gradient pushes the backbone away from domain-specific
-      features. domain_ids come from the 3-tuple batch — own domain for
-      original samples, donor domain for FFT-augmented samples.
-      Both are used: the backbone must be invariant to ALL 6 domains.
+    SupConLoss:
+      Operates on [emb_orig, emb_aug] — the paired embeddings already
+      produced by FFTAugmentedDataset. Pulls same-identity pairs together
+      across the two domain views (clean and FFT-styled), complementing
+      ArcFace which operates at the classification logit level.
+      Active only when loader returns ([orig, aug], label) pairs and
+      lambda_supcon > 0.
     """
     model.train()
     if center_loss is not None:
         center_loss.train()
 
-    use_center = (center_loss is not None and
-                  center_optimizer is not None and
-                  lambda_center > 0.0)
-    use_style  = lambda_style > 0.0
-    use_grl    = (lambda_grl > 0.0 and
-                  hasattr(model, "use_grl") and model.use_grl and
-                  model.domain_classifier is not None)
-    use_moe_lb = (lambda_load_balance > 0.0 and
-                  hasattr(model, "get_moe_lb_loss"))
+    use_center  = (center_loss is not None and
+                   center_optimizer is not None and
+                   lambda_center > 0.0)
+    use_style   = lambda_style  > 0.0
+    use_supcon  = lambda_supcon > 0.0
+    use_grl     = (lambda_grl > 0.0 and
+                   hasattr(model, "use_grl") and model.use_grl and
+                   model.domain_classifier is not None)
+    use_moe_lb  = (lambda_load_balance > 0.0 and
+                   hasattr(model, "get_moe_lb_loss"))
+
+    supcon_criterion = SupConLoss(temperature=temperature,
+                                  base_temperature=temperature) \
+                       if use_supcon else None
 
     def _get_emb(imgs, domain_ids=None):
         if hasattr(model, "_backbone"):
@@ -374,7 +382,6 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     running_loss = 0.0; correct = 0; total = 0
 
     for batch in loader:
-        # datasets return ([orig, aug], label, domain_id) — 3-tuple
         if len(batch) == 3:
             data, labels, domain_ids = batch
             domain_ids = domain_ids.to(device)
@@ -407,9 +414,18 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                 F.normalize(emb_orig, p=2, dim=1),
                 F.normalize(emb_aug,  p=2, dim=1), dim=1)
             loss = loss + lambda_style * (1.0 - sim.mean())
+        elif has_aug and (use_supcon or use_grl):
+            # need emb_aug for SupCon/GRL even if style loss is off
+            emb_aug = _get_emb(aug, domain_ids)
+
+        if use_supcon and has_aug:
+            # [B, 2, D] — two views per sample
+            emb_o = F.normalize(emb_orig, p=2, dim=1)
+            emb_a = F.normalize(emb_aug,  p=2, dim=1)
+            feats = torch.stack([emb_o, emb_a], dim=1)
+            loss  = loss + lambda_supcon * supcon_criterion(feats, labels)
 
         if use_grl and domain_ids is not None:
-            # apply GRL — gradient is negated entering the backbone
             emb_grl    = GRL.apply(emb_orig, lambda_grl)
             dom_logits = model.domain_classifier(emb_grl)
             loss_dom   = F.cross_entropy(dom_logits, domain_ids)
