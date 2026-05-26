@@ -280,12 +280,12 @@ def fit(local_model, anchor_model, server_model,
         optimizer.zero_grad()
 
         # local model forward — two views
-        output, fe1 = local_model(x,     y)
-        _,      fe2 = local_model(x_con, y)
+        output, fe1, _ = local_model(x,     y)
+        _,      fe2, _ = local_model(x_con, y)
 
         # cross-spectrum anchor forward (no gradient)
         with torch.no_grad():
-            _, fe3 = anchor_model(x, None)
+            _, fe3, _ = anchor_model(x, None, None)
 
         # paired features for SupCon
         fe = torch.cat([fe1.unsqueeze(1), fe2.unsqueeze(1)], dim=1)
@@ -354,9 +354,9 @@ def evaluate_split(embedding_fn, gallery_loader, probe_loader, device):
 
 @torch.no_grad()
 def emb_global(server_model, x):
-    """Global model embedding."""
+    """Global model embedding — compnet_fedpalm returns (logits, fe, _)."""
     server_model.eval()
-    _, fe = server_model(x, None)
+    _, fe, _ = server_model(x, None, None)
     return fe                          # already L2-normed in compnet_fedpalm
 
 
@@ -366,7 +366,7 @@ def evaluate_local_avg(local_models, gallery_loader, probe_loader, device):
     for m in local_models:
         m.eval()
         eer, r1 = evaluate_split(
-            lambda x, _m=m: _m(x, None)[1],
+            lambda x, _m=m: _m(x, None, None)[1],
             gallery_loader, probe_loader, device)
         eers.append(eer)
         r1s.append(r1)
