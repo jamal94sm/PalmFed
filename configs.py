@@ -37,22 +37,37 @@ CONFIG = {
     "k_test"           : 0.20,   # fraction of IDs allocated to test set
     "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
-    # ── Augmentation mode ──────────────────────────────────────
-    # Exactly one of the three modes should be active:
-    #
-    #   use_fft_aug=False, use_mixed_aug=False → spatial aug only (baseline)
-    #   use_fft_aug=True,  use_mixed_aug=False → FFT + spatial, all rounds
-    #   use_fft_aug=False, use_mixed_aug=True  → spatial first, FFT second
-    #
-    # use_mixed_aug takes priority over use_fft_aug when both are True.
-    "use_fft_aug"      : True,  # True → FFT aug for all rounds
-    "use_mixed_aug"    : False,  # True → spatial → FFT switch mid-training
-    "mixed_aug_round"  : 15,     # round at which to switch (mixed mode only)
-
+    
+    # ── Augmentation ───────────────────────────────────────────
+    "use_fft_aug"         : True,
+    "use_mixed_aug"       : False,
+    "mixed_aug_round"     : 15,
+    "fft_beta"            : 0.1,
+    "M"                   : 2,
+ 
+    # FFT augmentation method:
+    #   "amplitude" — original: swap raw 2D amplitude in Gaussian-masked region.
+    #                 Transfers content+style together. Simple and fast.
+    #   "radial"    — new: match donor's radial log-amplitude profile ring-by-ring.
+    #                 Transfers spectral decay rate (domain-discriminative) only.
+    #                 Preserves 2D spatial amplitude structure (identity content).
+    #                 Requires extract_radial_template() instead of extract_style_template().
+    "fft_aug_method"      : "amplitude",  # "amplitude" | "radial"
+ 
+    # FFT donor mode:
+    #   False — cross-domain (default): donor templates from OTHER clients.
+    #           Tests cross-domain style transfer — the proposed method's key idea.
+    #   True  — local-only: donor templates from OWN client pool only.
+    #           Augmentation diversity without cross-domain transfer.
+    #           Ablation: if local_only ≈ cross-domain, the benefit comes from
+    #           augmentation volume, not domain transfer. If cross-domain >> local,
+    #           the cross-domain style transfer itself is the key contribution.
+    "fft_local_only"      : False,
     # FFT augmentation parameters
     "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
 
+    
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
