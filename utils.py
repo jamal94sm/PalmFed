@@ -63,30 +63,82 @@ def extract_style_template(img_np):
     ], axis=-1).astype(np.float32)
 
 
-def apply_style_template(img_np, amp_template, beta):
+def extract_radial_template(img_np, n_bins=64):
     """
-    Swap low-frequency amplitude of img_np with amp_template using a
-    Gaussian soft mask. Phase (identity-specific texture) is preserved.
+    Extract a radial spectral profile from a grayscale image.
+    Returns a (n_bins,) float32 array — the mean log-amplitude per
+    concentric frequency ring.
 
-    Grayscale (H, W):
-      Foreground mask (> 0) is saved and restored after synthesis so
-      NormSingleROI always operates on palm ROI pixels only.
+    Used as a compact domain-discriminative template for radial-mode
+    FFT augmentation (method="radial" in apply_style_template).
 
-    RGB (H, W, 3):
-      Each channel is processed independently. No foreground mask —
-      RGB palmprint images (e.g. XJTU smartphone) have no zero-padded
-      background so masking is not needed.
+    Why radial:
+      The log+radial profile is more domain-discriminative than raw 2D
+      amplitude (classifier ablation confirmed this). Matching the donor's
+      radial profile ring-by-ring transfers the spectral decay rate
+      (sensor/wavelength-specific) while leaving the 2D spatial FFT
+      structure (identity content) intact.
+
+    Grayscale only — RGB support not needed since CompNet uses grayscale.
+    """
+    assert img_np.ndim == 2, "extract_radial_template expects grayscale (H,W)"
+    H, W   = img_np.shape
+    cy, cx = H // 2, W // 2
+    amp    = np.fft.fftshift(np.abs(np.fft.fft2(img_np)))
+    amp_log = np.log1p(amp)
+    Y, X   = np.ogrid[:H, :W]
+    R      = np.sqrt((X - cx)**2 + (Y - cy)**2)
+    r_max  = min(H, W) / 2.0
+    bins   = np.zeros(n_bins, dtype=np.float32)
+    edges  = np.linspace(0, r_max, n_bins + 1)
+    for b in range(n_bins):
+        ring = (R >= edges[b]) & (R < edges[b + 1])
+        if ring.any():
+            bins[b] = amp_log[ring].mean()
+    return bins
+
+
+def apply_style_template(img_np, amp_template, beta, method="amplitude"):
+    """
+    Apply FFT-based domain style transfer to img_np using amp_template.
+
+    method="amplitude"  (original — default for backward compatibility):
+      Swap low-frequency amplitude pixels using a Gaussian soft mask.
+      Transfers raw 2D amplitude values in the masked region.
+      Template type: 2D fftshifted amplitude array, same shape as img_np.
+
+    method="radial"  (new — more domain-discriminative):
+      Scale each frequency ring of img_np so its mean log-amplitude
+      matches the donor's radial profile. Transfers spectral decay rate
+      (sensor/wavelength signature) while preserving the 2D spatial
+      structure of the amplitude (identity content).
+      Template type: 1D radial profile (n_bins,) from extract_radial_template.
+
+      Derivation:
+        For each ring r:
+          target_log_mean[r] = mean(log(1+|FFT(img)|) over ring r)
+          donor_log_mean[r]  = amp_template[r]
+          scale[r]           = exp(donor_log_mean[r] - target_log_mean[r])
+          new_amp[ring r]    = old_amp[ring r] × scale[r]
+        This is equivalent to additively matching log-amplitude profiles,
+        which is multiplicative in linear amplitude space.
 
     Parameters
     ----------
-    img_np       : np.ndarray  (H, W) or (H, W, 3)  float32 in [0, 1]
-    amp_template : np.ndarray  same shape as img_np  fftshifted amplitude
-    beta         : float       Gaussian sigma as fraction of min(H, W)
+    img_np       : np.ndarray  (H, W) float32 in [0, 1]  grayscale only
+    amp_template : np.ndarray  (H, W) for method="amplitude",
+                                      (n_bins,) for method="radial"
+    beta         : float       Gaussian sigma (amplitude mode only)
+    method       : "amplitude" | "radial"
 
     Returns
     -------
-    img_syn : np.ndarray  same shape as img_np  float32 in [0, 1]
+    img_syn : np.ndarray  (H, W) float32 in [0, 1]
     """
+    if method == "radial":
+        return _apply_radial_template(img_np, amp_template)
+
+    # ── method="amplitude" (original) ────────────────────────────────────────
     H, W = img_np.shape[:2]
     mask = gaussian_mask(H, W, beta)
 
@@ -101,17 +153,61 @@ def apply_style_template(img_np, amp_template, beta):
             0.0, 1.0).astype(np.float32)
 
     if img_np.ndim == 2:
-        # grayscale — restore foreground mask so NormSingleROI is correct
         fg_mask = img_np > 0
         result  = _swap_channel(img_np, amp_template)
         result[~fg_mask] = 0.0
         return result
 
-    # RGB — process per channel, no foreground mask
+    # RGB
     return np.stack([
         _swap_channel(img_np[..., c], amp_template[..., c])
         for c in range(img_np.shape[2])
     ], axis=-1).astype(np.float32)
+
+
+def _apply_radial_template(img_np, radial_profile_donor):
+    """
+    Radial profile matching — scale each frequency ring of img_np so its
+    mean log-amplitude matches the donor's radial profile.
+
+    Grayscale (H, W) only.
+    Foreground mask preserved so NormSingleROI is correct.
+    """
+    assert img_np.ndim == 2, "_apply_radial_template expects grayscale (H,W)"
+    H, W   = img_np.shape
+    n_bins = len(radial_profile_donor)
+    cy, cx = H // 2, W // 2
+
+    fft    = np.fft.fft2(img_np)
+    amp    = np.fft.fftshift(np.abs(fft))
+    pha    = np.angle(fft)
+    amp_log = np.log1p(amp)
+
+    Y, X = np.ogrid[:H, :W]
+    R    = np.sqrt((X - cx)**2 + (Y - cy)**2)
+    r_max = min(H, W) / 2.0
+    edges = np.linspace(0, r_max, n_bins + 1)
+
+    amp_syn = amp.copy()
+    for b in range(n_bins):
+        ring = (R >= edges[b]) & (R < edges[b + 1])
+        if not ring.any():
+            continue
+        target_mean = amp_log[ring].mean()
+        donor_mean  = radial_profile_donor[b]
+        # multiplicative scale in linear amp = additive shift in log amp
+        scale = np.exp(donor_mean - target_mean)
+        amp_syn[ring] = amp[ring] * scale
+
+    amp_syn = np.fft.ifftshift(amp_syn)
+    img_syn = np.clip(
+        np.fft.ifft2(amp_syn * np.exp(1j * pha)).real,
+        0.0, 1.0).astype(np.float32)
+
+    # restore foreground mask
+    fg_mask = img_np > 0
+    img_syn[~fg_mask] = 0.0
+    return img_syn
 
 
 # ══════════════════════════════════════════════════════════════
