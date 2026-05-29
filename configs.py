@@ -20,96 +20,102 @@ CONFIG = {
     "model"            : "compnet",  # "compnet" | "ccnet" | "dinov2"
 
     # ── Paths ──────────────────────────────────────────────────
-    "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
-    "xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",
+    "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",   # CASIA-MS
+    "xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",        # XJTU
+
     "base_results_dir" : "./rst_fedavg_casiams",
+
+    # ── Fair comparison: shared splits and init weights ────────
+    # Both runs (use_fft_aug=True/False) load from the same files so
+    # that data splits and starting weights are identical.
+    # {dataset} and {model} are resolved at runtime.
     "splits_path"      : "./rst_fedavg_{dataset}/splits.pkl",
     "init_weights_path": "./rst_fedavg_{dataset}/init_weights_{model}.pth",
 
     # ── Dataset ────────────────────────────────────────────────
-    "n_ids"            : 200,
-    "k_test"           : 0.20,
-    "gallery_ratio"    : 0.20,
+    "n_ids"            : 200,    # number of identities to sample
+    "k_test"           : 0.20,   # fraction of IDs allocated to test set
+    "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
 
-    # ── Augmentation ───────────────────────────────────────────
-    "use_fft_aug"      : True,
-    "use_mixed_aug"    : False,
-    "mixed_aug_round"  : 15,
-    "fft_beta"         : 0.1,
-    "M"                : 2,
-    "fft_aug_method"   : "amplitude",  # "amplitude" | "radial"
-    "fft_local_only"   : True,
+    # ── Augmentation mode ──────────────────────────────────────
+    # Exactly one of the three modes should be active:
+    #
+    #   use_fft_aug=False, use_mixed_aug=False → spatial aug only (baseline)
+    #   use_fft_aug=True,  use_mixed_aug=False → FFT + spatial, all rounds
+    #   use_fft_aug=False, use_mixed_aug=True  → spatial first, FFT second
+    #
+    # use_mixed_aug takes priority over use_fft_aug when both are True.
+    "use_fft_aug"      : True,  # True → FFT aug for all rounds
+    "use_mixed_aug"    : False,  # True → spatial → FFT switch mid-training
+    "mixed_aug_round"  : 15,     # round at which to switch (mixed mode only)
+
+    # FFT augmentation parameters
+    "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
+    "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
 
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 30,
-    "local_epochs"     : 1,
+    "n_rounds"         : 30,    # R: total communication rounds
+    "local_epochs"     : 1,      # E: local training epochs per round
 
-    # ── MoE — MultiExpertCompNet ───────────────────────────────
-    #
-    # Architecture
-    # ────────────
-    # use_moe=True  → MultiExpertCompNet:
-    #   experts[0]       — shared base CompNet (always active)
-    #   experts[1..N]    — one domain-specific CompNet per domain
-    #   N = n_domains    (6 for CASIA-MS, 4 for XJTU)
-    #
-    # Forward (train & eval):
-    #   logits = 0.5 × base_expert(x) + 0.5 × domain_expert[d](x)
-    #
-    # Embedding (gallery/probe):
-    #   emb = L2_norm(0.5 × base_emb + 0.5 × domain_emb)
-    #   domain label of the test sample used to select domain_expert[d]
-    #
-    # use_moe=False → plain single CompNet (baseline)
-    #
-    # Deferred activation  (moe_warmup_round > 0)
-    # ────────────────────────────────────────────
-    # Phase 1 — rounds 1 … moe_warmup_round:
-    #   Only experts[0] (base) is constructed and trained.
-    #   All clients share a single CompNet via FedAvg.
-    #   The base learns a domain-agnostic representation.
-    #
-    # Phase 2 — round moe_warmup_round + 1 … n_rounds:
-    #   Server calls activate_moe() immediately after aggregation at
-    #   round moe_warmup_round.  This:
-    #     1. Copies trained base weights into every domain expert
-    #        (warm start — not random init).
-    #     2. Sets use_moe=True on global model and all clients.
-    #   All (1 + n_domains) CompNets are then trained and aggregated
-    #   via FedAvg in every subsequent round.
-    #
-    # Set moe_warmup_round = 0 to skip warmup (MoE active from round 1).
-    #
-    # FedAvg scope
-    # ────────────
-    # All CompNet backbone weights shared (base + all domain experts).
-    # arc.* heads of every expert stay local (never sent to server).
-    "use_moe"             : True,
-    "n_domains"           : 6,        # must match dataset: 6 CASIA-MS, 4 XJTU
-    "moe_warmup_round"    : 10,       # 0 = full MoE from round 1
+    # ── Mixture of Experts — CompNet only ─────────────────────
+    # When use_moe=True, the single FC(9708→512) bottleneck in CompNet
+    # is replaced by MoEFC: base_FC(x) + expert[domain_id](x).
+    # base_FC learns the domain-invariant projection (shared via FedAvg).
+    # Each expert[d] is a low-rank residual (9708→rank→512) that learns
+    # the domain-d-specific correction on top of the shared base.
+    # Domain routing uses explicit domain_id labels during training;
+    # at inference domain_ids=None so only base_FC is used.
+    # Requires use_fft_aug=True to generate cross-domain training signal.
+    "use_moe"          : False,  # True → MoEFC for CompNet
+    "n_experts"        : 6,      # number of domain experts (= n_clients)
+    "lora_rank"        : 64,     # expert bottleneck rank
 
-    # ── GRL ───────────────────────────────────────────────────
-    "use_grl"          : False,
-    "lambda_grl"       : 0.05,
+    # ── GRL ─────────────────────
+    "use_grl"          : False,  # True → domain adversarial training (GRL)
+    "lambda_grl"       : 0.05,   # GRL loss weight (start small, e.g. 0.05–0.2)
+    "n_domains"        : 6,     # number of domains = n_clients (6 CASIA-MS, 4 XJTU)
+    # GRL shares domain_classifier via FedAvg alongside backbone.
+    # domain_ids come from the 3-tuple batch — own domain (aug_idx=0) and
+    # donor domain (aug_idx≥1) — so all 6 domains appear in every client's
+    # batch after FFT augmentation, giving the GRL meaningful cross-domain signal.
 
-    # ── Whitening ─────────────────────────────────────────────
-    "use_whitening"    : False,
+    "use_whitening"    : False,  # True → ZCA whiten gallery+probe at evaluation
+    # Whitening matrix estimated from gallery, applied to both gallery and probe.
+    # Suppresses domain-induced variance in embedding space before cosine matching.
+    # Zero training cost — inference-time only.
 
-    # ── Losses ────────────────────────────────────────────────
-    "lambda_style"     : 1.0,
+    
+    # CrossEntropy + ArcFace is always active for all models.
+    #
+    # Style Consistency Loss — CompNet and DINOv2:
+    #   Enforces that FFT-augmented (or spatially-augmented) embeddings
+    #   stay close to their original counterparts via cosine similarity.
+    #   Loss = 1 - cosine_sim(emb_orig, emb_aug).  Range [0, 2]; 0 = perfect.
+    #   No NaN risk — always has exactly one positive pair per sample.
+    "lambda_style"     : 1,    # StyleConsistencyLoss weight (0.0 = disabled)
 
-    "use_supcon"       : True,
-    "lambda_supcon"    : 0.5,
-    "temperature"      : 0.07,
+    # ── Supervised Contrastive Loss ────────────────────────────
+    # SupCon operates on the paired embeddings [emb_orig, emb_aug] already
+    # produced by FFTAugmentedDataset. No dataset change needed.
+    # emb_orig = backbone(spatial_aug(fft_styled))
+    # emb_aug  = backbone(spatial_aug(clean))   (when aug_idx≥1)
+    # SupCon pulls same-identity pairs together across the two views,
+    # complementing ArcFace which operates at the classification logit level.
+    "use_supcon"       : True,  # True → add SupCon to training loss
+    "lambda_supcon"    : 0.5,    # SupCon weight (paper uses 0.15–0.2)
+    "temperature"      : 0.07,   # SupCon temperature
 
-    # CCNet-specific:
-    "ce_weight"        : 0.8,
-    "con_weight"       : 0.2,
+    # SupConLoss — CCNet only (between paired same-identity views):
+    "ce_weight"        : 0.8,    # CE loss weight (CCNet only; CompNet/DINOv2 use 1.0)
+    "con_weight"       : 0.2,    # SupConLoss weight (CCNet only)
+    "temperature"      : 0.07,   # SupConLoss temperature (CCNet only)
 
-    # Center Loss:
-    "use_center_loss"    : False,
-    "center_loss_weight" : 0.5,
-    "center_loss_lr"     : 0.5,
+    # CenterLoss — all models (optional):
+    #   Minimises distance between embeddings and per-client class centres.
+    #   Centres are kept local and carried over across rounds (never shared).
+    "use_center_loss"    : False,  # True → add CenterLoss to training
+    "center_loss_weight" : 0.5,  # λ_c — keep small so ArcFace dominates
+    "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
 
     # ── CompNet hyperparameters ────────────────────────────────
     "img_side"         : 128,
@@ -118,21 +124,23 @@ CONFIG = {
     "arcface_s"        : 30.0,
     "arcface_m"        : 0.50,
 
-    # ── CCNet-specific ─────────────────────────────────────────
-    "comp_weight"      : 0.8,
+    # ── CCNet-specific hyperparameters ─────────────────────────
+    "comp_weight"      : 0.8,    # channel vs spatial competition weight
 
-    # ── DINOv2-specific ────────────────────────────────────────
+    # ── DINOv2-specific hyperparameters ───────────────────────
+    # RGB 224×224 + ImageNet normalisation.
+    # ViT-S/14 blocks 10 and 11 are unfrozen; all others are frozen.
     "dino_img_side"    : 224,
-    "dino_weight_decay": 1e-4,
-    "dino_margin"      : 0.3,
-    "dino_scale"       : 16,
+    "dino_weight_decay": 1e-4,   # AdamW weight decay
+    "dino_margin"      : 0.3,    # ArcFace angular margin
+    "dino_scale"       : 16,     # ArcFace scale
 
     # ── Training ───────────────────────────────────────────────
     "batch_size"       : 32,
-    "lr"               : 0.001,
+    "lr"               : 0.001,  # constant lr across all rounds (no scheduler)
 
     # ── Misc ───────────────────────────────────────────────────
     "random_seed"      : 42,
     "num_workers"      : 4,
-    "avg_last_rounds"  : 5,
+    "avg_last_rounds"  : 5,     # number of final rounds to average for reporting
 }
