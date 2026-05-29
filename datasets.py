@@ -33,8 +33,7 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
-from utils import (extract_style_template, extract_radial_template,
-                   apply_style_template)
+from utils import extract_style_template, apply_style_template
 from configs import XJTU_VARIATIONS
 
 
@@ -266,8 +265,7 @@ class FFTAugmentedDataset(Dataset):
     def __init__(self, samples, style_bank, client_id, M, beta, img_side,
                  grayscale=True, mean_bank=None,
                  prefer_distant=True, use_mean_template=False,
-                 deterministic_donors=False,
-                 fft_method="amplitude", local_only=False):
+                 deterministic_donors=False):
         self.samples              = samples
         self.style_bank           = style_bank
         self.client_id            = client_id
@@ -275,22 +273,11 @@ class FFTAugmentedDataset(Dataset):
         self.beta                 = beta
         self.img_side             = img_side
         self.grayscale            = grayscale
+        self.other_ids            = [cid for cid in style_bank if cid != client_id]
         self.mean_bank            = mean_bank
         self.prefer_distant       = prefer_distant
         self.use_mean_template    = use_mean_template
         self.deterministic_donors = deterministic_donors
-        self.fft_method           = fft_method   # "amplitude" | "radial"
-        self.local_only           = local_only   # True → use own templates only
-
-        # donor pool: own templates only (local_only) or other clients (cross)
-        if local_only:
-            # use own client's templates as donor — tests augmentation benefit
-            # without cross-domain style sharing
-            self.other_ids = []          # no external donors
-            self.own_ids   = [client_id] # augment from own pool
-        else:
-            self.other_ids = [cid for cid in style_bank if cid != client_id]
-            self.own_ids   = []
 
         self.donor_order = self._rank_donors()
 
@@ -364,41 +351,33 @@ class FFTAugmentedDataset(Dataset):
         path, label = self.samples[sample_idx][0], self.samples[sample_idx][1]
         img_np = self._load_np(path)
 
-        # aug_idx=0 or no donors available → spatial aug only (same domain)
-        no_donors = (not self.other_ids and not self.local_only)
-        if aug_idx == 0 or no_donors:
-            orig = self._to_aug_tensor(img_np)
+        # orig: spatially augmented original — consistent with old file where
+        # _to_tensor applied spatial aug to every sample. ArcFace sees a
+        # spatially augmented view; style consistency loss compares it to
+        # a second independently augmented (or FFT-styled) view.
+        orig = self._to_aug_tensor(img_np)
+
+        if aug_idx == 0 or not self.other_ids:
+            # two independent spatial augmentations of same image
             return [orig, self._to_aug_tensor(img_np)], label, self.client_id
 
-        # ── donor selection ──────────────────────────────────────────────────
-        if self.local_only:
-            # local-only mode: pick a template from own client's pool
-            # This augments via own-domain style variation — tests whether
-            # augmentation diversity per se (not cross-domain transfer) helps.
-            rand_template = random.choice(self.style_bank[self.client_id])
-            donor_id      = self.client_id
+        # FFT style augmentation — select donor
+        if self.deterministic_donors:
+            rand_client = self.donor_order[(aug_idx - 1) % len(self.donor_order)]
+        elif self.donor_order and self.mean_bank:
+            rand_client = self.donor_order[0]
         else:
-            # cross-domain mode: pick from another client's pool
-            if self.deterministic_donors:
-                rand_client = self.donor_order[(aug_idx - 1) % len(self.donor_order)]
-            elif self.donor_order and self.mean_bank:
-                rand_client = self.donor_order[0]
-            else:
-                rand_client = random.choice(self.other_ids)
+            rand_client = random.choice(self.other_ids)
 
-            if self.use_mean_template and self.mean_bank \
-                    and rand_client in self.mean_bank:
-                rand_template = self.mean_bank[rand_client]
-            else:
-                rand_template = random.choice(self.style_bank[rand_client])
-            donor_id = rand_client
+        if self.use_mean_template and self.mean_bank \
+                and rand_client in self.mean_bank:
+            rand_template = self.mean_bank[rand_client]
+        else:
+            rand_template = random.choice(self.style_bank[rand_client])
 
-        img_syn = apply_style_template(img_np, rand_template, self.beta,
-                                        method=self.fft_method)
-
-        orig = self._to_aug_tensor(img_syn)   # ArcFace ← fft_styled
-        aug  = self._to_aug_tensor(img_np)    # style   ← clean
-        return [orig, aug], label, donor_id
+        img_syn = apply_style_template(img_np, rand_template, self.beta)
+        # domain_id = donor client (domain this sample was styled as)
+        return [orig, self._to_aug_tensor(img_syn)], label, rand_client
 
 
 # ══════════════════════════════════════════════════════════════
