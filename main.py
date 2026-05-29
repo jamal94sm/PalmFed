@@ -1,5 +1,5 @@
 # ==============================================================
-#  main.py — FLClient, FLServer, federated training loop
+#  main.py — FLClient, FLServer, and federated training loop
 # ==============================================================
 
 import os
@@ -19,90 +19,25 @@ from torch.utils.data import DataLoader
 warnings.filterwarnings("ignore")
 
 from configs  import CONFIG
-from models   import build_model, MultiExpertCompNet
+from models   import build_model
 from datasets import (PalmDataset, AugmentedDataset,
                       PairedDataset, FFTAugmentedDataset,
                       EvalDatasetDINO,
                       get_federated_splits)
-from utils    import (extract_style_template, extract_radial_template,
-                      evaluate_model,
+from utils    import (extract_style_template, evaluate_model,
                       train_compnet_epoch, train_ccnet_epoch,
                       CenterLoss)
 
 
-# ══════════════════════════════════════════════════════════════
-#  EVALUATION DATASET HELPER
-# ══════════════════════════════════════════════════════════════
-
 def make_eval_dataset(samples, cfg):
+    """
+    Return the correct evaluation dataset for the configured model.
+    DINOv2 uses RGB 224×224 with ImageNet normalisation.
+    CompNet and CCNet use grayscale 128×128 with NormSingleROI.
+    """
     if cfg["model"].strip().lower() == "dinov2":
         return EvalDatasetDINO(samples, cfg.get("dino_img_side", 224))
     return PalmDataset(samples, cfg["img_side"])
-
-
-# ══════════════════════════════════════════════════════════════
-#  EVALUATION WITH DOMAIN IDS
-# ══════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def evaluate_model_with_domain(model, gallery_loader, probe_loader,
-                                device, use_whitening=False):
-    """
-    Evaluation wrapper that passes domain_ids to MultiExpertCompNet.
-
-    PalmDataset stores (path, label, domain_id) in samples; get_domain_ids()
-    returns the domain_id list.  We inject domain_ids into the embedding
-    extraction so the correct domain expert is selected per sample.
-
-    Falls back to the standard evaluate_model() for non-MoE models.
-    """
-    from utils import extract_features, compute_eer, whiten_features
-
-    is_moe = isinstance(model, MultiExpertCompNet)
-
-    if not is_moe:
-        return evaluate_model(model, gallery_loader, probe_loader,
-                              device, use_whitening=use_whitening)
-
-    def _extract(loader):
-        model.eval()
-        feats, labels = [], []
-        for batch in loader:
-            if len(batch) == 3:
-                imgs, labs, dom_ids = batch
-                dom_ids = dom_ids.to(device)
-            else:
-                imgs, labs = batch
-                dom_ids = None
-            imgs = imgs.to(device)
-            emb  = model.get_embedding(imgs, dom_ids)
-            emb_np = emb.cpu().numpy()
-            nan_rows = np.isnan(emb_np).any(axis=1)
-            if nan_rows.any():
-                emb_np[nan_rows] = 0.0
-            feats.append(emb_np)
-            labels.append(labs.numpy())
-        return np.concatenate(feats), np.concatenate(labels)
-
-    gal_feats, gal_labels = _extract(gallery_loader)
-    prb_feats, prb_labels = _extract(probe_loader)
-
-    if use_whitening:
-        gal_feats, prb_feats = whiten_features(gal_feats, prb_feats)
-
-    sim_matrix  = np.nan_to_num(prb_feats @ gal_feats.T, nan=0.0)
-    scores_list, labels_list = [], []
-    for i in range(len(prb_feats)):
-        for j in range(len(gal_feats)):
-            scores_list.append(float(sim_matrix[i, j]))
-            labels_list.append(1 if prb_labels[i] == gal_labels[j] else -1)
-
-    eer    = compute_eer(np.column_stack([scores_list, labels_list]))
-    nn_idx = np.argmax(sim_matrix, axis=1)
-    correct = sum(prb_labels[i] == gal_labels[nn_idx[i]]
-                  for i in range(len(prb_feats)))
-    rank1  = 100.0 * correct / max(len(prb_feats), 1)
-    return eer, rank1
 
 
 # ══════════════════════════════════════════════════════════════
@@ -111,20 +46,41 @@ def evaluate_model_with_domain(model, gallery_loader, probe_loader,
 
 class FLClient:
     """
-    One federated learning client.
+    One federated learning client — owns one spectral/domain with
+    a disjoint subset of training identities.
 
-    MultiExpertCompNet weight management
-    ─────────────────────────────────────
-    get_weights() / set_weights() delegate to MultiExpertCompNet's own
-    methods which handle the 'experts.{i}.' key prefix and arc.* exclusion
-    transparently.  Plain CompNet / CCNet / DINOv2 use the old dict-based
-    approach unchanged.
+    Model selection
+    ───────────────
+      cfg["model"] == "compnet" → CompNet, trained with train_compnet_epoch
+                                  (grayscale 128×128, ArcFace + CE)
+      cfg["model"] == "ccnet"   → CCNet,   trained with train_ccnet_epoch
+                                  (grayscale 128×128, ArcFace + CE + SupCon)
+      cfg["model"] == "dinov2"  → DINOv2,  trained with train_compnet_epoch
+                                  (same single-image forward interface)
+                                  Images loaded and augmented as RGB.
+                                  FFT augmentation works per-channel on RGB.
 
-    MoE warmup transparency
-    ───────────────────────
-    The client is unaware of warmup state — it trains whatever model it
-    holds.  The server upgrades the global model via activate_moe() and
-    pushes new weights to all clients before the next round.
+    Weight sharing
+    ──────────────
+      Backbone parameters are shared via FedAvg.
+      arc.* is kept local — client-specific identity prototypes.
+      center_loss.centres is kept local — per-client class centres
+      that are carried over across rounds (never sent to server).
+
+    Optimiser
+    ─────────
+      Adam (CompNet/CCNet) or AdamW (DINOv2) with constant lr — recreated
+      each round since the model resets to the global backbone each round.
+      CenterLoss has its own SGD optimiser (center_loss_lr) that persists
+      across rounds so centres accumulate knowledge across FL rounds.
+
+    Augmentation modes (controlled by active_style_bank passed per round)
+    ──────────────────────────────────────────────────────────────────────
+      active_style_bank empty  → AugmentedDataset (spatial aug only)
+      active_style_bank filled → FFTAugmentedDataset (FFT + spatial aug)
+      Mixed mode is handled in main() by passing an empty bank for the
+      first mixed_aug_round rounds and a full bank thereafter — local_train
+      needs no special logic for it.
     """
 
     def __init__(self, client_id, spectrum, train_samples, label_map,
@@ -136,12 +92,20 @@ class FLClient:
         self.num_classes   = num_classes
         self.cfg           = cfg
         self.device        = device
-        self.model         = build_model(cfg, num_classes).to(device)
 
+        # local model — backbone overwritten each round from global weights
+        self.model = build_model(cfg, num_classes).to(device)
+
+        # center loss — kept local, never shared, persists across rounds
+        # embed_dim depends on model: 512 (CompNet), 2048 (CCNet), 384 (DINOv2)
         model_name = cfg["model"].strip().lower()
         if cfg.get("use_center_loss", False):
-            embed_dim = (cfg["embedding_dim"] if model_name == "compnet"
-                         else 2048 if model_name == "ccnet" else 384)
+            if model_name == "compnet":
+                embed_dim = cfg["embedding_dim"]
+            elif model_name == "ccnet":
+                embed_dim = 2048
+            else:  # dinov2
+                embed_dim = 384
             self.center_loss = CenterLoss(num_classes, embed_dim, device)
             self.center_optimizer = optim.SGD(
                 self.center_loss.parameters(),
@@ -150,73 +114,75 @@ class FLClient:
             self.center_loss      = None
             self.center_optimizer = None
 
-        n_experts_info = (f"  [MoE: {1 + cfg.get('n_domains',6)} CompNets, "
-                          f"warmup={cfg.get('moe_warmup_round',0)}]"
-                          if cfg.get("use_moe") and model_name == "compnet"
-                          else "")
         print(f"  Client {client_id} [{spectrum}] [{cfg['model']}] — "
               f"train IDs: {num_classes}  samples: {len(train_samples)}"
-              f"{n_experts_info}")
+              + (f"  [CenterLoss λ={cfg.get('center_loss_weight', 0.003)}]"
+                 if cfg.get("use_center_loss", False) else ""))
 
-    # ── weight management ─────────────────────────────────────────────────────
+    # ── weight management ───────────────────────────────────────────────────
+
+    def set_weights(self, backbone_state_dict):
+        """
+        Load global backbone weights into local model.
+        ArcFace head (arc.*) is never in backbone_state_dict and is
+        therefore preserved unchanged — local identity prototypes are kept.
+        """
+        local_state = self.model.state_dict()
+        for key, val in backbone_state_dict.items():
+            if key in local_state and local_state[key].shape == val.shape:
+                local_state[key] = val.clone()
+        self.model.load_state_dict(local_state)
 
     def get_weights(self):
-        """Return backbone weights for FedAvg — arc.* excluded."""
-        if isinstance(self.model, MultiExpertCompNet):
-            return self.model.get_weights()
+        """Return backbone weights for FedAvg — ArcFace head excluded."""
         return {k: v.cpu().clone()
                 for k, v in self.model.state_dict().items()
                 if not k.startswith("arc.")}
 
-    def set_weights(self, weights):
-        """Load global backbone weights into local model."""
-        if isinstance(self.model, MultiExpertCompNet):
-            self.model.set_weights(weights)
-            return
-        local = self.model.state_dict()
-        for k, v in weights.items():
-            if k in local and local[k].shape == v.shape:
-                local[k] = v.clone()
-        self.model.load_state_dict(local)
-
-    def activate_moe(self):
-        """Upgrade local model from warmup to full MoE mode."""
-        if isinstance(self.model, MultiExpertCompNet):
-            self.model.activate_moe()
-
-    # ── local training ────────────────────────────────────────────────────────
+    # ── local training ──────────────────────────────────────────────────────
 
     def local_train(self, local_epochs, active_style_bank, M, rnd,
                     mean_bank=None):
+        """
+        Train local model for local_epochs epochs.
+
+        active_style_bank controls augmentation mode this round:
+          {}       → AugmentedDataset  (spatial aug only)
+          non-empty → FFTAugmentedDataset (FFT + spatial aug)
+        This means mixed-mode is transparent here — main() simply passes
+        an empty bank for spatial rounds and a full bank for FFT rounds.
+        """
         model_name = self.cfg["model"].strip().lower()
         is_dino    = model_name == "dinov2"
         img_side   = self.cfg.get("dino_img_side", 224) if is_dino else self.cfg["img_side"]
         grayscale  = not is_dino
 
         if model_name in ("compnet", "dinov2"):
-            if active_style_bank and M > 1:
+            det_donors  = False
+            effective_M = M
+
+            if active_style_bank and effective_M > 1:
                 dataset = FFTAugmentedDataset(
                     samples              = self.train_samples,
                     style_bank           = active_style_bank,
                     client_id            = self.client_id,
-                    M                    = M,
+                    M                    = effective_M,
                     beta                 = self.cfg["fft_beta"],
                     img_side             = img_side,
                     grayscale            = grayscale,
                     mean_bank            = mean_bank
-                                           if self.cfg.get("domain_aware_mixing")
+                                           if self.cfg.get("domain_aware_mixing", False)
                                            else None,
                     prefer_distant       = self.cfg.get("prefer_distant_domain", True),
                     use_mean_template    = self.cfg.get("use_mean_template", False),
-                    deterministic_donors = False,
-                    fft_method           = self.cfg.get("fft_aug_method", "amplitude"),
-                    local_only           = self.cfg.get("fft_local_only", False),
+                    deterministic_donors = det_donors,
                 )
             else:
                 dataset = AugmentedDataset(self.train_samples, img_side,
                                            grayscale=grayscale)
 
         elif model_name == "ccnet":
+            # For CCNet, active_style_bank controls FFT on paired views too.
             dataset = PairedDataset(
                 samples    = self.train_samples,
                 img_side   = img_side,
@@ -224,10 +190,12 @@ class FLClient:
                 client_id  = self.client_id,
                 beta       = self.cfg["fft_beta"],
             )
+
         else:
             raise ValueError(f"Unknown model: '{self.cfg['model']}'")
 
-        round_seed   = self.cfg["random_seed"] + rnd * 1000 + self.client_id
+        # deterministic seed per (round, client) — same across all aug runs
+        round_seed = self.cfg["random_seed"] + rnd * 1000 + self.client_id
         train_loader = DataLoader(
             dataset,
             batch_size     = self.cfg["batch_size"],
@@ -243,35 +211,37 @@ class FLClient:
 
         criterion = nn.CrossEntropyLoss()
         if is_dino:
-            optimizer = optim.AdamW(self.model.parameters(), lr=self.cfg["lr"],
-                                    weight_decay=self.cfg.get("dino_weight_decay", 1e-4))
+            optimizer = optim.AdamW(
+                self.model.parameters(), lr=self.cfg["lr"],
+                weight_decay=self.cfg.get("dino_weight_decay", 1e-4))
         else:
             optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
 
-        lambda_c = (self.cfg.get("center_loss_weight", 0.0)
-                    if self.cfg.get("use_center_loss") else 0.0)
+        lambda_c = self.cfg.get("center_loss_weight", 0.0) \
+                   if self.cfg.get("use_center_loss", False) else 0.0
 
         avg_loss, accuracy = 0.0, 0.0
         for _ in range(local_epochs):
             if model_name in ("compnet", "dinov2"):
                 avg_loss, accuracy = train_compnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device,
-                    center_loss         = self.center_loss,
-                    center_optimizer    = self.center_optimizer,
-                    lambda_center       = lambda_c,
-                    lambda_style        = self.cfg.get("lambda_style", 0.0),
-                    lambda_grl          = (self.cfg.get("lambda_grl", 0.0)
-                                           if self.cfg.get("use_grl") else 0.0),
-                    lambda_load_balance = 0.0,
-                    lambda_supcon       = (self.cfg.get("lambda_supcon", 0.0)
-                                           if self.cfg.get("use_supcon") else 0.0),
-                    temperature         = self.cfg.get("temperature", 0.07),
+                    center_loss      = self.center_loss,
+                    center_optimizer = self.center_optimizer,
+                    lambda_center    = lambda_c,
+                    lambda_style     = self.cfg.get("lambda_style", 0.0),
+                    lambda_grl       = self.cfg.get("lambda_grl", 0.0)
+                                       if self.cfg.get("use_grl", False) else 0.0,
+                    lambda_load_balance = self.cfg.get("lambda_load_balance", 0.0)
+                                         if self.cfg.get("use_moe", False) else 0.0,
+                    lambda_supcon    = self.cfg.get("lambda_supcon", 0.0)
+                                       if self.cfg.get("use_supcon", False) else 0.0,
+                    temperature      = self.cfg.get("temperature", 0.07),
                 )
             elif model_name == "ccnet":
                 avg_loss, accuracy = train_ccnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device,
-                    ce_weight        = self.cfg.get("ce_weight", 0.8),
-                    con_weight       = self.cfg.get("con_weight", 0.2),
+                    ce_weight        = self.cfg.get("ce_weight",   0.8),
+                    con_weight       = self.cfg.get("con_weight",  0.2),
                     temperature      = self.cfg.get("temperature", 0.07),
                     center_loss      = self.center_loss,
                     center_optimizer = self.center_optimizer,
@@ -280,30 +250,33 @@ class FLClient:
 
         return avg_loss, accuracy
 
-    # ── style template extraction ─────────────────────────────────────────────
+    # ── style template extraction ───────────────────────────────────────────
 
     def extract_style_templates(self):
+        """
+        Extract FFT amplitude templates from all local training samples.
+        Always called regardless of aug mode so random state is identical
+        across spatial, FFT, and mixed runs.
+
+        Grayscale models (CompNet, CCNet): load as L → (H, W) template.
+        DINOv2: load as RGB → (H, W, 3) per-channel template.
+        Both formats are handled by extract_style_template() in utils.py.
+        """
         model_name = self.cfg["model"].strip().lower()
         is_dino    = model_name == "dinov2"
         img_side   = self.cfg.get("dino_img_side", 224) if is_dino \
                      else self.cfg["img_side"]
         mode       = "RGB" if is_dino else "L"
-        fft_method = self.cfg.get("fft_aug_method", "amplitude")
 
         templates = []
         for path, _ in self.train_samples:
             img    = Image.open(path).convert(mode).resize(
                 (img_side, img_side), Image.BILINEAR)
             img_np = np.array(img, dtype=np.float32) / 255.0
-            templates.append(
-                extract_radial_template(img_np)
-                if fft_method == "radial" and not is_dino
-                else extract_style_template(img_np))
-
-        method_label = (f"radial({self.cfg.get('fft_beta',0.1)})"
-                        if fft_method == "radial" else "amplitude")
+            templates.append(extract_style_template(img_np))
         print(f"  Client {self.client_id} [{self.spectrum}] "
-              f"— {len(templates)} templates  [{method_label}]")
+              f"— extracted {len(templates)} {'RGB' if is_dino else 'grayscale'} "
+              f"style templates")
         return templates
 
 
@@ -313,124 +286,112 @@ class FLClient:
 
 class FLServer:
     """
-    Central server — FedAvg aggregation and global evaluation.
-
-    MoE activation
-    ──────────────
-    After aggregation at round cfg["moe_warmup_round"] the server calls
-    activate_moe() which:
-      1. Calls global_model.activate_moe() — copies base weights into all
-         domain experts on the global model.
-      2. Calls client.activate_moe() on every client.
-      3. Pushes upgraded global weights to all clients via set_weights().
-
-    FedAvg with MultiExpertCompNet
-    ───────────────────────────────
-    aggregate() averages weights across clients using the same prefixed
-    key scheme ('experts.{i}.{param}') that MultiExpertCompNet uses.
-    Each expert's backbone is averaged independently across clients.
+    Central server:
+      - maintains the global model
+      - performs FedAvg aggregation on backbone weights only
+      - evaluates the global model on the shared gallery/probe test sets
     """
 
-    def __init__(self, num_classes, gallery_samples, probe_samples,
-                 cfg, device, clients):
-        self.cfg     = cfg
-        self.device  = device
-        self.clients = clients
+    def __init__(self, num_classes, gallery_samples, probe_samples, cfg, device):
+        self.cfg    = cfg
+        self.device = device
 
         self.global_model = build_model(cfg, num_classes).to(device)
 
-        # PalmDataset returns (img, label, domain_id) when samples have 3 elements
-        # — the DataLoader therefore yields 3-tuples, which evaluate_model_with_domain
-        # handles by forwarding domain_ids to get_embedding().
         self.gallery_loader = DataLoader(
             make_eval_dataset(gallery_samples, cfg),
-            batch_size=cfg["batch_size"], shuffle=False,
-            num_workers=cfg["num_workers"], pin_memory=True)
+            batch_size  = cfg["batch_size"],
+            shuffle     = False,
+            num_workers = cfg["num_workers"],
+            pin_memory  = True,
+        )
         self.probe_loader = DataLoader(
             make_eval_dataset(probe_samples, cfg),
-            batch_size=cfg["batch_size"], shuffle=False,
-            num_workers=cfg["num_workers"], pin_memory=True)
+            batch_size  = cfg["batch_size"],
+            shuffle     = False,
+            num_workers = cfg["num_workers"],
+            pin_memory  = True,
+        )
 
         print(f"  Server [{cfg['model']}] — "
               f"gallery: {len(gallery_samples)}  probe: {len(probe_samples)}")
 
     def get_global_weights(self):
-        if isinstance(self.global_model, MultiExpertCompNet):
-            return self.global_model.get_weights()
+        """Return backbone weights only (arc.* excluded)."""
         return {k: v.cpu().clone()
                 for k, v in self.global_model.state_dict().items()
                 if not k.startswith("arc.")}
 
     def aggregate(self, client_weight_dicts):
-        """FedAvg — averages all backbone weights across clients."""
+        """FedAvg on backbone parameters — arc.* never aggregated."""
         n        = len(client_weight_dicts)
         avg_dict = {}
         for key in client_weight_dicts[0].keys():
             stacked      = torch.stack(
                 [client_weight_dicts[i][key].float() for i in range(n)], dim=0)
             avg_dict[key] = stacked.mean(dim=0)
-
-        if isinstance(self.global_model, MultiExpertCompNet):
-            self.global_model.set_weights(avg_dict)
-        else:
-            global_state = self.global_model.state_dict()
-            global_state.update(avg_dict)
-            self.global_model.load_state_dict(global_state)
-
-    def activate_moe(self):
-        """
-        Upgrade global model and all clients to full MoE mode.
-
-        Order:
-          1. Upgrade global model (copies base → all domain experts).
-          2. Upgrade each client model.
-          3. Push new global weights to every client.
-        """
-        print(f"\n{'─'*56}")
-        print(f"  MoE activation — {self.cfg.get('n_domains',6)} domain experts")
-        print(f"  Warm-starting domain experts from trained base …")
-
-        self.global_model.activate_moe()
-
-        for client in self.clients:
-            client.activate_moe()
-
-        global_weights = self.get_global_weights()
-        for client in self.clients:
-            client.set_weights(global_weights)
-
-        print(f"  All clients upgraded and synced.")
-        print(f"{'─'*56}\n")
+        global_state = self.global_model.state_dict()
+        global_state.update(avg_dict)
+        self.global_model.load_state_dict(global_state)
 
     def evaluate(self, use_whitening=False):
-        return evaluate_model_with_domain(
+        """Evaluate global model on the shared gallery and probe sets."""
+        return evaluate_model(
             self.global_model,
-            self.gallery_loader, self.probe_loader,
-            self.device, use_whitening=use_whitening)
+            self.gallery_loader, self.probe_loader, self.device,
+            use_whitening=use_whitening)
 
 
 # ══════════════════════════════════════════════════════════════
-#  AUGMENTATION HELPERS
+#  AUGMENTATION MODE HELPERS
 # ══════════════════════════════════════════════════════════════
 
 def resolve_aug_mode(cfg):
-    if cfg.get("use_mixed_aug"):  return "mixed"
-    if cfg.get("use_fft_aug"):    return "fft"
+    """
+    Determine the augmentation mode from config flags.
+
+    Priority: use_mixed_aug > use_fft_aug > spatial-only (default).
+
+    Returns
+    -------
+    mode : str   "spatial" | "fft" | "mixed"
+    """
+    if cfg.get("use_mixed_aug", False):
+        return "mixed"
+    if cfg.get("use_fft_aug", False):
+        return "fft"
     return "spatial"
 
 
 def get_active_style_bank(style_bank_full, rnd, cfg, is_dinov2):
+    """
+    Return the style bank to pass to local_train for this round.
+
+    spatial → always {}
+    fft     → always style_bank_full
+    mixed   → {} for rounds 1..mixed_aug_round
+               style_bank_full for rounds mixed_aug_round+1..n_rounds
+
+    DINOv2 now supports FFT augmentation on RGB images (per-channel FFT),
+    so no special case is needed.
+    """
     mode = resolve_aug_mode(cfg)
-    if mode == "spatial": return {}
-    if mode == "fft":     return style_bank_full
+    if mode == "spatial":
+        return {}
+    if mode == "fft":
+        return style_bank_full
+    # mixed
     switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
     return style_bank_full if rnd > switch else {}
 
 
 def aug_mode_label(rnd, cfg, is_dinov2):
+    """Short label for console log — shows which mode is active this round."""
     mode = resolve_aug_mode(cfg)
-    if mode == "spatial": return "Spatial"
-    if mode == "fft":     return "FFT"
+    if mode == "spatial":
+        return "Spatial"
+    if mode == "fft":
+        return "FFT"
     switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
     return "FFT" if rnd > switch else "Spatial"
 
@@ -445,64 +406,78 @@ def main():
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-    device      = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    base_dir    = cfg["base_results_dir"]
-    is_dinov2   = cfg["model"].strip().lower() == "dinov2"
-    aug_mode    = resolve_aug_mode(cfg)
-    use_moe     = cfg.get("use_moe", False) and cfg["model"].strip().lower() == "compnet"
-    warmup_rnd  = cfg.get("moe_warmup_round", 0) if use_moe else 0
+    device     = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    base_dir   = cfg["base_results_dir"]
+    is_dinov2  = cfg["model"].strip().lower() == "dinov2"
+    aug_mode   = resolve_aug_mode(cfg)
     os.makedirs(base_dir, exist_ok=True)
 
-    # ── header ────────────────────────────────────────────────────────────────
+    # ── header ───────────────────────────────────────────────────────────────
     print(f"\n{'='*62}")
     print(f"  Federated Learning — Palmprint")
     print(f"  Dataset  : {cfg['dataset'].upper()}")
+    print(f"  Protocol : Open-Set, Non-Shared-ID, Cross-Domain")
     print(f"  Model    : {cfg['model'].upper()}")
     print(f"  Device   : {device}")
-    print(f"  Rounds   : {cfg['n_rounds']}   Local epochs: {cfg['local_epochs']}")
-    if use_moe:
-        n_dom = cfg.get("n_domains", 6)
-        print(f"  MoE      : {1+n_dom} CompNets "
-              f"(1 base + {n_dom} domain experts)")
-        if warmup_rnd > 0:
-            print(f"  Warmup   : {warmup_rnd} rounds (base only) → "
-                  f"domain experts activated at round {warmup_rnd}")
-        else:
-            print(f"  Warmup   : none (full MoE from round 1)")
-    print(f"  Aug mode : {aug_mode.upper()}   M={cfg['M']}   beta={cfg['fft_beta']}")
-    print(f"  LR       : {cfg['lr']}")
+    print(f"  Rounds   : {cfg['n_rounds']}   "
+          f"Local epochs/round : {cfg['local_epochs']}")
+    print(f"  IDs : {cfg['n_ids']}   "
+          f"Test ID ratio : {cfg['k_test']*100:.0f}%   "
+          f"Gallery ratio : {cfg['gallery_ratio']*100:.0f}%")
+    if aug_mode == "mixed":
+        switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
+        print(f"  Aug mode : MIXED  "
+              f"(Spatial rounds 1–{switch}, FFT rounds {switch+1}–{cfg['n_rounds']})"
+              f"  M={cfg['M']}  beta={cfg['fft_beta']}")
+    else:
+        print(f"  Aug mode : {aug_mode.upper()}   "
+              f"M={cfg['M']}   beta={cfg['fft_beta']}")
+    print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
     print(f"{'='*62}\n")
 
-    # ── paths ─────────────────────────────────────────────────────────────────
-    dataset_key       = cfg["dataset"].strip().lower()
-    model_key         = cfg["model"].strip().lower()
+    # ── resolve dataset- and model-specific paths ─────────────────────────
+    dataset_key   = cfg["dataset"].strip().lower()
+    model_key     = cfg["model"].strip().lower()
     splits_path       = cfg["splits_path"].format(dataset=dataset_key)
     init_weights_path = cfg["init_weights_path"].format(
                             dataset=dataset_key, model=model_key)
 
-    # ── splits ────────────────────────────────────────────────────────────────
+    # ── Step 0a: load or build data splits ────────────────────────────────
     os.makedirs(os.path.dirname(splits_path), exist_ok=True)
     if os.path.exists(splits_path):
-        print(f"Loading splits from: {splits_path}")
+        print(f"Loading existing data splits from: {splits_path}")
         with open(splits_path, "rb") as f:
             splits = pickle.load(f)
-        (client_data, gallery_samples, probe_samples,
-         test_label_map, domain_names) = splits
+        client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
+        print("  Splits loaded.")
     else:
-        print(f"Building splits for {cfg['dataset'].upper()} …")
+        print(f"Building federated data splits for {cfg['dataset'].upper()} …")
         splits = get_federated_splits(cfg, seed=seed)
         with open(splits_path, "wb") as f:
             pickle.dump(splits, f)
-        (client_data, gallery_samples, probe_samples,
-         test_label_map, domain_names) = splits
+        print(f"  Splits saved to: {splits_path}")
+        client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
 
     num_classes = client_data[0]["num_classes"]
     n_clients   = len(client_data)
-    print(f"\n  Clients: {n_clients}  ({domain_names})")
-    print(f"  IDs/client: {num_classes}   Test: {len(test_label_map)}")
-    print(f"  Gallery: {len(gallery_samples)}   Probe: {len(probe_samples)}\n")
+    print(f"\n  Clients        : {n_clients}  ({domain_names})")
+    print(f"  IDs per client : {num_classes}")
+    print(f"  Test  classes  : {len(test_label_map)}")
+    print(f"  Gallery        : {len(gallery_samples)}  "
+          f"Probe : {len(probe_samples)}\n")
+    # Local label mapping (0..num_classes-1 per client) — correct for our method.
+    # ArcFace is local and never sent back from the server, so each client
+    # must train a fully-dense head. Global label mapping would create a
+    # 156-class head where 130 rows stay random throughout — permanent noise
+    # in the softmax denominator that degrades the embedding space.
+    # Global mapping is only beneficial when the assembled global ArcFace is
+    # distributed back to all clients each round (FedPalm anchor model).
 
-    # ── clients ───────────────────────────────────────────────────────────────
+    # ── Step 0b: initialise server ────────────────────────────────────────
+    print("Initialising server …")
+    server = FLServer(num_classes, gallery_samples, probe_samples, cfg, device)
+
+    # ── Step 0c: initialise clients ───────────────────────────────────────
     print("Initialising clients …")
     clients = []
     for i, cd in enumerate(client_data):
@@ -515,97 +490,123 @@ def main():
             cfg           = cfg,
             device        = device,
         ))
+    # expose n_clients count
+    cfg["_n_clients"] = list(range(n_clients))
 
-    # ── server ────────────────────────────────────────────────────────────────
-    print("Initialising server …")
-    server = FLServer(num_classes, gallery_samples, probe_samples,
-                      cfg, device, clients)
-
-    # ── initial weights ───────────────────────────────────────────────────────
+    # ── Step 0d: load or save initial model weights ───────────────────────
+    # Validate arc.weight shape — if checkpoint was saved with a different
+    # num_classes (e.g. during global-label-map experiments), regenerate.
     if os.path.exists(init_weights_path):
-        print(f"\nLoading initial weights from: {init_weights_path}")
+        _probe    = torch.load(init_weights_path, map_location="cpu")
+        _ckpt_arc = _probe.get("arc.weight", None)
+        _mod_arc  = server.global_model.state_dict()["arc.weight"]
+        if _ckpt_arc is None or _ckpt_arc.shape != _mod_arc.shape:
+            print(f"\nInit weights arc.weight shape mismatch "
+                  f"({tuple(_ckpt_arc.shape) if _ckpt_arc is not None else 'missing'} "
+                  f"→ {tuple(_mod_arc.shape)}) — regenerating.")
+            os.remove(init_weights_path)
+
+    if os.path.exists(init_weights_path):
+        print(f"\nLoading existing initial weights from: {init_weights_path}")
         init_state = torch.load(init_weights_path, map_location=device)
-        server.global_model.load_state_dict(init_state, strict=False)
-        global_weights = server.get_global_weights()
+        missing, unexpected = server.global_model.load_state_dict(
+            init_state, strict=False)
+        if missing:
+            print(f"  INFO: {len(missing)} new key(s) not in checkpoint "
+                  f"(fresh init): {missing[:4]}{'...' if len(missing)>4 else ''}")
+        backbone_init = {k: v for k, v in init_state.items()
+                         if not k.startswith("arc.")}
         for client in clients:
-            client.set_weights(global_weights)
+            client.set_weights(backbone_init)
         print("  Initial weights loaded.")
     else:
         print(f"\nSaving initial weights to: {init_weights_path}")
         torch.save(server.global_model.state_dict(), init_weights_path)
-        global_weights = server.get_global_weights()
+        backbone_init = {k: v for k, v in server.global_model.state_dict().items()
+                         if not k.startswith("arc.")}
         for client in clients:
-            client.set_weights(global_weights)
+            client.set_weights(backbone_init)
         print("  Initial weights saved.")
 
-    # ── results file ──────────────────────────────────────────────────────────
+    # ── results file ──────────────────────────────────────────────────────
     results_path  = os.path.join(base_dir, "results.txt")
     client_header = "\t".join(
         f"Client{i}_EER(%)\tClient{i}_Rank1(%)" for i in range(n_clients))
     with open(results_path, "w") as f:
-        f.write(f"Round\tAug\tMoE\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
+        f.write(f"Round\tAug_Mode\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
 
-    # ── style templates ───────────────────────────────────────────────────────
-    print("\nExtracting style templates …")
-    style_bank_full = {c.client_id: c.extract_style_templates() for c in clients}
+    # ── Step 0e: extract style templates (always, all runs) ───────────────
+    # Always extracted regardless of aug mode so that the random state
+    # consumed by extraction is identical across spatial, FFT, and mixed runs.
+    # DINOv2 returns empty lists — templates are incompatible with RGB input.
+    print("\nExtracting style templates from all clients …")
+    style_bank_full = {
+        client.client_id: client.extract_style_templates()
+        for client in clients
+    }
     total = sum(len(v) for v in style_bank_full.values())
-    print(f"  Style bank: {total} templates across {len(style_bank_full)} clients\n")
+    if total > 0:
+        print(f"  Style bank ready — {total} templates "
+              f"across {len(style_bank_full)} clients")
 
-    mean_bank_full = {cid: np.mean(t, axis=0)
-                      for cid, t in style_bank_full.items() if t}
+    # compute per-client mean template for domain-aware mixing
+    # mean_bank_full: {client_id: mean_amplitude_array}
+    # identity variation averages out over many samples leaving domain signal
+    mean_bank_full = {
+        cid: np.mean(templates, axis=0)
+        for cid, templates in style_bank_full.items()
+        if len(templates) > 0
+    }
+    if cfg.get("domain_aware_mixing", False):
+        print(f"  Mean bank ready — {len(mean_bank_full)} domain mean templates")
+    if aug_mode == "mixed":
+        switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
+        print(f"  Mixed augmentation: Spatial rounds 1–{switch}, "
+              f"FFT rounds {switch+1}–{cfg['n_rounds']}.\n")
+    elif aug_mode == "fft":
+        print("  FFT augmentation ENABLED — style bank will be used.\n")
+    else:
+        print("  Spatial augmentation only — style bank extracted "
+              "but not used during training.\n")
 
     use_whitening = cfg.get("use_whitening", False)
 
-    # ── round 0 ───────────────────────────────────────────────────────────────
-    print("--- Round 0 (random init) ---")
+    # ── Round 0: random init evaluation ──────────────────────────────────
+    print("\n--- Round 0 (random init) ---")
     g_eer_0, g_rank1_0 = server.evaluate(use_whitening=use_whitening)
-    print(f"  [Global]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
+    print(f"  [Global init]  EER={g_eer_0*100:.4f}%  Rank-1={g_rank1_0:.2f}%")
     with open(results_path, "a") as f:
-        f.write(f"0\tInit\tFalse\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
+        f.write(f"0\tInit\t{g_eer_0*100:.4f}\t{g_rank1_0:.2f}\t"
                 + "\t".join("-1\t-1" for _ in range(n_clients)) + "\n")
 
+    g_eer, g_rank1 = g_eer_0, g_rank1_0
     recent_history = []
-    moe_activated  = False
 
-    # ── FL rounds ─────────────────────────────────────────────────────────────
+    # ── FL rounds ─────────────────────────────────────────────────────────
     for rnd in range(1, cfg["n_rounds"] + 1):
         t_start = time.time()
-
-        # MoE activation: triggered at the START of round warmup_rnd+1,
-        # i.e. after the warmup-round aggregation has already run.
-        if use_moe and not moe_activated and warmup_rnd > 0 and rnd == warmup_rnd + 1:
-            server.activate_moe()
-            moe_activated = True
 
         active_style_bank = get_active_style_bank(
             style_bank_full, rnd, cfg, is_dinov2)
         mode_label = aug_mode_label(rnd, cfg, is_dinov2)
-        moe_label  = str(moe_activated or (use_moe and warmup_rnd == 0))
-
-        # moe phase tag for console
-        if use_moe:
-            if warmup_rnd > 0 and not moe_activated:
-                phase_tag = f" [warmup {rnd}/{warmup_rnd}]"
-            else:
-                phase_tag = f" [MoE: base+domain]"
-        else:
-            phase_tag = ""
 
         global_weights = server.get_global_weights()
-        client_weights, client_metrics = [], []
+        client_weights = []
+        client_metrics = []
 
-        # ── local training ────────────────────────────────────────────────────
+        # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
             client.set_weights(global_weights)
             loss, acc = client.local_train(
                 cfg["local_epochs"], active_style_bank, cfg["M"], rnd,
-                mean_bank=mean_bank_full if cfg.get("domain_aware_mixing") else None)
-
-            c_eer, c_rank1 = evaluate_model_with_domain(
+                mean_bank = mean_bank_full
+                            if cfg.get("domain_aware_mixing", False)
+                            else None)
+            c_eer, c_rank1 = evaluate_model(
                 client.model,
                 server.gallery_loader, server.probe_loader,
-                device, use_whitening=use_whitening)
-
+                device,
+                use_whitening=use_whitening)
             client_weights.append(client.get_weights())
             client_metrics.append({
                 "client_id" : client.client_id,
@@ -616,18 +617,19 @@ def main():
                 "rank1"     : round(c_rank1, 3),
             })
 
-        # ── FedAvg + evaluation ───────────────────────────────────────────────
+        # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
         g_eer, g_rank1 = server.evaluate(use_whitening=use_whitening)
         elapsed = time.time() - t_start
 
+        # keep a rolling window for final average reporting
+        avg_rounds = cfg.get("avg_last_rounds", 5)
         recent_history.append((g_eer, g_rank1))
-        if len(recent_history) > cfg.get("avg_last_rounds", 5):
+        if len(recent_history) > avg_rounds:
             recent_history.pop(0)
 
         ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} "
-              f"[{mode_label}]{phase_tag} | "
+        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} [{mode_label}] | "
               f"Global EER={g_eer*100:.4f}%  Rank-1={g_rank1:.2f}%  "
               f"({elapsed:.1f}s)")
         for cm in client_metrics:
@@ -636,32 +638,34 @@ def main():
                   f"EER={cm['eer']*100:.3f}%  R1={cm['rank1']:.1f}%")
 
         client_cols = "\t".join(
-            f"{cm['eer']*100:.4f}\t{cm['rank1']:.2f}" for cm in client_metrics)
+            f"{cm['eer']*100:.4f}\t{cm['rank1']:.2f}"
+            for cm in client_metrics)
         with open(results_path, "a") as f:
-            f.write(f"{rnd}\t{mode_label}\t{moe_label}\t"
-                    f"{g_eer*100:.4f}\t{g_rank1:.2f}\t{client_cols}\n")
+            f.write(f"{rnd}\t{mode_label}\t{g_eer*100:.4f}\t{g_rank1:.2f}"
+                    f"\t{client_cols}\n")
 
-    # ── final report ──────────────────────────────────────────────────────────
-    n_avg     = len(recent_history)
-    avg_eer   = sum(e for e, _ in recent_history) / n_avg
-    avg_rank1 = sum(r for _, r in recent_history) / n_avg
+    # ── Final reporting ───────────────────────────────────────────────────
+    avg_rounds   = cfg.get("avg_last_rounds", 5)
+    n_avg        = len(recent_history)          # may be < avg_rounds if few rounds ran
+    avg_eer      = sum(e for e, _ in recent_history) / n_avg
+    avg_rank1    = sum(r for _, r in recent_history) / n_avg
 
     print(f"\n{'='*62}")
     print(f"  FL COMPLETE — {cfg['n_rounds']} rounds")
-    print(f"  Dataset   : {cfg['dataset'].upper()}")
-    print(f"  Model     : {cfg['model'].upper()}")
-    print(f"  Aug mode  : {aug_mode.upper()}")
-    if use_moe:
-        print(f"  MoE       : {1+cfg.get('n_domains',6)} CompNets  "
-              f"warmup={warmup_rnd}")
-    print(f"  Avg EER   : {avg_eer*100:.4f}%  (last {n_avg} rounds)")
-    print(f"  Avg Rank-1: {avg_rank1:.2f}%  (last {n_avg} rounds)")
-    print(f"  Results   : {results_path}")
+    print(f"  Dataset            : {cfg['dataset'].upper()}")
+    print(f"  Model              : {cfg['model'].upper()}")
+    print(f"  Aug mode           : {aug_mode.upper()}")
+    print(f"  Avg Global EER     : {avg_eer*100:.4f}%  "
+          f"(last {n_avg} rounds)")
+    print(f"  Avg Global Rank-1  : {avg_rank1:.2f}%  "
+          f"(last {n_avg} rounds)")
+    print(f"  Results saved to   : {results_path}")
     print(f"{'='*62}")
 
+    # append average summary line to results file
     with open(results_path, "a") as f:
         f.write(f"\n# Average of last {n_avg} rounds\n")
-        f.write(f"avg_{n_avg}\t—\t—\t{avg_eer*100:.4f}\t{avg_rank1:.2f}\n")
+        f.write(f"avg_{n_avg}\t—\t{avg_eer*100:.4f}\t{avg_rank1:.2f}\n")
 
 
 if __name__ == "__main__":
