@@ -1,16 +1,62 @@
 # ==============================================================
 #  models.py — CompNet and CCNet architectures
 # ==============================================================
-#  CompNet : GaborConv2d → CompetitiveBlock × 3 → FC → ArcFace
+#  CompNet : GaborConv2d → CompetitiveBlock × 3 → MoEFC → ArcFace
 #  CCNet   : CCGaborConv2d → CompetitiveBlock_Mul_Ord_Comp × 3
 #            → FC(13152→4096→2048) → ArcFace  +  SupConLoss
+#
+#  MoE changes
+#  ───────────
+#  _LoRABlock  : shared primitive — A(in→rank) → ReLU → B(rank→out), B init=0
+#  MoEFC       : shared LoRA base + per-domain LoRA experts
+#                output = B(ReLU(A(x))) + B_d(ReLU(A_d(x)))
+#  MoELayerNorm: per-domain affine LN (unchanged)
+#
+#  Deferred MoE activation
+#  ───────────────────────
+#  When cfg["moe_warmup_round"] > 0 CompNet starts with use_moe=False for the
+#  first moe_warmup_round rounds (shared LoRA base only, no experts, no domain
+#  LN).  At round moe_warmup_round the server calls
+#  model.activate_moe(moe_position) which:
+#    • copies the trained shared LoRA base weights into every expert (A_d ← A,
+#      B_d ← B), giving each expert a warm start rather than zero-init noise
+#    • replaces the standard LayerNorm with MoELayerNorm (if position includes
+#      "norm") initialised at γ=1, β=0 (identity — safe warm start)
+#    • sets self.use_moe = True so subsequent forward passes use routing
 # ==============================================================
 
 import math
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHARED LoRA PRIMITIVE
+# ══════════════════════════════════════════════════════════════
+
+class _LoRABlock(nn.Module):
+    """
+    Minimal LoRA block: A(in→rank) → ReLU → B(rank→out).
+
+    A is kaiming-initialised; B is zero-initialised so the block
+    contributes nothing at round 0 and learns its residual from scratch.
+    Use a small normal init on B (std=1e-4) to break zero-symmetry while
+    preserving the near-identity starting point.
+
+    Used as both the shared base and each per-domain expert inside MoEFC.
+    """
+    def __init__(self, in_features, out_features, rank, b_init_std=1e-4):
+        super().__init__()
+        self.A = nn.Linear(in_features, rank, bias=False)
+        self.B = nn.Linear(rank, out_features, bias=False)
+        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
+        nn.init.normal_(self.B.weight, std=b_init_std)
+
+    def forward(self, x):
+        return self.B(F.relu(self.A(x)))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -103,12 +149,7 @@ class ArcMarginProduct(nn.Module):
 
 
 class GRL(torch.autograd.Function):
-    """
-    Gradient Reversal Layer (Ganin & Lempitsky, DANN 2016).
-    Forward pass: identity.
-    Backward pass: gradient multiplied by -λ.
-    λ controls the strength of domain adversarial signal.
-    """
+    """Gradient Reversal Layer (Ganin & Lempitsky, DANN 2016)."""
     @staticmethod
     def forward(ctx, x, lam):
         ctx.lam = lam
@@ -120,17 +161,7 @@ class GRL(torch.autograd.Function):
 
 
 class DomainClassifier(nn.Module):
-    """
-    Shared domain classification head used with GRL.
-    Receives GRL-reversed embeddings and tries to predict domain.
-    The reversed gradient pushes the backbone away from domain-discriminative
-    features.
-
-    Shared via FedAvg: each client sees only its own domain during training,
-    but after aggregation the classifier has knowledge of all 6 domains.
-    The GRL signal therefore drives backbone toward globally domain-invariant
-    representations.
-    """
+    """Shared domain classification head used with GRL."""
     def __init__(self, in_features, n_domains):
         super().__init__()
         self.net = nn.Sequential(
@@ -143,150 +174,118 @@ class DomainClassifier(nn.Module):
         return self.net(x)
 
 
-class _ResidualExpert(nn.Module):
-    """
-    Low-rank domain-specific residual adapter: Linear(in→rank) → ReLU → Linear(rank→out).
-    B initialised to zero → zero contribution at round 0, learned from training.
-    """
-    def __init__(self, in_features, out_features, rank):
-        super().__init__()
-        self.A = nn.Linear(in_features, rank, bias=False)
-        self.B = nn.Linear(rank, out_features, bias=False)
-        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
-        nn.init.zeros_(self.B.weight)
-
-    def forward(self, x):
-        return self.B(F.relu(self.A(x)))
-
+# ══════════════════════════════════════════════════════════════
+#  MoEFC  —  shared LoRA base + per-domain LoRA experts
+# ══════════════════════════════════════════════════════════════
 
 class MoEFC(nn.Module):
     """
-    Exact-routing MoE at the FC bottleneck position.
-    Replaces nn.Linear(9708→512):
-        output = base_FC(x) + expert[domain_id](x)
+    FC bottleneck where both the shared base and every expert are _LoRABlocks.
 
-    Applied on: (B, 9708) Gabor feature concatenation.
-    Expert adapts the projection from raw texture features → embedding space.
-    Each expert learns a domain-specific correction to the shared projection.
+    output = base(x) + expert[d](x)
+           = B(ReLU(A(x))) + B_d(ReLU(A_d(x)))
 
-    moe_position="fc" in CompNet.
+    Deferred activation
+    ───────────────────
+    When CompNet is constructed with use_moe=False (warmup phase) this layer
+    is not instantiated.  Once activate_moe() is called the server replaces
+    the plain shared _LoRABlock (self.fc) with a full MoEFC whose experts are
+    initialised from the trained base weights — see CompNet.activate_moe().
+
+    Inference (domain_ids=None)
+    ───────────────────────────
+    Only the shared base is applied.  Expert contribution requires a domain
+    label and is skipped at evaluation time (gallery/probe sets are unlabelled
+    by domain in the evaluation loop).
     """
     def __init__(self, in_features=9708, out_features=512,
                  n_experts=6, rank=64):
         super().__init__()
         self.n_experts = n_experts
-        self.base      = nn.Linear(in_features, out_features)
+        self.base      = _LoRABlock(in_features, out_features, rank)
         self.experts   = nn.ModuleList([
-            _ResidualExpert(in_features, out_features, rank)
+            _LoRABlock(in_features, out_features, rank)
             for _ in range(n_experts)
         ])
 
     def forward(self, x, domain_ids=None):
-        base_out = self.base(x)                          # [B, 512]
+        out = self.base(x)
         if domain_ids is None:
-            return base_out                              # inference: base only
-        residual = torch.zeros_like(base_out)
+            return out
+        residual = torch.zeros_like(out)
         for d in range(self.n_experts):
             mask = (domain_ids == d)
             if mask.any():
                 residual[mask] = self.experts[d](x[mask])
-        return base_out + residual
+        return out + residual
 
+
+# ══════════════════════════════════════════════════════════════
+#  MoELayerNorm  —  per-domain affine LayerNorm
+# ══════════════════════════════════════════════════════════════
 
 class MoELayerNorm(nn.Module):
     """
-    Domain-conditional LayerNorm — replaces the shared LayerNorm(512).
+    Domain-conditional LayerNorm.
+    y = (x - μ) / σ  ×  γ[d]  +  β[d]
 
-    Standard LayerNorm:
-        y = (x - μ) / σ  ×  γ  +  β        (shared γ, β for all domains)
+    Initialised at γ=1, β=0 (identity) so activating it mid-training does
+    not disturb the existing embedding distribution.
 
-    MoELayerNorm:
-        y = (x - μ) / σ  ×  γ[d]  +  β[d]  (per-domain γ[d], β[d])
-
-    Each domain gets its own affine parameters (scale and shift) applied
-    after the shared normalisation statistics. The normalisation itself
-    (mean/std computation) is still shared — only the affine transform
-    is domain-specific.
-
-    Why this position:
-      LayerNorm's γ and β control the scale and shift of the normalised
-      embedding. Different spectral domains produce embeddings with
-      different magnitude distributions — domain-specific affine params
-      let each domain recalibrate the embedding to its own scale before
-      the ArcFace angular margin loss, without touching the shared backbone.
-
-    moe_position="norm" in CompNet.
-
-    Parameters per expert: 2 × embedding_dim = 2 × 512 = 1024
-    Total MoE params: n_experts × 1024  (vs n_experts × 654k for MoEFC)
-    Extremely lightweight — no additional linear layers.
-
-    Training: domain_ids selects which γ[d], β[d] to apply per sample.
-    Inference: domain_ids=None → falls back to shared γ[0], β[0]
-               (or mean of all experts — see forward).
+    Inference fallback (domain_ids=None): mean of all experts' γ and β.
     """
     def __init__(self, embedding_dim=512, n_experts=6, eps=1e-5):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.n_experts     = n_experts
         self.eps           = eps
-
-        # per-domain affine params: gamma[d] and beta[d]
-        # shape: (n_experts, embedding_dim)
-        # initialised to γ=1, β=0 so at round 0 it behaves like standard LN
         self.gamma = nn.Parameter(torch.ones(n_experts, embedding_dim))
         self.beta  = nn.Parameter(torch.zeros(n_experts, embedding_dim))
 
     def forward(self, x, domain_ids=None):
-        """
-        x          : (B, embedding_dim)
-        domain_ids : (B,) int tensor  or  None
-
-        Normalises x (shared statistics), then applies per-domain γ[d], β[d].
-        If domain_ids is None (inference without domain label):
-            uses mean of all experts' γ and β — smooth average.
-        """
-        # shared normalisation: (x - mean) / std per sample
-        mean = x.mean(dim=-1, keepdim=True)
-        var  = x.var(dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)   # (B, D)
-
+        mean   = x.mean(dim=-1, keepdim=True)
+        var    = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
         if domain_ids is None:
-            # inference fallback: average all domain affine params
-            g = self.gamma.mean(dim=0)   # (D,)
-            b = self.beta.mean(dim=0)    # (D,)
-            return x_norm * g + b
+            return x_norm * self.gamma.mean(dim=0) + self.beta.mean(dim=0)
+        return x_norm * self.gamma[domain_ids] + self.beta[domain_ids]
 
-        # training: select per-sample γ[d], β[d]
-        g = self.gamma[domain_ids]   # (B, D)
-        b = self.beta[domain_ids]    # (B, D)
-        return x_norm * g + b
 
+# ══════════════════════════════════════════════════════════════
+#  CompNet
+# ══════════════════════════════════════════════════════════════
 
 class CompNet(nn.Module):
     """
     CompNet = CB1 // CB2 // CB3 + FC(9708→512) + LayerNorm + Dropout + ArcFace.
 
-    Two independent MoE toggles — can be used separately or together:
+    MoE positions
+    ─────────────
+    "fc"   — shared LoRA base + per-domain LoRA experts at the FC bottleneck
+    "norm" — per-domain LayerNorm affine transform
+    "both" — both of the above
 
-    moe_position="fc"   — LoRA experts at the FC bottleneck:
-        output = base_Linear(9708→512) + expert[d](9708→rank→512)
-        Each expert is a low-rank residual adapter (A: 9708→rank, B: rank→512).
-        Adapts the Gabor texture → embedding projection per domain.
-        Params per expert: 9708×rank + rank×512  (rank=64 → ~654k per expert)
+    Deferred MoE activation  (moe_warmup_round > 0)
+    ───────────────────────────────────────────────
+    Phase 1 (rounds 1 … moe_warmup_round):
+      use_moe=False internally.  The FC is a plain _LoRABlock (shared base
+      only) and the norm is a standard LayerNorm.  All clients train the
+      shared base together via FedAvg — the base expert learns a domain-
+      agnostic representation.
 
-    moe_position="norm" — Per-domain LayerNorm:
-        output = (x-μ)/σ × γ[d] + β[d]
-        Shared normalisation statistics, domain-specific affine transform.
-        Recalibrates embedding scale/shift per domain before ArcFace.
-        Params per expert: 2 × 512 = 1024  (extremely lightweight)
-
-    moe_position="both" — LoRA experts at FC AND per-domain LayerNorm.
-        Maximum domain adaptation — projection and normalisation both
-        domain-specific. Use for ablation to measure each contribution.
+    Phase 2 (round moe_warmup_round + 1 … n_rounds):
+      The server calls model.activate_moe(moe_position) on the global model
+      immediately after round moe_warmup_round aggregation.  This:
+        1. Builds MoEFC and copies trained base weights → every expert A_d/B_d.
+        2. Replaces LayerNorm with MoELayerNorm (γ=1, β=0).
+        3. Sets self.use_moe = True.
+      The updated global model is then distributed to all clients as usual.
+      Experts start from the trained base — not from random init — so they
+      immediately have a meaningful starting point and diverge only by the
+      domain-specific residual they learn in subsequent rounds.
 
     Optional GRL (use_grl=True):
-        emb → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss.
+      emb → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss.
     """
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25,
@@ -297,18 +296,23 @@ class CompNet(nn.Module):
         self.cb1          = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
         self.cb2          = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
         self.cb3          = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
+
         self.use_moe      = use_moe
-        self.moe_position = moe_position   # "fc" | "norm" | "both"
+        self.moe_position = moe_position
+        self.n_experts    = n_experts
+        self.lora_rank    = lora_rank
+        self.embedding_dim = embedding_dim
 
         # ── FC layer ──────────────────────────────────────────────────────────
-        # MoEFC when moe_position is "fc" or "both"; plain Linear otherwise
+        # warmup (use_moe=False): plain shared _LoRABlock (base only, no experts)
+        # active  (use_moe=True): full MoEFC (shared base + per-domain experts)
         if use_moe and moe_position in ("fc", "both"):
-            self.fc       = MoEFC(9708, embedding_dim, n_experts, lora_rank)
+            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank)
         else:
-            self.fc       = nn.Linear(9708, embedding_dim)
+            # single shared LoRA block — same architecture as MoEFC.base
+            self.fc = _LoRABlock(9708, embedding_dim, lora_rank)
 
         # ── LayerNorm ─────────────────────────────────────────────────────────
-        # MoELayerNorm when moe_position is "norm" or "both"; shared LN otherwise
         if use_moe and moe_position in ("norm", "both"):
             self.emb_norm = MoELayerNorm(embedding_dim, n_experts)
         else:
@@ -321,6 +325,72 @@ class CompNet(nn.Module):
         self.domain_classifier = (DomainClassifier(embedding_dim, n_domains)
                                    if use_grl else None)
 
+    # ── deferred MoE activation ───────────────────────────────────────────────
+
+    def activate_moe(self, moe_position=None):
+        """
+        Switch the model from warmup mode (shared LoRA base only) to full MoE
+        mode (shared base + per-domain experts + optional per-domain LayerNorm).
+
+        Called by the server on the global model at round moe_warmup_round.
+        The updated state dict is then distributed to all clients via the
+        normal set_weights() path.
+
+        Steps
+        ─────
+        1. If FC position: build MoEFC, copy trained base weights into the
+           shared base slot AND into every expert (warm-start experts).
+        2. If norm position: replace LayerNorm with MoELayerNorm (γ=1, β=0).
+        3. Set self.use_moe = True and self.moe_position.
+
+        Parameters
+        ----------
+        moe_position : str | None
+            "fc" | "norm" | "both".  If None, uses self.moe_position.
+        """
+        if self.use_moe:
+            print("  [activate_moe] MoE already active — skipping.")
+            return
+
+        if moe_position is not None:
+            self.moe_position = moe_position
+
+        device = next(self.parameters()).device
+
+        # ── FC upgrade ────────────────────────────────────────────────────────
+        if self.moe_position in ("fc", "both"):
+            if not isinstance(self.fc, MoEFC):
+                # self.fc is currently a _LoRABlock (trained shared base)
+                trained_base = self.fc          # keep reference before replace
+
+                new_moe = MoEFC(9708, self.embedding_dim,
+                                self.n_experts, self.lora_rank).to(device)
+
+                # copy trained base weights into new_moe.base
+                new_moe.base.load_state_dict(trained_base.state_dict())
+
+                # warm-start every expert from the trained base
+                base_sd = trained_base.state_dict()
+                for expert in new_moe.experts:
+                    expert.load_state_dict(copy.deepcopy(base_sd))
+
+                self.fc = new_moe
+                print(f"  [activate_moe] FC upgraded: _LoRABlock → MoEFC "
+                      f"({self.n_experts} experts warm-started from base)")
+
+        # ── Norm upgrade ──────────────────────────────────────────────────────
+        if self.moe_position in ("norm", "both"):
+            if isinstance(self.emb_norm, nn.LayerNorm):
+                self.emb_norm = MoELayerNorm(
+                    self.embedding_dim, self.n_experts).to(device)
+                print(f"  [activate_moe] Norm upgraded: LayerNorm → MoELayerNorm "
+                      f"(γ=1, β=0 — identity warm start)")
+
+        self.use_moe = True
+        print(f"  [activate_moe] MoE active — position='{self.moe_position}'")
+
+    # ── forward ───────────────────────────────────────────────────────────────
+
     def _backbone(self, x, domain_ids=None):
         feat = torch.cat([self.cb1(x).flatten(1),
                           self.cb2(x).flatten(1),
@@ -330,7 +400,7 @@ class CompNet(nn.Module):
         if self.use_moe and self.moe_position in ("fc", "both"):
             emb = self.fc(feat, domain_ids)
         else:
-            emb = self.fc(feat)
+            emb = self.fc(feat)                              # plain _LoRABlock
 
         # LayerNorm / MoELayerNorm
         if self.use_moe and self.moe_position in ("norm", "both"):
@@ -358,10 +428,7 @@ class CompNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class SupConLoss(nn.Module):
-    """
-    Supervised Contrastive Loss (CCNet/loss.py — exact copy).
-    Expects features of shape [batch, n_views, embed_dim].
-    """
+    """Supervised Contrastive Loss (CCNet/loss.py — exact copy)."""
     def __init__(self, temperature=0.07, contrast_mode='all',
                  base_temperature=0.07):
         super().__init__()
@@ -412,7 +479,7 @@ class SupConLoss(nn.Module):
 
 
 class CCGaborConv2d(nn.Module):
-    """Learnable Gabor Convolution layer — CCNet version (stride=2, padding)."""
+    """Learnable Gabor Convolution layer — CCNet version."""
     def __init__(self, channel_in, channel_out, kernel_size,
                  stride=1, padding=0, init_ratio=1):
         super().__init__()
@@ -476,12 +543,7 @@ class SELayer(nn.Module):
 
 
 class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
-    """
-    Multi-Order Comprehensive Competition Block (CCNet).
-    1st order: LGC → spatial+channel competition → SE → conv → pool
-    2nd order: LGC(on 1st Gabor) → competition → SE → conv → pool
-    Output: concatenation of 1st and 2nd order flattened features.
-    """
+    """Multi-Order Comprehensive Competition Block (CCNet)."""
     def __init__(self, channel_in, n_competitor, ksize, stride, padding,
                  weight, init_ratio=1, o1=32, o2=12):
         super().__init__()
@@ -491,9 +553,9 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
         self.gabor_conv2d2 = CCGaborConv2d(n_competitor, n_competitor, ksize,
                                            stride=2, padding=ksize//2,
                                            init_ratio=init_ratio)
-        self.argmax   = nn.Softmax(dim=1)   # channel competition
-        self.argmax_x = nn.Softmax(dim=2)   # spatial-x competition
-        self.argmax_y = nn.Softmax(dim=3)   # spatial-y competition
+        self.argmax   = nn.Softmax(dim=1)
+        self.argmax_x = nn.Softmax(dim=2)
+        self.argmax_y = nn.Softmax(dim=3)
         self.conv1_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
         self.conv2_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
         self.maxpool  = nn.MaxPool2d(2, 2)
@@ -503,13 +565,11 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
         self.weight_spa  = (1 - weight) / 2
 
     def forward(self, x):
-        # 1st order
         x = self.gabor_conv2d(x)
         x_1 = self.weight_chan * self.argmax(x) + self.weight_spa * (
               self.argmax_x(x) + self.argmax_y(x))
         x_1 = self.se1(x_1)
         x_1 = self.maxpool(self.conv1_1(x_1))
-        # 2nd order
         x = self.gabor_conv2d2(x)
         x_2 = self.weight_chan * self.argmax(x) + self.weight_spa * (
               self.argmax_x(x) + self.argmax_y(x))
@@ -520,13 +580,7 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
 
 
 class CCNet(nn.Module):
-    """
-    CCNet = CB1 // CB2 // CB3 + FC(13152→4096→2048) + Dropout + ArcFace.
-    FC input size 13152 is fixed for 128×128 input images.
-
-    forward() returns (logits, normalised_6144d_contrastive_features)
-    get_embedding() returns L2-normalised 2048-d matching embedding.
-    """
+    """CCNet = CB1 // CB2 // CB3 + FC(13152→4096→2048) + Dropout + ArcFace."""
     def __init__(self, num_classes, comp_weight=0.8, dropout=0.5,
                  arcface_s=30.0, arcface_m=0.50):
         super().__init__()
@@ -551,17 +605,14 @@ class CCNet(nn.Module):
         x  = self._extract(x)
         x1 = self.fc(x)
         x  = self.fc1(x1)
-        # 6144-d normalised features for SupConLoss
         fe = F.normalize(torch.cat((x1, x), dim=1), dim=-1)
         logits = self.arclayer(self.drop(x), y)
         return logits, fe
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 2048-d embedding for matching."""
         x  = self._extract(x)
         return F.normalize(self.fc1(self.fc(x)), p=2, dim=1)
-
 
 
 # ══════════════════════════════════════════════════════════════
@@ -569,13 +620,7 @@ class CCNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class DINOBackbone(nn.Module):
-    """
-    DINOv2 ViT-S/14 backbone with selective unfreezing.
-    All parameters are frozen except blocks 10 and 11 of the ViT,
-    which are fine-tuned to adapt to palmprint recognition.
-    forward() returns the L2-normalised CLS token (384-d).
-    Requires: torch.hub access to facebookresearch/dinov2
-    """
+    """DINOv2 ViT-S/14 backbone with selective unfreezing (blocks 10 & 11)."""
     EMBED_DIM = 384
 
     def __init__(self):
@@ -589,23 +634,17 @@ class DINOBackbone(nn.Module):
         self.backbone = backbone
 
     def forward(self, x):
-        """Returns L2-normalised 384-d CLS token."""
         out = self.backbone.forward_features(x)
         cls = out["x_norm_clstoken"]
         return F.normalize(cls, p=2, dim=1)
 
 
 class LoRAExpert(nn.Module):
-    pass  # kept as placeholder — remove after confirming no external references
+    pass  # placeholder — kept for backward compatibility
 
 
 class DINOv2Model(nn.Module):
-    """
-    DINOv2 FL model = DINOBackbone + ArcFace.
-    backbone(x) → L2-normalised 384-d CLS token → ArcFace → logits.
-    Weight sharing: backbone.* via FedAvg; arc.* kept local.
-    Input: RGB 224×224 with ImageNet normalisation.
-    """
+    """DINOv2 FL model = DINOBackbone + ArcFace."""
     def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30):
         super().__init__()
         self.backbone = DINOBackbone()
@@ -617,7 +656,6 @@ class DINOv2Model(nn.Module):
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 384-d CLS embedding."""
         return self.backbone(x)
 
 
@@ -626,16 +664,25 @@ class DINOv2Model(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 def build_model(cfg, num_classes):
-    """Instantiate and return the model specified in cfg["model"]."""
+    """
+    Instantiate and return the model specified in cfg["model"].
+
+    For CompNet, use_moe is forced False when moe_warmup_round > 0 so the
+    model starts in warmup mode (shared LoRA base only).  activate_moe() is
+    called by the server at the appropriate round.
+    """
     name = cfg["model"].strip().lower()
     if name == "compnet":
+        warmup = cfg.get("moe_warmup_round", 0)
+        # during warmup phase, construct without MoE even if cfg says use_moe
+        effective_use_moe = cfg.get("use_moe", False) and (warmup == 0)
         return CompNet(
             num_classes   = num_classes,
             embedding_dim = cfg["embedding_dim"],
             arcface_s     = cfg["arcface_s"],
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
-            use_moe       = cfg.get("use_moe",        False),
+            use_moe       = effective_use_moe,
             n_experts     = cfg.get("n_experts",       6),
             lora_rank     = cfg.get("lora_rank",       64),
             moe_position  = cfg.get("moe_position",   "fc"),
