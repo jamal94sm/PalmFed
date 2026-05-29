@@ -64,7 +64,7 @@ CONFIG = {
     #           the cross-domain style transfer itself is the key contribution.
     "fft_local_only"      : True,
     # FFT augmentation parameters
-    "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
+    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
 
     
@@ -72,18 +72,30 @@ CONFIG = {
     "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
-    # ── Mixture of Experts — CompNet only ─────────────────────
-    # When use_moe=True, the single FC(9708→512) bottleneck in CompNet
-    # is replaced by MoEFC: base_FC(x) + expert[domain_id](x).
-    # base_FC learns the domain-invariant projection (shared via FedAvg).
-    # Each expert[d] is a low-rank residual (9708→rank→512) that learns
-    # the domain-d-specific correction on top of the shared base.
-    # Domain routing uses explicit domain_id labels during training;
-    # at inference domain_ids=None so only base_FC is used.
-    # Requires use_fft_aug=True to generate cross-domain training signal.
-    "use_moe"          : False,  # True → MoEFC for CompNet
-    "n_experts"        : 6,      # number of domain experts (= n_clients)
-    "lora_rank"        : 64,     # expert bottleneck rank
+    # ── MoE (disabled — kept for future experiments) ───────────
+    # Exact domain routing: expert[domain_id] selected per sample.
+    # No load-balance loss needed (exact routing is trivially balanced).
+    #
+    # moe_position controls WHERE domain-specific parameters are applied:
+    #
+    #   "fc"   — LoRA residual experts on the FC bottleneck:
+    #              output = base_Linear(9708→512)
+    #                     + expert[d](9708 → rank → 512)
+    #            Adapts Gabor texture → embedding projection per domain.
+    #            Params per expert: 9708×64 + 64×512 ≈ 654k
+    #
+    #   "norm" — Per-domain LayerNorm (domain-conditional normalisation):
+    #              output = (x - μ) / σ  ×  γ[d]  +  β[d]
+    #            Shared normalisation statistics, per-domain affine transform.
+    #            Recalibrates embedding scale/shift per domain before ArcFace.
+    #            Params per expert: 2 × 512 = 1024  (extremely lightweight)
+    #
+    #   "both" — LoRA experts at FC AND per-domain LayerNorm.
+    #            Maximum domain adaptation. Use for ablation.
+    "use_moe"             : True,
+    "moe_position"        : "norm",    # "fc" | "norm" | "both"
+    "n_experts"           : 6,
+    "lora_rank"           : 64,
 
     # ── GRL ─────────────────────
     "use_grl"          : False,  # True → domain adversarial training (GRL)
