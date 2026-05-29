@@ -193,61 +193,100 @@ class MoEFC(nn.Module):
         return base_out + residual
 
 
-class MoEEmb(nn.Module):
+class MoELayerNorm(nn.Module):
     """
-    Exact-routing MoE at the embedding position.
-    Applied after LayerNorm(512), before Dropout:
-        output = emb + expert[domain_id](emb)
+    Domain-conditional LayerNorm — replaces the shared LayerNorm(512).
 
-    Applied on: (B, 512) normalised embedding.
-    Expert adapts the embedding space directly — smaller, cheaper experts
-    (512→rank→512 vs 9708→rank→512 for MoEFC).
-    Each expert learns domain-specific shift in the angular embedding space,
-    complementing ArcFace's domain-invariant objective.
+    Standard LayerNorm:
+        y = (x - μ) / σ  ×  γ  +  β        (shared γ, β for all domains)
 
-    moe_position="emb" in CompNet.
+    MoELayerNorm:
+        y = (x - μ) / σ  ×  γ[d]  +  β[d]  (per-domain γ[d], β[d])
 
-    Tradeoff vs moe_position="fc":
-      "fc"  — larger experts (9708→64→512), adapts texture→embedding mapping.
-              More parameters per expert, higher-dimensional input.
-      "emb" — smaller experts (512→64→512), adapts embedding space directly.
-              Fewer parameters, operates on already-compressed representation.
-              May be more compatible with ArcFace angular geometry.
+    Each domain gets its own affine parameters (scale and shift) applied
+    after the shared normalisation statistics. The normalisation itself
+    (mean/std computation) is still shared — only the affine transform
+    is domain-specific.
+
+    Why this position:
+      LayerNorm's γ and β control the scale and shift of the normalised
+      embedding. Different spectral domains produce embeddings with
+      different magnitude distributions — domain-specific affine params
+      let each domain recalibrate the embedding to its own scale before
+      the ArcFace angular margin loss, without touching the shared backbone.
+
+    moe_position="norm" in CompNet.
+
+    Parameters per expert: 2 × embedding_dim = 2 × 512 = 1024
+    Total MoE params: n_experts × 1024  (vs n_experts × 654k for MoEFC)
+    Extremely lightweight — no additional linear layers.
+
+    Training: domain_ids selects which γ[d], β[d] to apply per sample.
+    Inference: domain_ids=None → falls back to shared γ[0], β[0]
+               (or mean of all experts — see forward).
     """
-    def __init__(self, embedding_dim=512, n_experts=6, rank=64):
+    def __init__(self, embedding_dim=512, n_experts=6, eps=1e-5):
         super().__init__()
-        self.n_experts = n_experts
-        self.experts   = nn.ModuleList([
-            _ResidualExpert(embedding_dim, embedding_dim, rank)
-            for _ in range(n_experts)
-        ])
+        self.embedding_dim = embedding_dim
+        self.n_experts     = n_experts
+        self.eps           = eps
 
-    def forward(self, emb, domain_ids=None):
+        # per-domain affine params: gamma[d] and beta[d]
+        # shape: (n_experts, embedding_dim)
+        # initialised to γ=1, β=0 so at round 0 it behaves like standard LN
+        self.gamma = nn.Parameter(torch.ones(n_experts, embedding_dim))
+        self.beta  = nn.Parameter(torch.zeros(n_experts, embedding_dim))
+
+    def forward(self, x, domain_ids=None):
+        """
+        x          : (B, embedding_dim)
+        domain_ids : (B,) int tensor  or  None
+
+        Normalises x (shared statistics), then applies per-domain γ[d], β[d].
+        If domain_ids is None (inference without domain label):
+            uses mean of all experts' γ and β — smooth average.
+        """
+        # shared normalisation: (x - mean) / std per sample
+        mean = x.mean(dim=-1, keepdim=True)
+        var  = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)   # (B, D)
+
         if domain_ids is None:
-            return emb                                   # inference: no residual
-        residual = torch.zeros_like(emb)
-        for d in range(self.n_experts):
-            mask = (domain_ids == d)
-            if mask.any():
-                residual[mask] = self.experts[d](emb[mask])
-        return emb + residual
+            # inference fallback: average all domain affine params
+            g = self.gamma.mean(dim=0)   # (D,)
+            b = self.beta.mean(dim=0)    # (D,)
+            return x_norm * g + b
+
+        # training: select per-sample γ[d], β[d]
+        g = self.gamma[domain_ids]   # (B, D)
+        b = self.beta[domain_ids]    # (B, D)
+        return x_norm * g + b
 
 
 class CompNet(nn.Module):
     """
     CompNet = CB1 // CB2 // CB3 + FC(9708→512) + LayerNorm + Dropout + ArcFace.
 
-    Optional MoE (use_moe=True):
-      moe_position="fc"  — MoEFC replaces Linear(9708→512).
-                           Expert: (B,9708) → base + residual_d → (B,512).
-                           Adapts texture-to-embedding projection per domain.
-      moe_position="emb" — MoEEmb inserted after LayerNorm(512).
-                           Expert: (B,512) → emb + residual_d → (B,512).
-                           Adapts the embedding space directly per domain.
-                           Smaller experts, more compatible with ArcFace geometry.
+    Two independent MoE toggles — can be used separately or together:
+
+    moe_position="fc"   — LoRA experts at the FC bottleneck:
+        output = base_Linear(9708→512) + expert[d](9708→rank→512)
+        Each expert is a low-rank residual adapter (A: 9708→rank, B: rank→512).
+        Adapts the Gabor texture → embedding projection per domain.
+        Params per expert: 9708×rank + rank×512  (rank=64 → ~654k per expert)
+
+    moe_position="norm" — Per-domain LayerNorm:
+        output = (x-μ)/σ × γ[d] + β[d]
+        Shared normalisation statistics, domain-specific affine transform.
+        Recalibrates embedding scale/shift per domain before ArcFace.
+        Params per expert: 2 × 512 = 1024  (extremely lightweight)
+
+    moe_position="both" — LoRA experts at FC AND per-domain LayerNorm.
+        Maximum domain adaptation — projection and normalisation both
+        domain-specific. Use for ablation to measure each contribution.
 
     Optional GRL (use_grl=True):
-      emb → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss.
+        emb → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss.
     """
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25,
@@ -259,21 +298,21 @@ class CompNet(nn.Module):
         self.cb2          = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
         self.cb3          = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
         self.use_moe      = use_moe
-        self.moe_position = moe_position   # "fc" | "emb"
+        self.moe_position = moe_position   # "fc" | "norm" | "both"
 
-        # FC layer: replaced by MoEFC when moe_position="fc"
-        if use_moe and moe_position == "fc":
+        # ── FC layer ──────────────────────────────────────────────────────────
+        # MoEFC when moe_position is "fc" or "both"; plain Linear otherwise
+        if use_moe and moe_position in ("fc", "both"):
             self.fc       = MoEFC(9708, embedding_dim, n_experts, lora_rank)
         else:
             self.fc       = nn.Linear(9708, embedding_dim)
 
-        self.emb_norm     = nn.LayerNorm(embedding_dim)
-
-        # MoE at embedding: inserted after LayerNorm when moe_position="emb"
-        if use_moe and moe_position == "emb":
-            self.moe_emb  = MoEEmb(embedding_dim, n_experts, lora_rank)
+        # ── LayerNorm ─────────────────────────────────────────────────────────
+        # MoELayerNorm when moe_position is "norm" or "both"; shared LN otherwise
+        if use_moe and moe_position in ("norm", "both"):
+            self.emb_norm = MoELayerNorm(embedding_dim, n_experts)
         else:
-            self.moe_emb  = None
+            self.emb_norm = nn.LayerNorm(embedding_dim)
 
         self.drop         = nn.Dropout(p=dropout)
         self.arc          = ArcMarginProduct(embedding_dim, num_classes,
@@ -285,28 +324,28 @@ class CompNet(nn.Module):
     def _backbone(self, x, domain_ids=None):
         feat = torch.cat([self.cb1(x).flatten(1),
                           self.cb2(x).flatten(1),
-                          self.cb3(x).flatten(1)], dim=1)    # [B, 9708]
+                          self.cb3(x).flatten(1)], dim=1)    # (B, 9708)
 
-        # ── FC / MoEFC ──────────────────────────────────────────────────────
-        if self.use_moe and self.moe_position == "fc":
-            emb = self.fc(feat, domain_ids)                  # MoEFC
+        # FC / MoEFC
+        if self.use_moe and self.moe_position in ("fc", "both"):
+            emb = self.fc(feat, domain_ids)
         else:
-            emb = self.fc(feat)                              # plain Linear
+            emb = self.fc(feat)
 
-        emb = self.emb_norm(emb)                             # LayerNorm(512)
+        # LayerNorm / MoELayerNorm
+        if self.use_moe and self.moe_position in ("norm", "both"):
+            emb = self.emb_norm(emb, domain_ids)
+        else:
+            emb = self.emb_norm(emb)
 
-        # ── MoEEmb (after LayerNorm) ─────────────────────────────────────────
-        if self.use_moe and self.moe_position == "emb" and self.moe_emb is not None:
-            emb = self.moe_emb(emb, domain_ids)
-
-        return emb                                           # [B, 512]
+        return emb                                           # (B, 512)
 
     def forward(self, x, y=None, domain_ids=None):
         return self.arc(self.drop(self._backbone(x, domain_ids)), y)
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 512-d embedding (no domain_ids at inference)."""
+        """L2-normalised 512-d embedding (inference, no domain_ids needed)."""
         return F.normalize(self._backbone(x), p=2, dim=1)
 
     def get_moe_lb_loss(self):
