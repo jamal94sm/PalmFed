@@ -5,11 +5,10 @@
 #  CCNet   : CCGaborConv2d → CompetitiveBlock_Mul_Ord_Comp × 3
 #            → FC(13152→4096→2048) → ArcFace  +  SupConLoss
 #
-#  MoE changes
-#  ───────────
-#  _LoRABlock  : shared primitive — A(in→rank) → ReLU → B(rank→out), B init=0
-#  MoEFC       : shared LoRA base + per-domain LoRA experts
-#                output = B(ReLU(A(x))) + B_d(ReLU(A_d(x)))
+#  MoE FC design
+#  ─────────────
+#  MoEFC  : shared Linear base + per-domain Linear experts
+#            output = Linear_base(x) + Linear_d(x)
 #  MoELayerNorm: per-domain affine LN (unchanged)
 #
 #  Deferred MoE activation
@@ -33,30 +32,7 @@ import torch.nn.functional as F
 from torch.nn import Parameter
 
 
-# ══════════════════════════════════════════════════════════════
-#  SHARED LoRA PRIMITIVE
-# ══════════════════════════════════════════════════════════════
 
-class _LoRABlock(nn.Module):
-    """
-    Minimal LoRA block: A(in→rank) → ReLU → B(rank→out).
-
-    A is kaiming-initialised; B is zero-initialised so the block
-    contributes nothing at round 0 and learns its residual from scratch.
-    Use a small normal init on B (std=1e-4) to break zero-symmetry while
-    preserving the near-identity starting point.
-
-    Used as both the shared base and each per-domain expert inside MoEFC.
-    """
-    def __init__(self, in_features, out_features, rank, b_init_std=1e-4):
-        super().__init__()
-        self.A = nn.Linear(in_features, rank, bias=False)
-        self.B = nn.Linear(rank, out_features, bias=False)
-        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
-        nn.init.normal_(self.B.weight, std=b_init_std)
-
-    def forward(self, x):
-        return self.B(F.relu(self.A(x)))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -175,36 +151,41 @@ class DomainClassifier(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  MoEFC  —  shared LoRA base + per-domain LoRA experts
+#  MoEFC  —  shared Linear base + per-domain Linear experts
 # ══════════════════════════════════════════════════════════════
 
 class MoEFC(nn.Module):
     """
-    FC bottleneck where both the shared base and every expert are _LoRABlocks.
+    FC bottleneck with a shared Linear base and per-domain Linear experts.
 
     output = base(x) + expert[d](x)
-           = B(ReLU(A(x))) + B_d(ReLU(A_d(x)))
+           = W_base·x + b_base + W_d·x + b_d
+
+    Both the shared base and every expert are plain nn.Linear layers
+    (xavier-uniform weight init, bias enabled).  The expert residual is
+    zero at the start of training only by coincidence of random init —
+    to guarantee a zero-residual warm start when activating mid-training,
+    activate_moe() zero-inits every expert's weights after copying the
+    base state dict into them (see CompNet.activate_moe).
 
     Deferred activation
     ───────────────────
-    When CompNet is constructed with use_moe=False (warmup phase) this layer
-    is not instantiated.  Once activate_moe() is called the server replaces
-    the plain shared _LoRABlock (self.fc) with a full MoEFC whose experts are
-    initialised from the trained base weights — see CompNet.activate_moe().
+    When CompNet is in warmup mode (use_moe=False) self.fc is a plain
+    nn.Linear.  activate_moe() replaces it with MoEFC, copies the trained
+    Linear weights into base AND into every expert, then zero-inits the
+    expert weight/bias so each expert starts as an identity residual (zero
+    contribution) on top of the already-trained base.
 
     Inference (domain_ids=None)
     ───────────────────────────
-    Only the shared base is applied.  Expert contribution requires a domain
-    label and is skipped at evaluation time (gallery/probe sets are unlabelled
-    by domain in the evaluation loop).
+    Only the shared base is applied — expert routing is skipped.
     """
-    def __init__(self, in_features=9708, out_features=512,
-                 n_experts=6, rank=64):
+    def __init__(self, in_features=9708, out_features=512, n_experts=6):
         super().__init__()
         self.n_experts = n_experts
-        self.base      = _LoRABlock(in_features, out_features, rank)
+        self.base      = nn.Linear(in_features, out_features)
         self.experts   = nn.ModuleList([
-            _LoRABlock(in_features, out_features, rank)
+            nn.Linear(in_features, out_features)
             for _ in range(n_experts)
         ])
 
@@ -261,28 +242,28 @@ class CompNet(nn.Module):
 
     MoE positions
     ─────────────
-    "fc"   — shared LoRA base + per-domain LoRA experts at the FC bottleneck
+    "fc"   — shared Linear base + per-domain Linear experts at the FC bottleneck
     "norm" — per-domain LayerNorm affine transform
     "both" — both of the above
 
     Deferred MoE activation  (moe_warmup_round > 0)
     ───────────────────────────────────────────────
     Phase 1 (rounds 1 … moe_warmup_round):
-      use_moe=False internally.  The FC is a plain _LoRABlock (shared base
-      only) and the norm is a standard LayerNorm.  All clients train the
-      shared base together via FedAvg — the base expert learns a domain-
-      agnostic representation.
+      use_moe=False internally.  The FC is a plain nn.Linear and the norm
+      is a standard LayerNorm.  All clients train the shared base together
+      via FedAvg — the base learns a domain-agnostic representation.
 
     Phase 2 (round moe_warmup_round + 1 … n_rounds):
       The server calls model.activate_moe(moe_position) on the global model
       immediately after round moe_warmup_round aggregation.  This:
-        1. Builds MoEFC and copies trained base weights → every expert A_d/B_d.
-        2. Replaces LayerNorm with MoELayerNorm (γ=1, β=0).
+        1. Builds MoEFC: copies trained Linear weights into base AND every
+           expert, then zero-inits each expert weight/bias so each expert
+           starts as a pure zero residual on top of the trained base.
+        2. Replaces LayerNorm with MoELayerNorm (γ=1, β=0 — identity).
         3. Sets self.use_moe = True.
-      The updated global model is then distributed to all clients as usual.
-      Experts start from the trained base — not from random init — so they
-      immediately have a meaningful starting point and diverge only by the
-      domain-specific residual they learn in subsequent rounds.
+      Experts start from the trained base weights with zero residual —
+      they learn domain-specific corrections from scratch on top of the
+      already-converged shared representation.
 
     Optional GRL (use_grl=True):
       emb → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss.
@@ -300,17 +281,16 @@ class CompNet(nn.Module):
         self.use_moe      = use_moe
         self.moe_position = moe_position
         self.n_experts    = n_experts
-        self.lora_rank    = lora_rank
+        self.lora_rank    = lora_rank   # kept for API compatibility, unused
         self.embedding_dim = embedding_dim
 
         # ── FC layer ──────────────────────────────────────────────────────────
-        # warmup (use_moe=False): plain shared _LoRABlock (base only, no experts)
-        # active  (use_moe=True): full MoEFC (shared base + per-domain experts)
+        # warmup (use_moe=False): plain nn.Linear — trains as the shared base.
+        # active  (use_moe=True): MoEFC — shared Linear base + per-domain experts.
         if use_moe and moe_position in ("fc", "both"):
-            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank)
+            self.fc = MoEFC(9708, embedding_dim, n_experts)
         else:
-            # single shared LoRA block — same architecture as MoEFC.base
-            self.fc = _LoRABlock(9708, embedding_dim, lora_rank)
+            self.fc = nn.Linear(9708, embedding_dim)
 
         # ── LayerNorm ─────────────────────────────────────────────────────────
         if use_moe and moe_position in ("norm", "both"):
@@ -329,8 +309,8 @@ class CompNet(nn.Module):
 
     def activate_moe(self, moe_position=None):
         """
-        Switch the model from warmup mode (shared LoRA base only) to full MoE
-        mode (shared base + per-domain experts + optional per-domain LayerNorm).
+        Switch the model from warmup mode (plain nn.Linear) to full MoE mode
+        (shared Linear base + per-domain Linear experts + optional MoELayerNorm).
 
         Called by the server on the global model at round moe_warmup_round.
         The updated state dict is then distributed to all clients via the
@@ -338,8 +318,11 @@ class CompNet(nn.Module):
 
         Steps
         ─────
-        1. If FC position: build MoEFC, copy trained base weights into the
-           shared base slot AND into every expert (warm-start experts).
+        1. If FC position: build MoEFC, copy trained nn.Linear weights into
+           the shared base slot AND into every expert, then zero-init each
+           expert's weight and bias so they start as pure zero residuals.
+           Experts therefore begin phase 2 from: base(x) + 0 = base(x),
+           and learn domain-specific corrections from scratch.
         2. If norm position: replace LayerNorm with MoELayerNorm (γ=1, β=0).
         3. Set self.use_moe = True and self.moe_position.
 
@@ -360,23 +343,28 @@ class CompNet(nn.Module):
         # ── FC upgrade ────────────────────────────────────────────────────────
         if self.moe_position in ("fc", "both"):
             if not isinstance(self.fc, MoEFC):
-                # self.fc is currently a _LoRABlock (trained shared base)
-                trained_base = self.fc          # keep reference before replace
+                # self.fc is currently a plain nn.Linear (trained shared base)
+                trained_linear = self.fc
 
                 new_moe = MoEFC(9708, self.embedding_dim,
-                                self.n_experts, self.lora_rank).to(device)
+                                self.n_experts).to(device)
 
-                # copy trained base weights into new_moe.base
-                new_moe.base.load_state_dict(trained_base.state_dict())
+                # copy trained Linear weights into new_moe.base
+                new_moe.base.load_state_dict(trained_linear.state_dict())
 
-                # warm-start every expert from the trained base
-                base_sd = trained_base.state_dict()
+                # copy base weights into every expert as the starting point,
+                # then zero-init each expert so its residual starts at zero
+                base_sd = copy.deepcopy(trained_linear.state_dict())
                 for expert in new_moe.experts:
-                    expert.load_state_dict(copy.deepcopy(base_sd))
+                    expert.load_state_dict(base_sd)
+                    nn.init.zeros_(expert.weight)
+                    if expert.bias is not None:
+                        nn.init.zeros_(expert.bias)
 
                 self.fc = new_moe
-                print(f"  [activate_moe] FC upgraded: _LoRABlock → MoEFC "
-                      f"({self.n_experts} experts warm-started from base)")
+                print(f"  [activate_moe] FC upgraded: nn.Linear → MoEFC "
+                      f"({self.n_experts} experts initialised: base weights "
+                      f"copied, expert residual zeroed)")
 
         # ── Norm upgrade ──────────────────────────────────────────────────────
         if self.moe_position in ("norm", "both"):
@@ -400,7 +388,7 @@ class CompNet(nn.Module):
         if self.use_moe and self.moe_position in ("fc", "both"):
             emb = self.fc(feat, domain_ids)
         else:
-            emb = self.fc(feat)                              # plain _LoRABlock
+            emb = self.fc(feat)                              # plain nn.Linear
 
         # LayerNorm / MoELayerNorm
         if self.use_moe and self.moe_position in ("norm", "both"):
@@ -668,7 +656,7 @@ def build_model(cfg, num_classes):
     Instantiate and return the model specified in cfg["model"].
 
     For CompNet, use_moe is forced False when moe_warmup_round > 0 so the
-    model starts in warmup mode (shared LoRA base only).  activate_moe() is
+    model starts in warmup mode (plain nn.Linear, no experts).  activate_moe() is
     called by the server at the appropriate round.
     """
     name = cfg["model"].strip().lower()
