@@ -1,31 +1,12 @@
 # ==============================================================
-#  models.py — CompNet, CCNet, DINOv2 architectures
+#  models.py — CompNet and CCNet architectures
 # ==============================================================
-#
-#  MoE design — MultiExpertCompNet
-#  ────────────────────────────────
-#  N full CompNet models (one per domain + one shared base).
-#
-#  Forward (train & inference):
-#    logits = 0.5 × base_expert(x) + 0.5 × domain_expert[d](x)
-#
-#  Embedding (gallery/probe evaluation):
-#    emb = 0.5 × base_expert.get_embedding(x)
-#        + 0.5 × domain_expert[d].get_embedding(x)
-#    then L2-normalised
-#
-#  Warmup (moe_warmup_round > 0):
-#    Phase 1: only base_expert is trained (plain CompNet via FedAvg).
-#    Phase 2: activate_moe() copies base_expert weights into every
-#             domain_expert as a warm start, then full training begins.
-#
-#  FedAvg:
-#    All CompNet backbone weights shared (base + all domain experts).
-#    arc.* heads kept local on every expert.
+#  CompNet : GaborConv2d → CompetitiveBlock × 3 → FC → ArcFace
+#  CCNet   : CCGaborConv2d → CompetitiveBlock_Mul_Ord_Comp × 3
+#            → FC(13152→4096→2048) → ArcFace  +  SupConLoss
 # ==============================================================
 
 import math
-import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,7 +14,7 @@ from torch.nn import Parameter
 
 
 # ══════════════════════════════════════════════════════════════
-#  COMPNET BUILDING BLOCKS
+#  COMPNET
 # ══════════════════════════════════════════════════════════════
 
 class GaborConv2d(nn.Module):
@@ -96,7 +77,7 @@ class CompetitiveBlock(nn.Module):
 
 
 class ArcMarginProduct(nn.Module):
-    """ArcFace angular margin product layer."""
+    """ArcFace angular margin product layer (shared by CompNet and CCNet)."""
     def __init__(self, in_features, out_features, s=30.0, m=0.50,
                  easy_margin=False):
         super().__init__()
@@ -122,7 +103,12 @@ class ArcMarginProduct(nn.Module):
 
 
 class GRL(torch.autograd.Function):
-    """Gradient Reversal Layer."""
+    """
+    Gradient Reversal Layer (Ganin & Lempitsky, DANN 2016).
+    Forward pass: identity.
+    Backward pass: gradient multiplied by -λ.
+    λ controls the strength of domain adversarial signal.
+    """
     @staticmethod
     def forward(ctx, x, lam):
         ctx.lam = lam
@@ -134,7 +120,17 @@ class GRL(torch.autograd.Function):
 
 
 class DomainClassifier(nn.Module):
-    """Domain classification head used with GRL."""
+    """
+    Shared domain classification head used with GRL.
+    Receives GRL-reversed embeddings and tries to predict domain.
+    The reversed gradient pushes the backbone away from domain-discriminative
+    features.
+
+    Shared via FedAvg: each client sees only its own domain during training,
+    but after aggregation the classifier has knowledge of all 6 domains.
+    The GRL signal therefore drives backbone toward globally domain-invariant
+    representations.
+    """
     def __init__(self, in_features, n_domains):
         super().__init__()
         self.net = nn.Sequential(
@@ -147,223 +143,111 @@ class DomainClassifier(nn.Module):
         return self.net(x)
 
 
-# ══════════════════════════════════════════════════════════════
-#  SINGLE CompNet  (one expert)
-# ══════════════════════════════════════════════════════════════
-
-class CompNet(nn.Module):
+class _ResidualExpert(nn.Module):
     """
-    Single CompNet expert: CB1//CB2//CB3 → FC(9708→512) → LN → Dropout → ArcFace.
-
-    Used standalone (baseline) or as one expert inside MultiExpertCompNet.
-    get_embedding() returns the L2-normalised 512-d embedding before ArcFace.
+    Low-rank domain-specific residual adapter: Linear(in→rank) → ReLU → Linear(rank→out).
+    B initialised to zero → zero contribution at round 0, learned from training.
     """
-    def __init__(self, num_classes, embedding_dim=512,
-                 arcface_s=30.0, arcface_m=0.50, dropout=0.25,
-                 use_grl=False, n_domains=6):
+    def __init__(self, in_features, out_features, rank):
         super().__init__()
-        self.cb1      = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
-        self.cb2      = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
-        self.cb3      = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.fc       = nn.Linear(9708, embedding_dim)
-        self.emb_norm = nn.LayerNorm(embedding_dim)
-        self.drop     = nn.Dropout(p=dropout)
-        self.arc      = ArcMarginProduct(embedding_dim, num_classes,
-                                         s=arcface_s, m=arcface_m)
-        self.use_grl  = use_grl
-        self.domain_classifier = (DomainClassifier(embedding_dim, n_domains)
-                                   if use_grl else None)
+        self.A = nn.Linear(in_features, rank, bias=False)
+        self.B = nn.Linear(rank, out_features, bias=False)
+        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
+        nn.init.zeros_(self.B.weight)
 
-    def _backbone(self, x):
-        feat = torch.cat([self.cb1(x).flatten(1),
-                          self.cb2(x).flatten(1),
-                          self.cb3(x).flatten(1)], dim=1)   # (B, 9708)
-        return self.emb_norm(self.fc(feat))                 # (B, 512)
-
-    def forward(self, x, y=None, domain_ids=None):
-        return self.arc(self.drop(self._backbone(x)), y)
-
-    @torch.no_grad()
-    def get_embedding(self, x):
-        return F.normalize(self._backbone(x), p=2, dim=1)
-
-    def get_backbone_state(self):
-        """Return all parameters except arc.* for FedAvg."""
-        return {k: v.cpu().clone()
-                for k, v in self.state_dict().items()
-                if not k.startswith("arc.")}
-
-    def set_backbone_state(self, state_dict):
-        """Load backbone weights; arc.* preserved unchanged."""
-        local = self.state_dict()
-        for k, v in state_dict.items():
-            if k in local and local[k].shape == v.shape:
-                local[k] = v.clone()
-        self.load_state_dict(local)
+    def forward(self, x):
+        return self.B(F.relu(self.A(x)))
 
 
-# ══════════════════════════════════════════════════════════════
-#  MultiExpertCompNet  (MoE over full CompNet models)
-# ══════════════════════════════════════════════════════════════
-
-class MultiExpertCompNet(nn.Module):
+class MoEFC(nn.Module):
     """
-    MoE wrapper holding N+1 full CompNet models:
-      • experts[0]          — shared base expert (always active)
-      • experts[1..N]       — one domain-specific expert per domain
+    Mixture-of-Experts FC bottleneck for CompNet.
+    Replaces the single nn.Linear(9708→512) with:
+        output = base_FC(x) + expert[domain_id](x)
 
-    Forward (train & eval):
-      logits = 0.5 × base_expert(x, y) + 0.5 × domain_expert[d](x, y)
+    base_FC  — shared across all clients via FedAvg; learns domain-invariant projection.
+    expert[d] — low-rank residual (9708→rank→512); learns domain-specific correction.
 
-    Embedding (gallery/probe):
-      emb = L2_norm(0.5 × base_emb + 0.5 × domain_emb)
+    Domain routing:
+      Training:  domain_ids tensor [B] selects one expert per sample (exact routing).
+      Inference: domain_ids=None → base_FC only (no residual). Base FC carries the
+                 full domain-invariant representation; residuals are training-time only.
 
-    domain_ids tensor selects which domain expert to pair with the base.
-    At inference domain_ids comes from the test sample's domain label
-    (stored in gallery/probe tuples as the third element).
-
-    Warmup (moe_warmup_round > 0)
-    ──────────────────────────────
-    During warmup use_moe=False — only experts[0] (the base) is trained.
-    activate_moe() copies base weights into every domain expert and sets
-    use_moe=True so subsequent rounds use both experts.
-
-    FedAvg
-    ──────
-    get_weights() returns backbone params of ALL experts (base + domain).
-    arc.* heads of every expert are excluded and stay local.
+    experts[k] after FedAvg:
+      Client k contributes the strongest gradient to expert[k] (its own domain).
+      Other clients contribute via FFT-augmented copies styled as domain k.
+      Expert[k] converges toward the domain-k-specific correction, informed
+      primarily by the client that owns that domain.
     """
-
-    def __init__(self, num_classes, n_domains, embedding_dim=512,
-                 arcface_s=30.0, arcface_m=0.50, dropout=0.25,
-                 use_moe=False, use_grl=False):
+    def __init__(self, in_features=9708, out_features=512,
+                 n_experts=6, rank=64):
         super().__init__()
-        self.n_domains     = n_domains
-        self.embedding_dim = embedding_dim
-        self.use_moe       = use_moe
-
-        # experts[0] = shared base; experts[1..n_domains] = domain experts
-        n_experts = 1 + n_domains
-        self.experts = nn.ModuleList([
-            CompNet(num_classes, embedding_dim, arcface_s, arcface_m,
-                    dropout, use_grl=use_grl, n_domains=n_domains)
+        self.n_experts = n_experts
+        self.base      = nn.Linear(in_features, out_features)
+        self.experts   = nn.ModuleList([
+            _ResidualExpert(in_features, out_features, rank)
             for _ in range(n_experts)
         ])
 
+    def forward(self, x, domain_ids=None):
+        base_out = self.base(x)                              # [B, 512]
+        if domain_ids is None:
+            return base_out                                  # inference: base only
+        residual = torch.zeros_like(base_out)
+        for d in range(self.n_experts):
+            mask = (domain_ids == d)
+            if mask.any():
+                residual[mask] = self.experts[d](x[mask])
+        return base_out + residual
+
+
+class CompNet(nn.Module):
+    """
+    CompNet = CB1 // CB2 // CB3 + FC(9708→512) + Dropout + ArcFace.
+
+    Optional GRL branch (use_grl=True):
+      emb [B,512] → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss
+      The reversed gradient pushes the backbone toward domain-invariant features.
+      DomainClassifier is shared via FedAvg (not excluded from get_weights).
+
+    Optional MoE branch (use_moe=True):
+      FC replaced by MoEFC with domain-conditioned residual experts.
+    """
+    def __init__(self, num_classes, embedding_dim=512,
+                 arcface_s=30.0, arcface_m=0.50, dropout=0.25,
+                 use_moe=False, n_experts=6, lora_rank=64,
+                 use_grl=False, n_domains=6):
+        super().__init__()
+        self.cb1     = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
+        self.cb2     = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
+        self.cb3     = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
+        self.use_moe = use_moe
+        if use_moe:
+            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank)
+        else:
+            self.fc = nn.Linear(9708, embedding_dim)
+        self.drop = nn.Dropout(p=dropout)
+        self.arc  = ArcMarginProduct(embedding_dim, num_classes,
+                                     s=arcface_s, m=arcface_m)
         self.use_grl = use_grl
+        self.domain_classifier = (DomainClassifier(embedding_dim, n_domains)
+                                   if use_grl else None)
 
-    # ── MoE activation ────────────────────────────────────────────────────────
-
-    def activate_moe(self):
-        """
-        Copy base expert weights into every domain expert as a warm start,
-        then enable dual-expert routing.
-
-        Called once by the server after warmup aggregation.  Each domain
-        expert starts with identical weights to the base — they diverge
-        only by the domain-specific gradient signal they receive in
-        subsequent rounds.
-        """
+    def _backbone(self, x, domain_ids=None):
+        feat = torch.cat([self.cb1(x).flatten(1),
+                          self.cb2(x).flatten(1),
+                          self.cb3(x).flatten(1)], dim=1)   # [B, 9708]
         if self.use_moe:
-            print("  [activate_moe] already active — skipping.")
-            return
-
-        base_state = copy.deepcopy(self.experts[0].state_dict())
-        for d in range(1, len(self.experts)):
-            self.experts[d].load_state_dict(base_state)
-
-        self.use_moe = True
-        n_domain_experts = len(self.experts) - 1
-        print(f"  [activate_moe] {n_domain_experts} domain experts "
-              f"warm-started from base expert.")
-
-    # ── forward helpers ───────────────────────────────────────────────────────
-
-    def _base_expert(self):
-        return self.experts[0]
-
-    def _domain_expert(self, d):
-        # experts[1..n_domains] → domain index d maps to experts[d+1]
-        return self.experts[d + 1]
-
-    # ── forward ───────────────────────────────────────────────────────────────
+            return self.fc(feat, domain_ids)
+        return self.fc(feat)
 
     def forward(self, x, y=None, domain_ids=None):
-        """
-        Training forward — returns aggregated logits.
-
-        If use_moe=False (warmup): only base expert runs.
-        If use_moe=True: base + domain expert logits averaged (0.5/0.5).
-
-        domain_ids : LongTensor (B,) — domain index per sample (0..n_domains-1)
-        """
-        base_logits = self._base_expert()(x, y)
-
-        if not self.use_moe or domain_ids is None:
-            return base_logits
-
-        # per-sample domain expert selection — vectorised over unique domains
-        domain_logits = torch.zeros_like(base_logits)
-        for d in range(self.n_domains):
-            mask = (domain_ids == d)
-            if mask.any():
-                domain_logits[mask] = self._domain_expert(d)(x[mask], y[mask])
-
-        return 0.5 * base_logits + 0.5 * domain_logits
+        return self.arc(self.drop(self._backbone(x, domain_ids)), y)
 
     @torch.no_grad()
-    def get_embedding(self, x, domain_ids=None):
-        """
-        L2-normalised embedding for gallery/probe evaluation.
-
-        If use_moe=False or domain_ids=None: base expert only.
-        If use_moe=True: average of base + domain expert embeddings,
-        then L2-normalised.
-
-        domain_ids : LongTensor (B,) or None
-        """
-        base_emb = self._base_expert().get_embedding(x)   # (B, 512), L2-normed
-
-        if not self.use_moe or domain_ids is None:
-            return base_emb
-
-        domain_emb = torch.zeros_like(base_emb)
-        for d in range(self.n_domains):
-            mask = (domain_ids == d)
-            if mask.any():
-                domain_emb[mask] = self._domain_expert(d).get_embedding(x[mask])
-
-        return F.normalize(0.5 * base_emb + 0.5 * domain_emb, p=2, dim=1)
-
-    # ── weight management for FedAvg ──────────────────────────────────────────
-
-    def get_weights(self):
-        """
-        Return all backbone parameters across all experts for FedAvg.
-        Keys are prefixed with 'experts.{i}.' to avoid collisions.
-        arc.* excluded from every expert.
-        """
-        weights = {}
-        for i, expert in enumerate(self.experts):
-            for k, v in expert.get_backbone_state().items():
-                weights[f"experts.{i}.{k}"] = v
-        return weights
-
-    def set_weights(self, weights):
-        """
-        Load FedAvg-aggregated backbone weights back into all experts.
-        arc.* keys absent from weights dict — preserved unchanged.
-        """
-        for i, expert in enumerate(self.experts):
-            prefix = f"experts.{i}."
-            expert_state = {k[len(prefix):]: v
-                            for k, v in weights.items()
-                            if k.startswith(prefix)}
-            if expert_state:
-                expert.set_backbone_state(expert_state)
-
-    def get_moe_lb_loss(self):
-        return torch.tensor(0.0, device=next(self.parameters()).device)
+    def get_embedding(self, x):
+        """L2-normalised 512-d embedding — base FC only (no MoE residual)."""
+        return F.normalize(self._backbone(x, domain_ids=None), p=2, dim=1)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -371,7 +255,10 @@ class MultiExpertCompNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class SupConLoss(nn.Module):
-    """Supervised Contrastive Loss."""
+    """
+    Supervised Contrastive Loss (CCNet/loss.py — exact copy).
+    Expects features of shape [batch, n_views, embed_dim].
+    """
     def __init__(self, temperature=0.07, contrast_mode='all',
                  base_temperature=0.07):
         super().__init__()
@@ -413,16 +300,16 @@ class SupConLoss(nn.Module):
         logits_mask = torch.scatter(
             torch.ones_like(mask), 1,
             torch.arange(batch_size * anchor_count).view(-1, 1).to(device), 0)
-        mask         = mask * logits_mask
-        exp_logits   = torch.exp(logits) * logits_mask
-        log_prob     = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        mask = mask * logits_mask
+        exp_logits        = torch.exp(logits) * logits_mask
+        log_prob          = logits - torch.log(exp_logits.sum(1, keepdim=True))
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
         return loss.view(anchor_count, batch_size).mean()
 
 
 class CCGaborConv2d(nn.Module):
-    """Learnable Gabor Convolution layer — CCNet version."""
+    """Learnable Gabor Convolution layer — CCNet version (stride=2, padding)."""
     def __init__(self, channel_in, channel_out, kernel_size,
                  stride=1, padding=0, init_ratio=1):
         super().__init__()
@@ -433,13 +320,16 @@ class CCGaborConv2d(nn.Module):
         self.padding     = padding
         self.init_ratio  = init_ratio if init_ratio > 0 else 1.0
         self.kernel      = 0
-        self.gamma = nn.Parameter(torch.FloatTensor([2.0]),      requires_grad=True)
-        self.sigma = nn.Parameter(torch.FloatTensor([9.2*init_ratio]), requires_grad=True)
+        _SIGMA = 9.2   * self.init_ratio
+        _FREQ  = 0.057 / self.init_ratio
+        _GAMMA = 2.0
+        self.gamma = nn.Parameter(torch.FloatTensor([_GAMMA]), requires_grad=True)
+        self.sigma = nn.Parameter(torch.FloatTensor([_SIGMA]), requires_grad=True)
         self.theta = nn.Parameter(
             torch.FloatTensor(torch.arange(0, channel_out).float()) * math.pi / channel_out,
             requires_grad=False)
-        self.f   = nn.Parameter(torch.FloatTensor([0.057/init_ratio]), requires_grad=True)
-        self.psi = nn.Parameter(torch.FloatTensor([0]), requires_grad=False)
+        self.f   = nn.Parameter(torch.FloatTensor([_FREQ]), requires_grad=True)
+        self.psi = nn.Parameter(torch.FloatTensor([0]),     requires_grad=False)
 
     def genGaborBank(self, kernel_size, channel_in, channel_out,
                      sigma, gamma, theta, f, psi):
@@ -465,6 +355,7 @@ class CCGaborConv2d(nn.Module):
 
 
 class SELayer(nn.Module):
+    """Squeeze-and-Excitation layer (CCNet)."""
     def __init__(self, channel, reduction=1):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -482,6 +373,12 @@ class SELayer(nn.Module):
 
 
 class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
+    """
+    Multi-Order Comprehensive Competition Block (CCNet).
+    1st order: LGC → spatial+channel competition → SE → conv → pool
+    2nd order: LGC(on 1st Gabor) → competition → SE → conv → pool
+    Output: concatenation of 1st and 2nd order flattened features.
+    """
     def __init__(self, channel_in, n_competitor, ksize, stride, padding,
                  weight, init_ratio=1, o1=32, o2=12):
         super().__init__()
@@ -491,9 +388,9 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
         self.gabor_conv2d2 = CCGaborConv2d(n_competitor, n_competitor, ksize,
                                            stride=2, padding=ksize//2,
                                            init_ratio=init_ratio)
-        self.argmax   = nn.Softmax(dim=1)
-        self.argmax_x = nn.Softmax(dim=2)
-        self.argmax_y = nn.Softmax(dim=3)
+        self.argmax   = nn.Softmax(dim=1)   # channel competition
+        self.argmax_x = nn.Softmax(dim=2)   # spatial-x competition
+        self.argmax_y = nn.Softmax(dim=3)   # spatial-y competition
         self.conv1_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
         self.conv2_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
         self.maxpool  = nn.MaxPool2d(2, 2)
@@ -503,11 +400,13 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
         self.weight_spa  = (1 - weight) / 2
 
     def forward(self, x):
+        # 1st order
         x = self.gabor_conv2d(x)
         x_1 = self.weight_chan * self.argmax(x) + self.weight_spa * (
               self.argmax_x(x) + self.argmax_y(x))
         x_1 = self.se1(x_1)
         x_1 = self.maxpool(self.conv1_1(x_1))
+        # 2nd order
         x = self.gabor_conv2d2(x)
         x_2 = self.weight_chan * self.argmax(x) + self.weight_spa * (
               self.argmax_x(x) + self.argmax_y(x))
@@ -518,6 +417,13 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
 
 
 class CCNet(nn.Module):
+    """
+    CCNet = CB1 // CB2 // CB3 + FC(13152→4096→2048) + Dropout + ArcFace.
+    FC input size 13152 is fixed for 128×128 input images.
+
+    forward() returns (logits, normalised_6144d_contrastive_features)
+    get_embedding() returns L2-normalised 2048-d matching embedding.
+    """
     def __init__(self, num_classes, comp_weight=0.8, dropout=0.5,
                  arcface_s=30.0, arcface_m=0.50):
         super().__init__()
@@ -535,19 +441,24 @@ class CCNet(nn.Module):
                                          s=arcface_s, m=arcface_m)
 
     def _extract(self, x):
-        return torch.cat((self.cb1(x), self.cb2(x), self.cb3(x)), dim=1)
+        x1 = self.cb1(x); x2 = self.cb2(x); x3 = self.cb3(x)
+        return torch.cat((x1, x2, x3), dim=1)
 
     def forward(self, x, y=None):
         x  = self._extract(x)
         x1 = self.fc(x)
         x  = self.fc1(x1)
+        # 6144-d normalised features for SupConLoss
         fe = F.normalize(torch.cat((x1, x), dim=1), dim=-1)
-        return self.arclayer(self.drop(x), y), fe
+        logits = self.arclayer(self.drop(x), y)
+        return logits, fe
 
     @torch.no_grad()
     def get_embedding(self, x):
-        x = self._extract(x)
+        """L2-normalised 2048-d embedding for matching."""
+        x  = self._extract(x)
         return F.normalize(self.fc1(self.fc(x)), p=2, dim=1)
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -555,6 +466,13 @@ class CCNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class DINOBackbone(nn.Module):
+    """
+    DINOv2 ViT-S/14 backbone with selective unfreezing.
+    All parameters are frozen except blocks 10 and 11 of the ViT,
+    which are fine-tuned to adapt to palmprint recognition.
+    forward() returns the L2-normalised CLS token (384-d).
+    Requires: torch.hub access to facebookresearch/dinov2
+    """
     EMBED_DIM = 384
 
     def __init__(self):
@@ -568,11 +486,23 @@ class DINOBackbone(nn.Module):
         self.backbone = backbone
 
     def forward(self, x):
+        """Returns L2-normalised 384-d CLS token."""
         out = self.backbone.forward_features(x)
-        return F.normalize(out["x_norm_clstoken"], p=2, dim=1)
+        cls = out["x_norm_clstoken"]
+        return F.normalize(cls, p=2, dim=1)
+
+
+class LoRAExpert(nn.Module):
+    pass  # kept as placeholder — remove after confirming no external references
 
 
 class DINOv2Model(nn.Module):
+    """
+    DINOv2 FL model = DINOBackbone + ArcFace.
+    backbone(x) → L2-normalised 384-d CLS token → ArcFace → logits.
+    Weight sharing: backbone.* via FedAvg; arc.* kept local.
+    Input: RGB 224×224 with ImageNet normalisation.
+    """
     def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30):
         super().__init__()
         self.backbone = DINOBackbone()
@@ -584,6 +514,7 @@ class DINOv2Model(nn.Module):
 
     @torch.no_grad()
     def get_embedding(self, x):
+        """L2-normalised 384-d CLS embedding."""
         return self.backbone(x)
 
 
@@ -592,46 +523,21 @@ class DINOv2Model(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 def build_model(cfg, num_classes):
-    """
-    Instantiate the model specified in cfg["model"].
-
-    For compnet with use_moe=True: returns MultiExpertCompNet.
-      - If moe_warmup_round > 0, use_moe is forced False on construction
-        so the model starts in warmup mode (base expert only).
-        activate_moe() is called by the server at the right round.
-      - If moe_warmup_round == 0, full MoE is active from round 1.
-
-    For compnet with use_moe=False: returns plain CompNet.
-    """
+    """Instantiate and return the model specified in cfg["model"]."""
     name = cfg["model"].strip().lower()
-
     if name == "compnet":
-        if cfg.get("use_moe", False):
-            warmup = cfg.get("moe_warmup_round", 0)
-            # start in warmup mode when a warmup period is configured
-            effective_use_moe = (warmup == 0)
-            n_domains = cfg.get("n_domains", 6)
-            return MultiExpertCompNet(
-                num_classes   = num_classes,
-                n_domains     = n_domains,
-                embedding_dim = cfg["embedding_dim"],
-                arcface_s     = cfg["arcface_s"],
-                arcface_m     = cfg["arcface_m"],
-                dropout       = cfg["dropout"],
-                use_moe       = effective_use_moe,
-                use_grl       = cfg.get("use_grl", False),
-            )
-        else:
-            return CompNet(
-                num_classes   = num_classes,
-                embedding_dim = cfg["embedding_dim"],
-                arcface_s     = cfg["arcface_s"],
-                arcface_m     = cfg["arcface_m"],
-                dropout       = cfg["dropout"],
-                use_grl       = cfg.get("use_grl", False),
-                n_domains     = cfg.get("n_domains", 6),
-            )
-
+        return CompNet(
+            num_classes   = num_classes,
+            embedding_dim = cfg["embedding_dim"],
+            arcface_s     = cfg["arcface_s"],
+            arcface_m     = cfg["arcface_m"],
+            dropout       = cfg["dropout"],
+            use_moe       = cfg.get("use_moe",   False),
+            n_experts     = cfg.get("n_experts",  6),
+            lora_rank     = cfg.get("lora_rank",  64),
+            use_grl       = cfg.get("use_grl",    False),
+            n_domains     = cfg.get("n_domains",  6),
+        )
     elif name == "ccnet":
         return CCNet(
             num_classes  = num_classes,
@@ -640,14 +546,12 @@ def build_model(cfg, num_classes):
             arcface_s    = cfg["arcface_s"],
             arcface_m    = cfg["arcface_m"],
         )
-
     elif name == "dinov2":
         return DINOv2Model(
             num_classes = num_classes,
             arcface_s   = cfg.get("dino_scale",  16.0),
             arcface_m   = cfg.get("dino_margin",  0.30),
         )
-
     else:
         raise ValueError(f"Unknown model: '{cfg['model']}'. "
                          f"Choose 'compnet', 'ccnet', or 'dinov2'.")
