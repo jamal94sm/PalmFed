@@ -89,10 +89,10 @@ CONFIG = {
     #
     # Set moe_warmup_round = 0 to disable deferred activation (MoE from round 1).
     "use_moe"             : True,
-    "moe_position"        : "both",   # "fc" | "norm" | "both"
+    "moe_position"        : "norm",   # "fc" | "norm" | "both"
     "n_experts"           : 6,
     "lora_rank"           : 64,
-    "moe_warmup_round"    : 10,       # 0 = MoE active from round 1
+    "moe_warmup_round"    : 5,        # 0 = MoE active from round 1
                                       # N = MoE activates after round N
 
     # ── GRL ───────────────────────────────────────────────────
