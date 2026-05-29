@@ -26,123 +26,100 @@ CONFIG = {
     "base_results_dir" : "./rst_fedavg_casiams",
 
     # ── Fair comparison: shared splits and init weights ────────
-    # Both runs (use_fft_aug=True/False) load from the same files so
-    # that data splits and starting weights are identical.
-    # {dataset} and {model} are resolved at runtime.
     "splits_path"      : "./rst_fedavg_{dataset}/splits.pkl",
     "init_weights_path": "./rst_fedavg_{dataset}/init_weights_{model}.pth",
 
     # ── Dataset ────────────────────────────────────────────────
-    "n_ids"            : 200,    # number of identities to sample
-    "k_test"           : 0.20,   # fraction of IDs allocated to test set
-    "gallery_ratio"    : 0.20,   # fraction of test-ID samples → gallery
+    "n_ids"            : 200,
+    "k_test"           : 0.20,
+    "gallery_ratio"    : 0.20,
 
-    
     # ── Augmentation ───────────────────────────────────────────
     "use_fft_aug"         : True,
     "use_mixed_aug"       : False,
     "mixed_aug_round"     : 15,
     "fft_beta"            : 0.1,
     "M"                   : 2,
- 
+
     # FFT augmentation method:
-    #   "amplitude" — original: swap raw 2D amplitude in Gaussian-masked region.
-    #                 Transfers content+style together. Simple and fast.
-    #   "radial"    — new: match donor's radial log-amplitude profile ring-by-ring.
-    #                 Transfers spectral decay rate (domain-discriminative) only.
-    #                 Preserves 2D spatial amplitude structure (identity content).
-    #                 Requires extract_radial_template() instead of extract_style_template().
+    #   "amplitude" — swap raw 2D amplitude in Gaussian-masked region.
+    #   "radial"    — match donor's radial log-amplitude profile ring-by-ring.
     "fft_aug_method"      : "amplitude",  # "amplitude" | "radial"
- 
+
     # FFT donor mode:
-    #   False — cross-domain (default): donor templates from OTHER clients.
-    #           Tests cross-domain style transfer — the proposed method's key idea.
+    #   False — cross-domain: donor templates from OTHER clients.
     #   True  — local-only: donor templates from OWN client pool only.
-    #           Augmentation diversity without cross-domain transfer.
-    #           Ablation: if local_only ≈ cross-domain, the benefit comes from
-    #           augmentation volume, not domain transfer. If cross-domain >> local,
-    #           the cross-domain style transfer itself is the key contribution.
     "fft_local_only"      : True,
-    # FFT augmentation parameters
-    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
-    "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
 
-    
     # ── FL hyperparameters ─────────────────────────────────────
-    "n_rounds"         : 30,    # R: total communication rounds
-    "local_epochs"     : 1,      # E: local training epochs per round
+    "n_rounds"         : 30,
+    "local_epochs"     : 1,
 
-    # ── MoE (disabled — kept for future experiments) ───────────
-    # Exact domain routing: expert[domain_id] selected per sample.
-    # No load-balance loss needed (exact routing is trivially balanced).
+    # ── MoE ───────────────────────────────────────────────────
+    #
+    # Architecture
+    # ────────────
+    # FC layer: shared LoRA base + per-domain LoRA experts.
+    #   output = B(ReLU(A(x))) + B_d(ReLU(A_d(x)))
+    #   Both base and experts use _LoRABlock (A→ReLU→B, B init≈0).
     #
     # moe_position controls WHERE domain-specific parameters are applied:
-    #
-    #   "fc"   — LoRA residual experts on the FC bottleneck:
-    #              output = base_Linear(9708→512)
-    #                     + expert[d](9708 → rank → 512)
-    #            Adapts Gabor texture → embedding projection per domain.
-    #            Params per expert: 9708×64 + 64×512 ≈ 654k
-    #
-    #   "norm" — Per-domain LayerNorm (domain-conditional normalisation):
-    #              output = (x - μ) / σ  ×  γ[d]  +  β[d]
-    #            Shared normalisation statistics, per-domain affine transform.
-    #            Recalibrates embedding scale/shift per domain before ArcFace.
-    #            Params per expert: 2 × 512 = 1024  (extremely lightweight)
-    #
+    #   "fc"   — LoRA experts at the FC bottleneck only.
+    #   "norm" — per-domain LayerNorm affine only.
     #   "both" — LoRA experts at FC AND per-domain LayerNorm.
-    #            Maximum domain adaptation. Use for ablation.
+    #
+    # Deferred activation  (moe_warmup_round > 0)
+    # ────────────────────────────────────────────
+    # Phase 1 — rounds 1 … moe_warmup_round:
+    #   MoE is disabled. The FC is a single shared _LoRABlock (base only)
+    #   and the norm is a standard LayerNorm. All clients train together
+    #   via FedAvg — the shared base learns a domain-agnostic representation.
+    #
+    # Phase 2 — round moe_warmup_round + 1 … n_rounds:
+    #   The server calls model.activate_moe() immediately after aggregation
+    #   at round moe_warmup_round. This:
+    #     1. Replaces the shared _LoRABlock with MoEFC, copying trained base
+    #        weights into the shared base slot AND into every expert (warm start).
+    #     2. Replaces LayerNorm with MoELayerNorm (γ=1, β=0 — identity).
+    #     3. Sets use_moe=True on the global model.
+    #   The upgraded global model is then distributed to all clients as usual.
+    #   Experts start from the trained base — not random init — so they
+    #   immediately have a meaningful starting point and diverge only by the
+    #   domain-specific residual they learn in subsequent rounds.
+    #
+    # Set moe_warmup_round = 0 to disable deferred activation (MoE from round 1).
     "use_moe"             : True,
-    "moe_position"        : "norm",    # "fc" | "norm" | "both"
+    "moe_position"        : "both",   # "fc" | "norm" | "both"
     "n_experts"           : 6,
     "lora_rank"           : 64,
+    "moe_warmup_round"    : 10,       # 0 = MoE active from round 1
+                                      # N = MoE activates after round N
 
-    # ── GRL ─────────────────────
-    "use_grl"          : False,  # True → domain adversarial training (GRL)
-    "lambda_grl"       : 0.05,   # GRL loss weight (start small, e.g. 0.05–0.2)
-    "n_domains"        : 6,     # number of domains = n_clients (6 CASIA-MS, 4 XJTU)
-    # GRL shares domain_classifier via FedAvg alongside backbone.
-    # domain_ids come from the 3-tuple batch — own domain (aug_idx=0) and
-    # donor domain (aug_idx≥1) — so all 6 domains appear in every client's
-    # batch after FFT augmentation, giving the GRL meaningful cross-domain signal.
+    # ── GRL ───────────────────────────────────────────────────
+    "use_grl"          : False,
+    "lambda_grl"       : 0.05,
+    "n_domains"        : 6,
 
-    "use_whitening"    : False,  # True → ZCA whiten gallery+probe at evaluation
-    # Whitening matrix estimated from gallery, applied to both gallery and probe.
-    # Suppresses domain-induced variance in embedding space before cosine matching.
-    # Zero training cost — inference-time only.
+    # ── Whitening ─────────────────────────────────────────────
+    "use_whitening"    : False,
 
-    
-    # CrossEntropy + ArcFace is always active for all models.
-    #
-    # Style Consistency Loss — CompNet and DINOv2:
-    #   Enforces that FFT-augmented (or spatially-augmented) embeddings
-    #   stay close to their original counterparts via cosine similarity.
-    #   Loss = 1 - cosine_sim(emb_orig, emb_aug).  Range [0, 2]; 0 = perfect.
-    #   No NaN risk — always has exactly one positive pair per sample.
-    "lambda_style"     : 1,    # StyleConsistencyLoss weight (0.0 = disabled)
+    # ── Losses ────────────────────────────────────────────────
+    # Style Consistency Loss:
+    "lambda_style"     : 1,
 
-    # ── Supervised Contrastive Loss ────────────────────────────
-    # SupCon operates on the paired embeddings [emb_orig, emb_aug] already
-    # produced by FFTAugmentedDataset. No dataset change needed.
-    # emb_orig = backbone(spatial_aug(fft_styled))
-    # emb_aug  = backbone(spatial_aug(clean))   (when aug_idx≥1)
-    # SupCon pulls same-identity pairs together across the two views,
-    # complementing ArcFace which operates at the classification logit level.
-    "use_supcon"       : True,  # True → add SupCon to training loss
-    "lambda_supcon"    : 0.5,    # SupCon weight (paper uses 0.15–0.2)
-    "temperature"      : 0.07,   # SupCon temperature
+    # Supervised Contrastive Loss:
+    "use_supcon"       : True,
+    "lambda_supcon"    : 0.5,
+    "temperature"      : 0.07,
 
-    # SupConLoss — CCNet only (between paired same-identity views):
-    "ce_weight"        : 0.8,    # CE loss weight (CCNet only; CompNet/DINOv2 use 1.0)
-    "con_weight"       : 0.2,    # SupConLoss weight (CCNet only)
-    "temperature"      : 0.07,   # SupConLoss temperature (CCNet only)
+    # CCNet-specific:
+    "ce_weight"        : 0.8,
+    "con_weight"       : 0.2,
 
-    # CenterLoss — all models (optional):
-    #   Minimises distance between embeddings and per-client class centres.
-    #   Centres are kept local and carried over across rounds (never shared).
-    "use_center_loss"    : False,  # True → add CenterLoss to training
-    "center_loss_weight" : 0.5,  # λ_c — keep small so ArcFace dominates
-    "center_loss_lr"     : 0.5,    # SGD lr for centre updates (paper default)
+    # Center Loss:
+    "use_center_loss"    : False,
+    "center_loss_weight" : 0.5,
+    "center_loss_lr"     : 0.5,
 
     # ── CompNet hyperparameters ────────────────────────────────
     "img_side"         : 128,
@@ -152,22 +129,20 @@ CONFIG = {
     "arcface_m"        : 0.50,
 
     # ── CCNet-specific hyperparameters ─────────────────────────
-    "comp_weight"      : 0.8,    # channel vs spatial competition weight
+    "comp_weight"      : 0.8,
 
     # ── DINOv2-specific hyperparameters ───────────────────────
-    # RGB 224×224 + ImageNet normalisation.
-    # ViT-S/14 blocks 10 and 11 are unfrozen; all others are frozen.
     "dino_img_side"    : 224,
-    "dino_weight_decay": 1e-4,   # AdamW weight decay
-    "dino_margin"      : 0.3,    # ArcFace angular margin
-    "dino_scale"       : 16,     # ArcFace scale
+    "dino_weight_decay": 1e-4,
+    "dino_margin"      : 0.3,
+    "dino_scale"       : 16,
 
     # ── Training ───────────────────────────────────────────────
     "batch_size"       : 32,
-    "lr"               : 0.001,  # constant lr across all rounds (no scheduler)
+    "lr"               : 0.001,
 
     # ── Misc ───────────────────────────────────────────────────
     "random_seed"      : 42,
     "num_workers"      : 4,
-    "avg_last_rounds"  : 5,     # number of final rounds to average for reporting
+    "avg_last_rounds"  : 5,
 }
