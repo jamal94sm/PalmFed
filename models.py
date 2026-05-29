@@ -161,23 +161,15 @@ class _ResidualExpert(nn.Module):
 
 class MoEFC(nn.Module):
     """
-    Mixture-of-Experts FC bottleneck for CompNet.
-    Replaces the single nn.Linear(9708→512) with:
+    Exact-routing MoE at the FC bottleneck position.
+    Replaces nn.Linear(9708→512):
         output = base_FC(x) + expert[domain_id](x)
 
-    base_FC  — shared across all clients via FedAvg; learns domain-invariant projection.
-    expert[d] — low-rank residual (9708→rank→512); learns domain-specific correction.
+    Applied on: (B, 9708) Gabor feature concatenation.
+    Expert adapts the projection from raw texture features → embedding space.
+    Each expert learns a domain-specific correction to the shared projection.
 
-    Domain routing:
-      Training:  domain_ids tensor [B] selects one expert per sample (exact routing).
-      Inference: domain_ids=None → base_FC only (no residual). Base FC carries the
-                 full domain-invariant representation; residuals are training-time only.
-
-    experts[k] after FedAvg:
-      Client k contributes the strongest gradient to expert[k] (its own domain).
-      Other clients contribute via FFT-augmented copies styled as domain k.
-      Expert[k] converges toward the domain-k-specific correction, informed
-      primarily by the client that owns that domain.
+    moe_position="fc" in CompNet.
     """
     def __init__(self, in_features=9708, out_features=512,
                  n_experts=6, rank=64):
@@ -190,9 +182,9 @@ class MoEFC(nn.Module):
         ])
 
     def forward(self, x, domain_ids=None):
-        base_out = self.base(x)                              # [B, 512]
+        base_out = self.base(x)                          # [B, 512]
         if domain_ids is None:
-            return base_out                                  # inference: base only
+            return base_out                              # inference: base only
         residual = torch.zeros_like(base_out)
         for d in range(self.n_experts):
             mask = (domain_ids == d)
@@ -201,53 +193,125 @@ class MoEFC(nn.Module):
         return base_out + residual
 
 
+class MoEEmb(nn.Module):
+    """
+    Exact-routing MoE at the embedding position.
+    Applied after LayerNorm(512), before Dropout:
+        output = emb + expert[domain_id](emb)
+
+    Applied on: (B, 512) normalised embedding.
+    Expert adapts the embedding space directly — smaller, cheaper experts
+    (512→rank→512 vs 9708→rank→512 for MoEFC).
+    Each expert learns domain-specific shift in the angular embedding space,
+    complementing ArcFace's domain-invariant objective.
+
+    moe_position="emb" in CompNet.
+
+    Tradeoff vs moe_position="fc":
+      "fc"  — larger experts (9708→64→512), adapts texture→embedding mapping.
+              More parameters per expert, higher-dimensional input.
+      "emb" — smaller experts (512→64→512), adapts embedding space directly.
+              Fewer parameters, operates on already-compressed representation.
+              May be more compatible with ArcFace angular geometry.
+    """
+    def __init__(self, embedding_dim=512, n_experts=6, rank=64):
+        super().__init__()
+        self.n_experts = n_experts
+        self.experts   = nn.ModuleList([
+            _ResidualExpert(embedding_dim, embedding_dim, rank)
+            for _ in range(n_experts)
+        ])
+
+    def forward(self, emb, domain_ids=None):
+        if domain_ids is None:
+            return emb                                   # inference: no residual
+        residual = torch.zeros_like(emb)
+        for d in range(self.n_experts):
+            mask = (domain_ids == d)
+            if mask.any():
+                residual[mask] = self.experts[d](emb[mask])
+        return emb + residual
+
+
 class CompNet(nn.Module):
     """
-    CompNet = CB1 // CB2 // CB3 + FC(9708→512) + Dropout + ArcFace.
+    CompNet = CB1 // CB2 // CB3 + FC(9708→512) + LayerNorm + Dropout + ArcFace.
 
-    Optional GRL branch (use_grl=True):
-      emb [B,512] → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss
-      The reversed gradient pushes the backbone toward domain-invariant features.
-      DomainClassifier is shared via FedAvg (not excluded from get_weights).
+    Optional MoE (use_moe=True):
+      moe_position="fc"  — MoEFC replaces Linear(9708→512).
+                           Expert: (B,9708) → base + residual_d → (B,512).
+                           Adapts texture-to-embedding projection per domain.
+      moe_position="emb" — MoEEmb inserted after LayerNorm(512).
+                           Expert: (B,512) → emb + residual_d → (B,512).
+                           Adapts the embedding space directly per domain.
+                           Smaller experts, more compatible with ArcFace geometry.
 
-    Optional MoE branch (use_moe=True):
-      FC replaced by MoEFC with domain-conditioned residual experts.
+    Optional GRL (use_grl=True):
+      emb → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss.
     """
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25,
                  use_moe=False, n_experts=6, lora_rank=64,
+                 moe_position="fc",
                  use_grl=False, n_domains=6):
         super().__init__()
-        self.cb1     = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
-        self.cb2     = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
-        self.cb3     = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.use_moe = use_moe
-        if use_moe:
-            self.fc = MoEFC(9708, embedding_dim, n_experts, lora_rank)
+        self.cb1          = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
+        self.cb2          = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
+        self.cb3          = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
+        self.use_moe      = use_moe
+        self.moe_position = moe_position   # "fc" | "emb"
+
+        # FC layer: replaced by MoEFC when moe_position="fc"
+        if use_moe and moe_position == "fc":
+            self.fc       = MoEFC(9708, embedding_dim, n_experts, lora_rank)
         else:
-            self.fc = nn.Linear(9708, embedding_dim)
-        self.drop = nn.Dropout(p=dropout)
-        self.arc  = ArcMarginProduct(embedding_dim, num_classes,
-                                     s=arcface_s, m=arcface_m)
-        self.use_grl = use_grl
+            self.fc       = nn.Linear(9708, embedding_dim)
+
+        self.emb_norm     = nn.LayerNorm(embedding_dim)
+
+        # MoE at embedding: inserted after LayerNorm when moe_position="emb"
+        if use_moe and moe_position == "emb":
+            self.moe_emb  = MoEEmb(embedding_dim, n_experts, lora_rank)
+        else:
+            self.moe_emb  = None
+
+        self.drop         = nn.Dropout(p=dropout)
+        self.arc          = ArcMarginProduct(embedding_dim, num_classes,
+                                             s=arcface_s, m=arcface_m)
+        self.use_grl      = use_grl
         self.domain_classifier = (DomainClassifier(embedding_dim, n_domains)
                                    if use_grl else None)
 
     def _backbone(self, x, domain_ids=None):
         feat = torch.cat([self.cb1(x).flatten(1),
                           self.cb2(x).flatten(1),
-                          self.cb3(x).flatten(1)], dim=1)   # [B, 9708]
-        if self.use_moe:
-            return self.fc(feat, domain_ids)
-        return self.fc(feat)
+                          self.cb3(x).flatten(1)], dim=1)    # [B, 9708]
+
+        # ── FC / MoEFC ──────────────────────────────────────────────────────
+        if self.use_moe and self.moe_position == "fc":
+            emb = self.fc(feat, domain_ids)                  # MoEFC
+        else:
+            emb = self.fc(feat)                              # plain Linear
+
+        emb = self.emb_norm(emb)                             # LayerNorm(512)
+
+        # ── MoEEmb (after LayerNorm) ─────────────────────────────────────────
+        if self.use_moe and self.moe_position == "emb" and self.moe_emb is not None:
+            emb = self.moe_emb(emb, domain_ids)
+
+        return emb                                           # [B, 512]
 
     def forward(self, x, y=None, domain_ids=None):
         return self.arc(self.drop(self._backbone(x, domain_ids)), y)
 
     @torch.no_grad()
     def get_embedding(self, x):
-        """L2-normalised 512-d embedding — base FC only (no MoE residual)."""
-        return F.normalize(self._backbone(x, domain_ids=None), p=2, dim=1)
+        """L2-normalised 512-d embedding (no domain_ids at inference)."""
+        return F.normalize(self._backbone(x), p=2, dim=1)
+
+    def get_moe_lb_loss(self):
+        """No load-balance loss for exact routing — always zero."""
+        return torch.tensor(0.0, device=next(self.parameters()).device)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -532,11 +596,12 @@ def build_model(cfg, num_classes):
             arcface_s     = cfg["arcface_s"],
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
-            use_moe       = cfg.get("use_moe",   False),
-            n_experts     = cfg.get("n_experts",  6),
-            lora_rank     = cfg.get("lora_rank",  64),
-            use_grl       = cfg.get("use_grl",    False),
-            n_domains     = cfg.get("n_domains",  6),
+            use_moe       = cfg.get("use_moe",        False),
+            n_experts     = cfg.get("n_experts",       6),
+            lora_rank     = cfg.get("lora_rank",       64),
+            moe_position  = cfg.get("moe_position",   "fc"),
+            use_grl       = cfg.get("use_grl",         False),
+            n_domains     = cfg.get("n_domains",       6),
         )
     elif name == "ccnet":
         return CCNet(
