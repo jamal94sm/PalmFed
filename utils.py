@@ -133,7 +133,7 @@ def extract_features_dual(base_model, gallery_loader, probe_loader, device,
 
     Returns (eer, rank1) or (None, None) if registry is empty.
     """
-    from models import _ResidualExpert
+    from models import _FeatureResidualExpert
 
     if not domain_expert_registry:
         return None, None
@@ -143,11 +143,10 @@ def extract_features_dual(base_model, gallery_loader, probe_loader, device,
     out_f  = cfg_fc.out_features
     rank   = cfg_fc.domain_expert.A.weight.shape[0]  # detect rank from local expert
 
-    # materialise one _ResidualExpert per registered client on correct device
+    # materialise one _FeatureResidualExpert per registered client on correct device
     expert_modules = {}
     gate_raws      = {}
     for cid, state in domain_expert_registry.items():
-        from models import _FeatureResidualExpert
         exp = _FeatureResidualExpert(in_f, rank).to(device)
         exp.load_state_dict({k: v.to(device)
                              for k, v in state["domain_expert_state"].items()})
