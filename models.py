@@ -2,37 +2,56 @@
 #  models.py — CompNet and CCNet architectures
 # ==============================================================
 #
-#  DualExpertFC redesign:
+#  Dual-branch Gabor MoE (CompNet with use_moe=True):
 #
-#  domain_expert now operates in 9708-d Gabor FEATURE SPACE (not embedding space).
-#  It outputs a 9708-d residual that corrects the Gabor features before
-#  the base_expert projects them to 512-d. Combination uses a fixed scalar weight:
+#  Two PARALLEL Gabor extractor stacks + one shared FC + ArcFace.
 #
-#    corrected_feat = gabor_feat + expert_weight * domain_expert(gabor_feat)
-#    emb            = base_expert(corrected_feat)
+#  base_gabor   (CB1/CB2/CB3) → base_feat   [B, 9708]
+#    • Trained on ALL samples (real + FFT augmented).
+#    • base_feat → shared FC(9708→512) → domain-invariant embedding.
+#    • base_gabor.* and fc.* are FedAvg'd.
 #
-#  Benefits over the previous embedding-space residual:
-#    1. Domain signal lives in Gabor feature space (spectral/lighting differences
-#       are directly encoded there). The correction is geometrically meaningful.
-#    2. GlobalFull mismatch eliminated: the domain correction is always composed
-#       with whatever base_expert is active — local or FedAvg'd global.
-#    3. The domain reconstruction loss has a natural target in this space.
+#  domain_gabor (CB1/CB2/CB3) → domain_feat [B, 9708]
+#    • Trained ONLY on real own-domain samples (sentinel skips it).
+#    • Domain-specific Gabor filters diverge from base_gabor over rounds.
+#    • domain_gabor.* is NEVER FedAvg'd — stays local to owning client.
 #
-#  Domain reconstruction loss (computed in utils.train_compnet_epoch):
-#    For real own-domain samples in a batch:
-#      overall_mean  = mean(gabor_feat over all samples in batch)
-#      domain_signal = mean(gabor_feat[real_mask])
-#      target        = domain_signal - overall_mean   [domain-specific offset]
-#      L_recon = MSE(domain_expert(real_feats), target.expand_as(real_feats))
+#  Fusion (feature space, before the single FC):
+#    real sample  : fused = (1-w)*base_feat + w*domain_feat
+#    FFT sentinel : fused = base_feat   (domain_gabor not called)
+#    warmup       : fused = base_feat   (domain_gabor frozen)
 #
-#    This gives domain_expert an exclusive self-supervised task: predict the
-#    average domain-specific deviation of the Gabor features from the global
-#    batch mean. The base_expert cannot optimise this (it sees all domains and
-#    its gradient averages out the domain signal). The domain_expert is rewarded
-#    for being domain-homogeneous and identity-invariant — the right inductive bias.
+#  emb = fc(fused)  → single shared projection for all samples.
+#
+#  Why feature-space fusion before one shared FC:
+#    - Both branches produce 9708-d vectors in the same feature geometry
+#      (same CompetitiveBlock architecture), so weighted averaging is
+#      geometrically meaningful.
+#    - A single FC sees domain-corrected features and learns one
+#      domain-invariant projection; there is no embedding-space alignment
+#      problem between two independent 512-d spaces.
+#    - The FC is always FedAvg'd on the fused features, so GlobalFull
+#      evaluation (using the local domain_gabor) composes correctly with
+#      whatever FC version is active — local or global.
+#
+#  Domain reconstruction loss:
+#    domain_gabor(real_feats) should predict the domain-specific component
+#    of the Gabor features relative to the global batch mean:
+#      target = mean(base_gabor(real)) - mean(base_gabor(all))
+#    This gives domain_gabor an exclusive self-supervised task that
+#    base_gabor cannot optimise, giving it a clear learning signal.
+#
+#  Weight management:
+#    FedAvg'd  : base_gabor.*, fc.*
+#    Local-only : arc.*, domain_gabor.*
+#
+#  Two global models:
+#    GlobalBase : base_gabor + fc only  (domain_gabor not used)
+#    GlobalFull : base_gabor + domain_gabor[k] + fc for domain k
 #
 # ==============================================================
 
+import copy
 import math
 import torch
 import torch.nn as nn
@@ -41,7 +60,7 @@ from torch.nn import Parameter
 
 
 # ══════════════════════════════════════════════════════════════
-#  COMPNET BUILDING BLOCKS
+#  SHARED BUILDING BLOCKS
 # ══════════════════════════════════════════════════════════════
 
 class GaborConv2d(nn.Module):
@@ -66,15 +85,15 @@ class GaborConv2d(nn.Module):
         half = ksize // 2; ksz = 2 * half + 1
         y0 = torch.arange(-half, half + 1).float()
         x0 = torch.arange(-half, half + 1).float()
-        y  = y0.view(1, -1).repeat(c_out, c_in, ksz, 1)
-        x  = x0.view(-1, 1).repeat(c_out, c_in, 1, ksz)
+        y  = y0.view(1,-1).repeat(c_out, c_in, ksz, 1)
+        x  = x0.view(-1,1).repeat(c_out, c_in, 1, ksz)
         x  = x.to(sigma.device); y = y.to(sigma.device)
-        xt =  x * torch.cos(theta.view(-1,1,1,1)) + y * torch.sin(theta.view(-1,1,1,1))
-        yt = -x * torch.sin(theta.view(-1,1,1,1)) + y * torch.cos(theta.view(-1,1,1,1))
+        xt =  x*torch.cos(theta.view(-1,1,1,1)) + y*torch.sin(theta.view(-1,1,1,1))
+        yt = -x*torch.sin(theta.view(-1,1,1,1)) + y*torch.cos(theta.view(-1,1,1,1))
         gb = -torch.exp(
-            -0.5 * ((gamma * xt)**2 + yt**2) / (8 * sigma.view(-1,1,1,1)**2)
-        ) * torch.cos(2 * math.pi * f.view(-1,1,1,1) * xt + psi.view(-1,1,1,1))
-        return gb - gb.mean(dim=[2, 3], keepdim=True)
+            -0.5*((gamma*xt)**2+yt**2) / (8*sigma.view(-1,1,1,1)**2)
+        ) * torch.cos(2*math.pi*f.view(-1,1,1,1)*xt+psi.view(-1,1,1,1))
+        return gb - gb.mean(dim=[2,3], keepdim=True)
 
     def forward(self, x):
         self.kernel = self._gen_bank(
@@ -84,6 +103,7 @@ class GaborConv2d(nn.Module):
 
 
 class CompetitiveBlock(nn.Module):
+    """CB = LGC + soft-argmax + PPU."""
     def __init__(self, channel_in, n_competitor, ksize, stride, padding,
                  init_ratio=1, o1=32, o2=12):
         super().__init__()
@@ -102,6 +122,21 @@ class CompetitiveBlock(nn.Module):
         return self.conv2(self.maxpool(self.conv1(x)))
 
 
+def make_gabor_stack(init_ratios=(1.0, 0.5, 0.25)):
+    """Create three CompetitiveBlocks with given init_ratios."""
+    cb1 = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=init_ratios[0])
+    cb2 = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=init_ratios[1])
+    cb3 = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=init_ratios[2])
+    return cb1, cb2, cb3
+
+
+def extract_gabor(cb1, cb2, cb3, x):
+    """Run three CBs on x and concatenate outputs → [B, 9708]."""
+    return torch.cat([cb1(x).flatten(1),
+                      cb2(x).flatten(1),
+                      cb3(x).flatten(1)], dim=1)
+
+
 class ArcMarginProduct(nn.Module):
     def __init__(self, in_features, out_features, s=30.0, m=0.50,
                  easy_margin=False):
@@ -111,7 +146,7 @@ class ArcMarginProduct(nn.Module):
         nn.init.xavier_uniform_(self.weight)
         self.easy_margin = easy_margin
         self.cos_m = math.cos(m); self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m); self.mm = math.sin(math.pi - m) * m
+        self.th    = math.cos(math.pi - m); self.mm = math.sin(math.pi - m) * m
 
     def forward(self, x, label=None):
         cosine = F.linear(F.normalize(x), F.normalize(self.weight))
@@ -143,336 +178,63 @@ class DomainClassifier(nn.Module):
     def forward(self, x): return self.net(x)
 
 
-class _FeatureResidualExpert(nn.Module):
-    """
-    Low-rank residual adapter operating in 9708-d Gabor FEATURE space.
-
-    Architecture: A(9708→rank) → ReLU → B(rank→9708)
-    Output is a 9708-d correction to the Gabor feature vector.
-
-    Unlike the previous embedding-space residual (9708→rank→512), this
-    module outputs in the same space as its input, making it interpretable
-    as a domain-specific feature correction.
-
-    B initialised to zero → zero correction at round 0 (safe start).
-    A initialised Kaiming → gradient flows from the first batch.
-    """
-    def __init__(self, in_features, rank):
-        super().__init__()
-        self.A = nn.Linear(in_features, rank, bias=False)
-        self.B = nn.Linear(rank, in_features, bias=False)
-        nn.init.kaiming_normal_(self.A.weight, nonlinearity="relu")
-        nn.init.zeros_(self.B.weight)
-
-    def forward(self, x):
-        return self.B(F.relu(self.A(x)))
-
-
 # ══════════════════════════════════════════════════════════════
-#  DUAL-EXPERT FC BOTTLENECK  (feature-space domain correction)
-# ══════════════════════════════════════════════════════════════
-
-class DualExpertFC(nn.Module):
-    """
-    Two-expert FC bottleneck with feature-space domain correction.
-
-    base_expert   : nn.Linear(9708→512)
-      • Receives gradient from ALL samples (real + FFT sentinel).
-      • FedAvg'd — learns the domain-invariant projection.
-
-    domain_expert : _FeatureResidualExpert(9708→rank→9708)
-      • Receives gradient ONLY from real own-domain samples
-        (domain_id >= 0, NOT the FFT sentinel -1).
-      • NEVER FedAvg'd — permanently local.
-      • Learns a domain-specific FEATURE-SPACE correction.
-
-    expert_weight : fixed scalar w in [0, 1]   (from config, not learned)
-      • Controls how strongly the domain correction is applied.
-      • Fixed rather than learned because a learned gate had no gradient
-        pressure to open (the ArcFace loss does not specifically reward
-        the domain_expert's contribution).
-
-    Forward (training):
-      gabor_feat  [B, 9708]
-      ├─ real samples (domain_id >= 0):
-      │    corrected = gabor_feat + expert_weight * domain_expert(gabor_feat)
-      │    emb       = base_expert(corrected)
-      └─ sentinel samples (domain_id == -1):
-           emb = base_expert(gabor_feat)     [domain_expert skipped]
-
-    Domain reconstruction loss (computed externally in train_compnet_epoch):
-      On real samples in each batch:
-        overall_mean  = mean(gabor_feat, dim=0)         [9708] all samples
-        domain_mean   = mean(gabor_feat[real], dim=0)   [9708] domain centroid
-        target        = domain_mean - overall_mean       [9708] domain-specific offset
-        prediction    = domain_expert(gabor_feat[real])  [R, 9708]
-        L_recon = MSE(prediction, target.unsqueeze(0).expand_as(prediction))
-
-      The domain_expert is rewarded for capturing what makes domain k
-      different from the global average — a purely domain-specific signal.
-
-    Inference:
-      embed(feat, domain_id=int) → base(feat + w * domain_expert(feat))
-      embed(feat, domain_id=None) → base(feat)               [GlobalBase]
-
-    GlobalFull inference (external expert from another client's local model):
-      embed_with_external_expert(feat, ext_expert, ext_weight)
-      → base(feat + ext_weight * ext_expert(feat))
-      The mismatch of the previous design is eliminated: domain correction
-      is in feature space, so it composes correctly with any base_expert.
-    """
-
-    SENTINEL = -1
-
-    def __init__(self, in_features=9708, out_features=512, rank=64,
-                 expert_weight=0.5):
-        super().__init__()
-        self.in_features   = in_features
-        self.out_features  = out_features
-        self.expert_weight = expert_weight   # fixed, not learned
-
-        # ── shared (FedAvg'd) ──────────────────────────────────────────────
-        self.base_expert = nn.Linear(in_features, out_features)
-
-        # ── local-only (never FedAvg'd) ───────────────────────────────────
-        self.domain_expert = _FeatureResidualExpert(in_features, rank)
-
-        self._warmup = False
-        self.register_buffer("_real_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("_skip_count", torch.tensor(0, dtype=torch.long))
-
-    # ── warmup ──────────────────────────────────────────────────────────────
-
-    def set_warmup(self, warmup: bool):
-        self._warmup = warmup
-        for p in self.domain_expert.parameters():
-            p.requires_grad = not warmup
-
-    @property
-    def is_warming_up(self): return self._warmup
-
-    # ── routing stats ────────────────────────────────────────────────────────
-
-    def reset_routing_stats(self): self._real_count.zero_(); self._skip_count.zero_()
-
-    def get_routing_stats(self):
-        return {"real": int(self._real_count), "skip": int(self._skip_count)}
-
-    # ── forward (training) ───────────────────────────────────────────────────
-
-    def forward(self, x, domain_ids=None):
-        """
-        x          : Tensor [B, 9708]  — Gabor features
-        domain_ids : Tensor [B] int | None
-          >= 0  → real own-domain sample → feature corrected by domain_expert
-          == -1 → FFT sentinel           → base_expert only
-          None  → warmup                 → base_expert only
-
-        Returns emb [B, 512] — base_expert applied to (optionally corrected) features.
-        Also returns domain_expert_outputs [B, 9708] (only for real samples, else None)
-        for use in the domain reconstruction loss.
-        """
-        if self._warmup or domain_ids is None:
-            return self.base_expert(x), None
-
-        real_mask = (domain_ids >= 0)
-        skip_mask = ~real_mask
-
-        # start with a copy of x; real samples will be corrected in place
-        corrected = x.clone()
-        domain_expert_out = None   # will hold domain_expert predictions for real
-
-        if real_mask.any():
-            raw_correction          = self.domain_expert(x[real_mask])   # [R, 9708]
-            corrected[real_mask]    = x[real_mask] + self.expert_weight * raw_correction
-            domain_expert_out       = raw_correction  # returned for recon loss
-            if self.training:
-                self._real_count += real_mask.sum().item()
-
-        if skip_mask.any() and self.training:
-            self._skip_count += skip_mask.sum().item()
-
-        emb = self.base_expert(corrected)
-        return emb, domain_expert_out   # domain_expert_out is None if no real samples
-
-    # ── inference ────────────────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def embed(self, feat, domain_id=None):
-        """Single-domain inference."""
-        if domain_id is None or self._warmup:
-            return self.base_expert(feat)
-        correction = self.domain_expert(feat)
-        return self.base_expert(feat + self.expert_weight * correction)
-
-    @torch.no_grad()
-    def embed_with_external_expert(self, feat, ext_domain_expert, ext_weight):
-        """
-        GlobalFull inference with an external client's domain_expert.
-        Feature-space correction composes correctly with any base_expert
-        because it operates before the base projection.
-        """
-        correction = ext_domain_expert(feat)
-        return self.base_expert(feat + ext_weight * correction)
-
-    # ── gradient norms ───────────────────────────────────────────────────────
-
-    def get_grad_norms(self):
-        def _n(p): return round(float(p.grad.norm()), 4) if p.grad is not None else None
-        return {
-            "base_grad_norm"  : _n(self.base_expert.weight),
-            "domain_grad_norm": _n(self.domain_expert.B.weight),
-            "gate_grad_norm"  : None,   # no learned gate in this design
-        }
-
-    # ── weight-space diagnostics ─────────────────────────────────────────────
-
-    @torch.no_grad()
-    def get_weight_diagnostics(self):
-        return {
-            "base_weight_norm"  : round(float(self.base_expert.weight.norm()), 4),
-            "domain_weight_norm": round(float(self.domain_expert.B.weight.norm()), 4),
-            "gate_value"        : self.expert_weight,   # fixed, for display
-        }
-
-    # ── activation-space diagnostics ─────────────────────────────────────────
-
-    @torch.no_grad()
-    def get_activation_diagnostics(self, feat):
-        """
-        feat : Tensor [N, 9708]  — fixed probe Gabor features.
-
-        Returns per-sample stats measuring how much the domain_expert
-        shifts the features and how much the base_expert output changes.
-        """
-        feat      = feat.float()
-        correction = self.domain_expert(feat)              # [N, 9708]
-        corrected  = feat + self.expert_weight * correction
-        base_only  = self.base_expert(feat)                # [N, 512]
-        base_full  = self.base_expert(corrected)           # [N, 512]
-
-        # how large is the feature-space correction relative to the features
-        feat_norm   = float(feat.norm(dim=1).mean())
-        corr_norm   = float((self.expert_weight * correction).norm(dim=1).mean())
-        feat_ratio  = corr_norm / max(feat_norm, 1e-8)
-
-        # how much does the embedding direction change
-        cos_sim = float(F.cosine_similarity(
-            F.normalize(base_only, dim=1),
-            F.normalize(base_full, dim=1)).mean())
-
-        # how large is the final embedding difference
-        base_emb_norm = float(base_only.norm(dim=1).mean())
-        diff_norm     = float((base_full - base_only).norm(dim=1).mean())
-        emb_ratio     = diff_norm / max(base_emb_norm, 1e-8)
-
-        return {
-            "base_norm"           : round(float(base_only.norm(dim=1).mean()), 4),
-            "feat_correction_norm": round(corr_norm, 4),
-            "feat_correction_ratio": round(feat_ratio, 4),  # corr / feat magnitude
-            "emb_diff_norm"       : round(diff_norm, 4),
-            "gated_base_ratio"    : round(emb_ratio, 4),    # embedding shift ratio
-            "base_full_cos_sim"   : round(cos_sim, 4),
-            "gate_value"          : self.expert_weight,
-            "domain_gated_norm"   : round(corr_norm, 4),   # alias for printer compat
-        }
-
-    # ── domain reconstruction loss ───────────────────────────────────────────
-
-    def compute_domain_recon_loss(self, gabor_feat, domain_ids):
-        """
-        Compute the domain reconstruction loss for real samples in the batch.
-
-        Theory
-        ──────
-        The domain_expert should predict the domain-specific component of
-        the Gabor features — i.e. what makes domain k different from all
-        other domains in feature space.
-
-        We approximate this as:
-          target = domain_mean - overall_mean
-
-        where:
-          overall_mean = mean of all gabor_feat in this batch [9708]
-                         ≈ domain-invariant features (multiple domains averaged)
-          domain_mean  = mean of real own-domain features [9708]
-                         ≈ domain k centroid (identity variation averages out)
-          target       = domain-specific offset [9708]
-
-        The domain_expert's output for any individual sample of domain k
-        should approximate this target. This is identity-invariant by
-        construction (the target is a per-batch constant shared by all
-        real samples) and domain-specific (it captures what domain k looks
-        like relative to the global average).
-
-        Why the base_expert cannot optimise this:
-          The base_expert sees all domains and its gradient is pulled in
-          multiple directions simultaneously. Its loss (ArcFace classification)
-          rewards identity discriminability, not domain homogeneity.
-          The reconstruction loss explicitly rewards the domain_expert for
-          being homogeneous across identities within a domain — the exact
-          opposite of the identity-discriminative ArcFace task.
-
-        Parameters
-        ──────────
-        gabor_feat : Tensor [B, 9708]  — raw Gabor features, before correction
-        domain_ids : Tensor [B]        — -1 for sentinel, >=0 for real
-
-        Returns
-        ───────
-        loss : scalar Tensor  — MSE reconstruction loss (0.0 if no real samples)
-        target_norm : float   — norm of the target (for diagnostics)
-        """
-        real_mask = (domain_ids >= 0)
-        if not real_mask.any():
-            return torch.tensor(0.0, device=gabor_feat.device, requires_grad=False), 0.0
-
-        real_feats   = gabor_feat[real_mask]               # [R, 9708]
-        overall_mean = gabor_feat.mean(dim=0)              # [9708]  all samples
-        domain_mean  = real_feats.mean(dim=0)              # [9708]  domain centroid
-        target       = (domain_mean - overall_mean).detach()  # [9708] stop-grad on target
-
-        prediction   = self.domain_expert(real_feats)     # [R, 9708]
-        target_exp   = target.unsqueeze(0).expand_as(prediction)
-
-        loss = F.mse_loss(prediction, target_exp)
-        return loss, float(target.norm())
-
-
-# ══════════════════════════════════════════════════════════════
-#  COMPNET  (with DualExpertFC)
+#  COMPNET  —  Dual-Branch Gabor MoE
 # ══════════════════════════════════════════════════════════════
 
 class CompNet(nn.Module):
     """
-    CompNet = CB1//CB2//CB3 + DualExpertFC(9708→[9708]→512) + Dropout + ArcFace.
+    CompNet with dual parallel Gabor branches (MoE mode).
 
-    The domain_expert now corrects in Gabor feature space (9708-d) before
-    the base_expert projects to 512-d. Fixed expert_weight controls the blend.
+    Standard (use_moe=False):
+      CB1/CB2/CB3 → feat [B,9708] → fc → drop → arc
+
+    MoE (use_moe=True):
+      base_gabor   (CB1b/CB2b/CB3b) → base_feat   [B,9708]  all samples
+      domain_gabor (CB1d/CB2d/CB3d) → domain_feat [B,9708]  real only
+      fused = (1-w)*base_feat + w*domain_feat               feature-space blend
+      fc(fused) → drop → arc
+
+    Sentinel (domain_id == -1, FFT samples):
+      fused = base_feat   (domain_gabor branch not called)
+
+    domain_gabor starts as a copy of base_gabor at init — same spectral
+    coverage — then diverges as it trains exclusively on real samples.
 
     Weight management
     ─────────────────
-    FedAvg'd  : fc.base_expert.* + all Gabor/CB parameters
-    Local-only : arc.*, fc.domain_expert.*
-    (No gate parameters — expert_weight is a fixed config scalar.)
+    FedAvg'd  : base_gabor.* (cb1b/cb2b/cb3b)  +  fc.*
+    Local-only : arc.*  +  domain_gabor.* (cb1d/cb2d/cb3d)
     """
+
+    SENTINEL = -1   # domain_id value for FFT-augmented samples
+
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25,
-                 use_moe=False, lora_rank=64,
+                 use_moe=False, expert_weight=0.5,
                  use_grl=False, n_domains=6,
-                 expert_weight=0.5,
-                 # legacy args kept for compat — ignored
-                 gate_mode=None, gate_init=None, gate_scale=None, n_experts=None):
+                 # legacy kwargs silently ignored
+                 lora_rank=None, gate_mode=None, gate_init=None,
+                 gate_scale=None, n_experts=None):
         super().__init__()
-        self.cb1 = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
-        self.cb2 = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
-        self.cb3 = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.use_moe = use_moe
+        self.use_moe       = use_moe
+        self.expert_weight = expert_weight
+
         if use_moe:
-            self.fc = DualExpertFC(9708, embedding_dim, lora_rank,
-                                   expert_weight=expert_weight)
+            # ── base branch (FedAvg'd) ────────────────────────────────────
+            self.cb1b, self.cb2b, self.cb3b = make_gabor_stack()
+            # ── domain branch (local only) ────────────────────────────────
+            # Initialised as a deep copy of base so it starts from the same
+            # spectral prior and diverges only through domain-specific data.
+            self.cb1d = copy.deepcopy(self.cb1b)
+            self.cb2d = copy.deepcopy(self.cb2b)
+            self.cb3d = copy.deepcopy(self.cb3b)
+            self._warmup = False
         else:
-            self.fc = nn.Linear(9708, embedding_dim)
+            # Standard single-branch CompNet
+            self.cb1, self.cb2, self.cb3 = make_gabor_stack()
+
+        self.fc   = nn.Linear(9708, embedding_dim)
         self.drop = nn.Dropout(p=dropout)
         self.arc  = ArcMarginProduct(embedding_dim, num_classes,
                                      s=arcface_s, m=arcface_m)
@@ -480,66 +242,277 @@ class CompNet(nn.Module):
         self.domain_classifier = (DomainClassifier(embedding_dim, n_domains)
                                    if use_grl else None)
 
-    def local_only_keys(self):
-        """Keys never sent to server: local ArcFace + local domain_expert."""
-        return ("arc.", "fc.domain_expert.")
+        # routing counters
+        self.register_buffer("_real_count", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_skip_count", torch.zeros(1, dtype=torch.long))
+
+    # ── warmup control ───────────────────────────────────────────────────────
 
     def set_moe_warmup(self, warmup: bool):
-        if self.use_moe: self.fc.set_warmup(warmup)
+        """Freeze / unfreeze domain_gabor branch."""
+        if not self.use_moe:
+            return
+        self._warmup = warmup
+        for p in list(self.cb1d.parameters()) + \
+                 list(self.cb2d.parameters()) + \
+                 list(self.cb3d.parameters()):
+            p.requires_grad = not warmup
 
     @property
     def moe_is_warming_up(self):
-        return self.use_moe and self.fc.is_warming_up
+        return self.use_moe and self._warmup
 
-    def _gabor_feat(self, x):
-        return torch.cat([self.cb1(x).flatten(1),
-                          self.cb2(x).flatten(1),
-                          self.cb3(x).flatten(1)], dim=1)   # [B, 9708]
+    # ── key classification ───────────────────────────────────────────────────
+
+    def local_only_keys(self):
+        """Keys that NEVER leave the client (excluded from FedAvg)."""
+        if self.use_moe:
+            return ("arc.", "cb1d.", "cb2d.", "cb3d.")
+        return ("arc.",)
+
+    # ── routing stats ────────────────────────────────────────────────────────
+
+    def reset_routing_stats(self):
+        self._real_count.zero_(); self._skip_count.zero_()
+
+    def get_routing_stats(self):
+        return {"real": int(self._real_count), "skip": int(self._skip_count)}
+
+    # ── feature extraction ───────────────────────────────────────────────────
+
+    def _base_feat(self, x):
+        """Base Gabor features [B, 9708] — always computed."""
+        if self.use_moe:
+            return extract_gabor(self.cb1b, self.cb2b, self.cb3b, x)
+        return extract_gabor(self.cb1, self.cb2, self.cb3, x)
+
+    def _domain_feat(self, x):
+        """Domain Gabor features [B, 9708] — MoE only."""
+        return extract_gabor(self.cb1d, self.cb2d, self.cb3d, x)
+
+    # ── fused feature (training + inference) ─────────────────────────────────
+
+    def _fused_feat(self, x, domain_ids=None):
+        """
+        Compute weighted feature fusion for a batch.
+
+        domain_ids : Tensor [B] | None
+          >= 0  → real own-domain sample  → fused = (1-w)*base + w*domain
+          == -1 → FFT sentinel            → fused = base  (domain branch skipped)
+          None  → warmup / non-MoE        → fused = base
+
+        Returns
+        -------
+        fused       : Tensor [B, 9708]
+        base_feat   : Tensor [B, 9708]   — always returned for recon loss target
+        domain_feat : Tensor [R, 9708] | None — domain branch output for real samples
+        real_mask   : BoolTensor [B]    — which samples are real
+        """
+        base_feat = self._base_feat(x)           # [B, 9708]
+
+        if not self.use_moe or self._warmup or domain_ids is None:
+            return base_feat, base_feat, None, None
+
+        real_mask = (domain_ids >= 0)             # FFT sentinel = False
+
+        if not real_mask.any():
+            return base_feat, base_feat, None, real_mask
+
+        # Only run domain_gabor on real samples (saves compute + ensures
+        # no gradient flows from FFT sentinel through domain branch)
+        domain_feat_real = self._domain_feat(x[real_mask])   # [R, 9708]
+
+        fused = base_feat.clone()
+        fused[real_mask] = ((1.0 - self.expert_weight) * base_feat[real_mask]
+                            + self.expert_weight        * domain_feat_real)
+
+        if self.training:
+            self._real_count += real_mask.sum().item()
+            self._skip_count += (~real_mask).sum().item()
+
+        return fused, base_feat, domain_feat_real, real_mask
+
+    # ── backbone ─────────────────────────────────────────────────────────────
 
     def _backbone(self, x, domain_ids=None):
         """
-        Returns (emb, domain_expert_out).
-        domain_expert_out is None when not MoE or warmup or no real samples.
-        Used by train_compnet_epoch to compute the reconstruction loss.
+        Full forward through Gabor + FC.
+        Returns (emb [B,512], base_feat [B,9708], domain_feat [R,9708]|None, real_mask|None).
         """
-        feat = self._gabor_feat(x)
-        if self.use_moe:
-            emb, de_out = self.fc(feat, domain_ids)
-            return emb, de_out
-        return self.fc(feat), None
+        fused, base_feat, domain_feat, real_mask = self._fused_feat(x, domain_ids)
+        emb = self.fc(fused)
+        return emb, base_feat, domain_feat, real_mask
+
+    # ── training forward ─────────────────────────────────────────────────────
 
     def forward(self, x, y=None, domain_ids=None):
-        emb, _ = self._backbone(x, domain_ids)
+        emb, _, _, _ = self._backbone(x, domain_ids)
         return self.arc(self.drop(emb), y)
+
+    # ── inference ────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def get_embedding(self, x, domain_id=None):
-        feat = self._gabor_feat(x)
-        if self.use_moe:
-            return F.normalize(self.fc.embed(feat, domain_id), p=2, dim=1)
-        return F.normalize(self.fc(feat), p=2, dim=1)
+        """
+        L2-normalised 512-d embedding.
+        domain_id : int  → fuse base + domain branches  (GlobalFull)
+                    None → base branch only              (GlobalBase)
+        """
+        base_feat = self._base_feat(x)
+        if self.use_moe and domain_id is not None and not self._warmup:
+            domain_feat = self._domain_feat(x)
+            fused = ((1.0 - self.expert_weight) * base_feat
+                     + self.expert_weight        * domain_feat)
+        else:
+            fused = base_feat
+        return F.normalize(self.fc(fused), p=2, dim=1)
 
     @torch.no_grad()
-    def get_embedding_with_external_expert(self, x, ext_domain_expert, ext_weight):
-        feat = self._gabor_feat(x)
-        raw  = self.fc.embed_with_external_expert(feat, ext_domain_expert, ext_weight)
-        return F.normalize(raw, p=2, dim=1)
+    def get_embedding_with_external_domain(self, x, ext_cb1d, ext_cb2d, ext_cb3d):
+        """
+        GlobalFull inference using an external client's domain_gabor modules.
+        Server calls this after loading client k's domain_gabor state.
+        """
+        base_feat   = self._base_feat(x)
+        domain_feat = extract_gabor(ext_cb1d, ext_cb2d, ext_cb3d, x)
+        fused = ((1.0 - self.expert_weight) * base_feat
+                 + self.expert_weight        * domain_feat)
+        return F.normalize(self.fc(fused), p=2, dim=1)
+
+    # ── domain reconstruction loss ────────────────────────────────────────────
+
+    def compute_domain_recon_loss(self, base_feat, domain_feat_real, real_mask):
+        """
+        Domain reconstruction loss — gives domain_gabor an exclusive target.
+
+        For real samples in a batch:
+          base_all_mean  = mean(base_feat, dim=0)              [9708] all samples
+          base_real_mean = mean(base_feat[real_mask], dim=0)   [9708] real centroid
+          target         = (base_real_mean - base_all_mean).detach()
+                           The domain-specific component of the base features:
+                           what domain k looks like compared to the global average.
+
+          prediction = domain_feat_real    [R, 9708]  (already computed in _backbone)
+
+          L_recon = MSE(prediction, target.expand_as(prediction))
+
+        Why this target:
+          base_all_mean  ≈ domain-invariant (averaged over all 6 domains via FFT aug)
+          base_real_mean = domain k centroid (identity variation averages out)
+          target         = what is specific to domain k in the Gabor features
+          domain_gabor is rewarded for producing this offset for EVERY sample
+          → it learns to be identity-invariant and domain-homogeneous,
+            the exact complement of base_gabor's identity-discriminative task.
+
+        Note: target is computed from BASE features, not domain features.
+          This means domain_gabor is anchored to the same feature geometry
+          as base_gabor, preventing arbitrary divergence.
+
+        Parameters
+        ──────────
+        base_feat        : Tensor [B, 9708]  detached — no grad needed
+        domain_feat_real : Tensor [R, 9708]  with grad — domain_gabor output
+        real_mask        : BoolTensor [B]
+
+        Returns
+        ───────
+        loss : scalar Tensor
+        """
+        if domain_feat_real is None or not real_mask.any():
+            return torch.tensor(0.0, device=base_feat.device)
+
+        with torch.no_grad():
+            base_all_mean  = base_feat.mean(dim=0)                # [9708]
+            base_real_mean = base_feat[real_mask].mean(dim=0)     # [9708]
+            target         = base_real_mean - base_all_mean        # [9708]
+
+        target_exp = target.unsqueeze(0).expand_as(domain_feat_real)
+        return F.mse_loss(domain_feat_real, target_exp)
 
     # ── diagnostics ──────────────────────────────────────────────────────────
 
-    def reset_routing_stats(self):
-        if self.use_moe: self.fc.reset_routing_stats()
-    def get_routing_stats(self):
-        return self.fc.get_routing_stats() if self.use_moe else None
-    def get_grad_norms(self):
-        return self.fc.get_grad_norms() if self.use_moe else None
     def get_weight_diagnostics(self):
-        return self.fc.get_weight_diagnostics() if self.use_moe else None
-    def get_activation_diagnostics(self, probe_feat):
-        return self.fc.get_activation_diagnostics(probe_feat) if self.use_moe else None
-    def compute_domain_recon_loss(self, gabor_feat, domain_ids):
-        if not self.use_moe: return torch.tensor(0.0), 0.0
-        return self.fc.compute_domain_recon_loss(gabor_feat, domain_ids)
+        if not self.use_moe:
+            return None
+        with torch.no_grad():
+            # Cosine similarity between base and domain Gabor filter banks
+            # High similarity → domain branch hasn't diverged yet (expected early)
+            # Lower similarity → domain branch specialising
+            def _flat_params(cb):
+                return torch.cat([p.data.flatten()
+                                  for p in cb.parameters() if p.requires_grad])
+            base_p   = torch.cat([_flat_params(self.cb1b),
+                                   _flat_params(self.cb2b),
+                                   _flat_params(self.cb3b)])
+            domain_p = torch.cat([_flat_params(self.cb1d),
+                                   _flat_params(self.cb2d),
+                                   _flat_params(self.cb3d)])
+            cos_sim  = float(F.cosine_similarity(
+                base_p.unsqueeze(0), domain_p.unsqueeze(0)))
+            divergence = 1.0 - cos_sim          # 0 = identical, 1 = orthogonal
+            param_diff = float((base_p - domain_p).norm())
+        return {
+            "base_weight_norm"  : round(float(base_p.norm()), 3),
+            "domain_weight_norm": round(float(domain_p.norm()), 3),
+            "branch_cos_sim"    : round(cos_sim, 4),
+            "branch_divergence" : round(divergence, 4),
+            "branch_param_diff" : round(param_diff, 4),
+            "gate_value"        : self.expert_weight,
+        }
+
+    def get_activation_diagnostics(self, probe_img):
+        """
+        probe_img : Tensor [N, 1, H, W]  — fixed probe images (not features).
+
+        Returns feature-space and embedding-space statistics measuring
+        how much the domain branch shifts the representation.
+        """
+        if not self.use_moe:
+            return None
+        with torch.no_grad():
+            probe_img = probe_img.to(next(self.parameters()).device)
+            base_feat   = self._base_feat(probe_img)      # [N, 9708]
+            domain_feat = self._domain_feat(probe_img)    # [N, 9708]
+            correction  = self.expert_weight * (domain_feat - base_feat)
+            fused       = base_feat + correction
+
+            base_emb  = self.fc(base_feat)
+            fused_emb = self.fc(fused)
+
+            feat_norm  = float(base_feat.norm(dim=1).mean())
+            corr_norm  = float(correction.norm(dim=1).mean())
+            feat_ratio = corr_norm / max(feat_norm, 1e-8)
+
+            cos_sim = float(F.cosine_similarity(
+                F.normalize(base_emb, dim=1),
+                F.normalize(fused_emb, dim=1)).mean())
+
+            emb_norm  = float(base_emb.norm(dim=1).mean())
+            diff_norm = float((fused_emb - base_emb).norm(dim=1).mean())
+            emb_ratio = diff_norm / max(emb_norm, 1e-8)
+
+        return {
+            "base_norm"            : round(feat_norm, 4),
+            "feat_correction_ratio": round(feat_ratio, 4),
+            "gated_base_ratio"     : round(emb_ratio, 4),
+            "base_full_cos_sim"    : round(cos_sim, 4),
+            "gate_value"           : self.expert_weight,
+            "domain_gated_norm"    : round(float(correction.norm(dim=1).mean()), 4),
+        }
+
+    def get_grad_norms(self):
+        if not self.use_moe:
+            return None
+        def _gnorm(modules):
+            grads = [p.grad.norm() for m in modules
+                     for p in m.parameters()
+                     if p.grad is not None]
+            return round(float(torch.stack(grads).mean()), 4) if grads else None
+        return {
+            "base_grad_norm"  : _gnorm([self.cb1b, self.cb2b, self.cb3b, self.fc]),
+            "domain_grad_norm": _gnorm([self.cb1d, self.cb2d, self.cb3d]),
+            "gate_grad_norm"  : None,   # no learned gate
+        }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -549,40 +522,38 @@ class CompNet(nn.Module):
 class SupConLoss(nn.Module):
     def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07):
         super().__init__()
-        self.temperature = temperature; self.contrast_mode = contrast_mode
-        self.base_temperature = base_temperature
+        self.temperature=temperature; self.contrast_mode=contrast_mode
+        self.base_temperature=base_temperature
 
     def forward(self, features, labels=None, mask=None):
-        device = features.device
-        if len(features.shape) < 3: raise ValueError('features needs [bsz, n_views, ...]')
-        if len(features.shape) > 3: features = features.view(features.shape[0], features.shape[1], -1)
-        batch_size = features.shape[0]
+        device=features.device
+        if len(features.shape)<3: raise ValueError('features needs [bsz,n_views,...]')
+        if len(features.shape)>3: features=features.view(features.shape[0],features.shape[1],-1)
+        B=features.shape[0]
         if labels is not None and mask is not None: raise ValueError('Cannot define both')
-        elif labels is None and mask is None: mask = torch.eye(batch_size, dtype=torch.float32, device=device)
+        elif labels is None and mask is None: mask=torch.eye(B,dtype=torch.float32,device=device)
         elif labels is not None:
-            labels = labels.contiguous().view(-1, 1)
-            mask   = torch.eq(labels, labels.T).float().to(device)
-        else: mask = mask.float().to(device)
-        contrast_count   = features.shape[1]
-        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
-        if self.contrast_mode == 'one': anchor_feature = features[:, 0]; anchor_count = 1
-        elif self.contrast_mode == 'all': anchor_feature = contrast_feature; anchor_count = contrast_count
+            labels=labels.contiguous().view(-1,1)
+            mask=torch.eq(labels,labels.T).float().to(device)
+        else: mask=mask.float().to(device)
+        nc=features.shape[1]; cf=torch.cat(torch.unbind(features,dim=1),dim=0)
+        if self.contrast_mode=='one': af=features[:,0]; ac=1
+        elif self.contrast_mode=='all': af=cf; ac=nc
         else: raise ValueError(f'Unknown mode: {self.contrast_mode}')
-        anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T), self.temperature)
-        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
-        logits = anchor_dot_contrast - logits_max.detach()
-        mask = mask.repeat(anchor_count, contrast_count)
-        logits_mask = torch.scatter(torch.ones_like(mask), 1,
-            torch.arange(batch_size * anchor_count).view(-1, 1).to(device), 0)
-        mask = mask * logits_mask
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob   = logits - torch.log(exp_logits.sum(1, keepdim=True))
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
-        return -(self.temperature / self.base_temperature) * mean_log_prob_pos.view(anchor_count, batch_size).mean()
+        adc=torch.div(torch.matmul(af,cf.T),self.temperature)
+        lm,_=torch.max(adc,dim=1,keepdim=True); logits=adc-lm.detach()
+        mask=mask.repeat(ac,nc)
+        lmask=torch.scatter(torch.ones_like(mask),1,
+               torch.arange(B*ac).view(-1,1).to(device),0)
+        mask=mask*lmask
+        exp_l=torch.exp(logits)*lmask
+        lp=logits-torch.log(exp_l.sum(1,keepdim=True))
+        mlpp=(mask*lp).sum(1)/mask.sum(1)
+        return -(self.temperature/self.base_temperature)*mlpp.view(ac,B).mean()
 
 
 class CCGaborConv2d(nn.Module):
-    def __init__(self, channel_in, channel_out, kernel_size, stride=1, padding=0, init_ratio=1):
+    def __init__(self,channel_in,channel_out,kernel_size,stride=1,padding=0,init_ratio=1):
         super().__init__()
         self.channel_in=channel_in; self.channel_out=channel_out; self.kernel_size=kernel_size
         self.stride=stride; self.padding=padding; self.init_ratio=init_ratio if init_ratio>0 else 1.0; self.kernel=0
@@ -625,8 +596,10 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
         self.pool=nn.MaxPool2d(2,2); self.se1=SELayer(n_competitor); self.se2=SELayer(n_competitor)
         self.wc=weight; self.ws=(1-weight)/2
     def forward(self,x):
-        x=self.gabor1(x); x1=self.wc*self.argmax(x)+self.ws*(self.argmax_x(x)+self.argmax_y(x)); x1=self.pool(self.conv1(self.se1(x1)))
-        x=self.gabor2(x); x2=self.wc*self.argmax(x)+self.ws*(self.argmax_x(x)+self.argmax_y(x)); x2=self.pool(self.conv2(self.se2(x2)))
+        x=self.gabor1(x); x1=self.wc*self.argmax(x)+self.ws*(self.argmax_x(x)+self.argmax_y(x))
+        x1=self.pool(self.conv1(self.se1(x1)))
+        x=self.gabor2(x); x2=self.wc*self.argmax(x)+self.ws*(self.argmax_x(x)+self.argmax_y(x))
+        x2=self.pool(self.conv2(self.se2(x2)))
         return torch.cat((x1.flatten(1),x2.flatten(1)),dim=1)
 
 
@@ -652,7 +625,7 @@ class CCNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class DINOBackbone(nn.Module):
-    EMBED_DIM = 384
+    EMBED_DIM=384
     def __init__(self):
         super().__init__()
         backbone=torch.hub.load("facebookresearch/dinov2","dinov2_vits14",verbose=False)
@@ -689,10 +662,9 @@ def build_model(cfg, num_classes):
             arcface_m     = cfg["arcface_m"],
             dropout       = cfg["dropout"],
             use_moe       = cfg.get("use_moe",          False),
-            lora_rank     = cfg.get("lora_rank",         64),
+            expert_weight = cfg.get("moe_expert_weight", 0.5),
             use_grl       = cfg.get("use_grl",           False),
             n_domains     = cfg.get("n_domains",         6),
-            expert_weight = cfg.get("moe_expert_weight", 0.5),
         )
     elif name == "ccnet":
         return CCNet(
