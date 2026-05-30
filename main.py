@@ -165,18 +165,20 @@ def print_moe_diagnostics(rnd, client_records, warmup_active):
         avg_ratio  = sum(a["gated_base_ratio"]    for a in act_diags) / len(act_diags)
         avg_cos    = sum(a["base_full_cos_sim"]    for a in act_diags) / len(act_diags)
         avg_gate   = sum(a["gate_value"]           for a in act_diags) / len(act_diags)
-        print(f"  │   Avg gated/base ratio : {avg_ratio:.4f}"
-              f"  (>0.1 = domain_expert contributing meaningfully)")
-        print(f"  │   Avg base·full CosSim : {avg_cos:.4f}"
+        print(f"  │   ExpertWeight (fixed)  : {avg_gate:.4f}")
+        print(f"  │   Avg feat-corr/feat    : {avg_ratio:.4f}"
+              f"  (>0.1 = meaningful feature correction)")
+        print(f"  │   Avg base·full CosSim  : {avg_cos:.4f}"
               f"  (<0.99 = domain_expert shifting embedding direction)")
-        print(f"  │   Avg gate value       : {avg_gate:.4f}")
-        if not warmup_active:
-            if avg_ratio < 0.05:
-                print(f"  │   ⚠ domain_expert contribution very small — "
-                      f"consider larger gate_init or gate_scale")
-            if avg_cos > 0.999:
-                print(f"  │   ⚠ domain_expert not shifting embeddings — "
-                      f"may not be specialising yet")
+        recon_vals = [r.get("recon_loss") for r in client_records
+                      if r.get("recon_loss") is not None]
+        if recon_vals:
+            avg_r = sum(recon_vals) / len(recon_vals)
+            print(f"  │   Avg domain recon loss : {avg_r:.6f}"
+                  f"  (decreasing = domain_expert learning domain signal)")
+        if not warmup_active and avg_ratio < 0.05:
+            print(f"  │   ⚠ feature correction very small — "
+                  f"consider larger moe_expert_weight")
     print(f"  └" + "─" * 73 + "┘")
 
 
@@ -262,8 +264,8 @@ class FLClient:
                 k: v.cpu().clone()
                 for k, v in self.model.fc.domain_expert.state_dict().items()
             },
-            "gate_raw": self.model.fc.gate_raw.detach().cpu().clone(),
-            "client_id": self.client_id,
+            "expert_weight": self.model.fc.expert_weight,
+            "client_id"    : self.client_id,
         }
 
     # ── probe feature extraction ────────────────────────────────────────────
@@ -354,7 +356,7 @@ class FLClient:
         avg_loss, accuracy, last_grad_norms = 0.0, 0.0, None
         for _ in range(local_epochs):
             if model_name in ("compnet", "dinov2"):
-                avg_loss, accuracy, last_grad_norms = train_compnet_epoch(
+                avg_loss, accuracy, last_grad_norms, avg_recon = train_compnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device,
                     center_loss        = self.center_loss,
                     center_optimizer   = self.center_optimizer,
@@ -365,10 +367,12 @@ class FLClient:
                     lambda_supcon      = self.cfg.get("lambda_supcon", 0.0)
                                          if self.cfg.get("use_supcon", False) else 0.0,
                     temperature        = self.cfg.get("temperature", 0.07),
-                    collect_grad_norms = use_moe and not warmup_active,
+                    collect_grad_norms  = use_moe and not warmup_active,
+                    lambda_domain_recon = self.cfg.get("lambda_domain_recon", 0.0)
+                                          if use_moe and not warmup_active else 0.0,
                 )
             elif model_name == "ccnet":
-                avg_loss, accuracy, _ = train_ccnet_epoch(
+                avg_loss, accuracy, _, avg_recon = train_ccnet_epoch(
                     self.model, train_loader, criterion, optimizer, self.device,
                     ce_weight=self.cfg.get("ce_weight", 0.8),
                     con_weight=self.cfg.get("con_weight", 0.2),
@@ -389,6 +393,7 @@ class FLClient:
                 "grad_norms" : last_grad_norms,
                 "routing"    : (self.model.get_routing_stats()
                                 if not warmup_active else None),
+                "recon_loss" : avg_recon if not warmup_active else None,
                 "warmup"     : warmup_active,
             }
 
@@ -506,7 +511,7 @@ class FLServer:
                 cid = state["client_id"]
                 self.domain_expert_registry[cid] = {
                     "domain_expert_state": state["domain_expert_state"],
-                    "gate_raw"           : state["gate_raw"],
+                    "expert_weight"      : state.get("expert_weight", 0.5),
                 }
 
     def evaluate_base(self, use_whitening=False, warmup_active=False):
