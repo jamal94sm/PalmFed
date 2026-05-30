@@ -46,11 +46,11 @@ CONFIG = {
     #
     # use_mixed_aug takes priority over use_fft_aug when both are True.
     "use_fft_aug"      : True,  # True → FFT aug for all rounds
-    "use_mixed_aug"    : False,  # True → spatial → FFT switch mid-training
+    "use_mixed_aug"    : True,  # True → spatial → FFT switch mid-training
     "mixed_aug_round"  : 10,     # round at which to switch (mixed mode only)
 
     # FFT augmentation parameters
-    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
+    "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
 
     # ── FL hyperparameters ─────────────────────────────────────
@@ -74,19 +74,52 @@ CONFIG = {
     #   GlobalBase: base_expert only   (domain_id=None at inference)
     #   GlobalFull: base_expert + domain_expert[k] for sample domain_id=k
     "use_moe"          : True,  # True → DualExpertFC for CompNet
-    "lora_rank"        : 32,     # domain_expert bottleneck rank (9708→rank→512)
+    "lora_rank"        : 16,     # domain_expert bottleneck rank (9708→rank→512)
 
-    # Expert gate — controls residual magnitude
-    # gate_mode  : "scalar"  → one learnable scalar α per expert (simple, recommended)
-    #              "network" → small MLP per expert conditioned on base output (expressive)
-    # gate_init  : initial effective gate value (before sigmoid*scale)
-    # gate_scale : maximum gate value = sigmoid(raw) * gate_scale
-    #   Effective gate range: (0, gate_scale).
-    #   With gate_init=1.0 and gate_scale=2.0: starts at 1.0, can grow to 2.0.
-    #   This ensures the residual starts at a meaningful magnitude and can grow.
-    "moe_gate_mode"    : "scalar",  # "scalar" | "network"
-    "moe_gate_init"    : 1.0,       # initial gate value
-    "moe_gate_scale"   : 2.0,       # maximum gate value (gate lives in (0, scale))
+    # Expert combination weight
+    # Fixed scalar w in [0, 1] that controls how the base_expert and
+    # domain_expert outputs are blended in the combined embedding.
+    #
+    # Architecture (feature space):
+    #   corrected_feat = gabor_feat + expert_weight * domain_expert(gabor_feat)
+    #   emb = base_expert(corrected_feat)
+    #
+    # domain_expert operates in 9708-d Gabor feature space, outputting a
+    # 9708-d correction before the base_expert projection. This means:
+    #   - domain_expert corrects what the Gabor filters captured in the raw image
+    #   - base_expert then projects the domain-corrected features to 512-d
+    #   - GlobalFull mismatch is eliminated: domain correction is always
+    #     composed with whatever base_expert is currently active
+    #
+    # expert_weight = 0.0 → pure base_expert (MoE disabled effectively)
+    # expert_weight = 0.5 → equal blend (recommended starting point)
+    # expert_weight = 1.0 → full domain correction
+    "moe_expert_weight": 0.5,       # fixed combination weight w
+
+    # Domain reconstruction loss
+    # Gives the domain_expert an exclusive self-supervised objective:
+    # reconstruct the domain-specific component of the Gabor features.
+    #
+    # For a batch of real own-domain samples from client k:
+    #   overall_mean   = mean(gabor_feat, dim=0)          [9708]  all samples
+    #   real_feats     = gabor_feat[real_mask]             [R, 9708]
+    #   domain_signal  = mean(real_feats, dim=0)           [9708]  domain centroid
+    #   target         = domain_signal - overall_mean      [9708]  domain-specific part
+    #   prediction     = domain_expert(real_feats)         [R, 9708]
+    #   L_recon = MSE(prediction, target.expand_as(prediction))
+    #
+    # Why this works:
+    #   - overall_mean ≈ domain-invariant features (all domains averaged)
+    #   - domain_signal = what domain k looks like on average in this batch
+    #   - target = the domain-specific deviation from the global average
+    #   - The domain_expert must learn to predict this domain centroid offset
+    #     from any individual sample of domain k
+    #   - This is antagonistic to ArcFace (which wants identity-discriminative
+    #     features) — the domain_expert is rewarded for being domain-homogeneous
+    #     and identity-invariant, exactly the right inductive bias
+    #
+    # lambda_domain_recon = 0.0 disables the loss entirely
+    "lambda_domain_recon": 0.5,     # reconstruction loss weight
 
     # MoE warm-up: freeze domain experts for the first moe_warmup_rounds
     # FL rounds so the shared base FC learns a strong domain-invariant
