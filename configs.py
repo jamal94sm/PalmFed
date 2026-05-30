@@ -70,6 +70,13 @@ CONFIG = {
     "n_experts"        : 6,      # number of domain experts (= n_clients)
     "lora_rank"        : 64,     # expert bottleneck rank
 
+    # MoE warm-up: freeze domain experts for the first moe_warmup_rounds
+    # FL rounds so the shared base FC learns a strong domain-invariant
+    # initialisation before experts start their domain-specific corrections.
+    # After warm-up, experts are unfrozen and trained normally.
+    # Setting moe_warmup_rounds=0 disables warm-up (original behaviour).
+    "moe_warmup_rounds": 10,     # rounds to train base only; 0 = no warmup
+
     # ── GRL ─────────────────────
     "use_grl"          : False,  # True → domain adversarial training (GRL)
     "lambda_grl"       : 0.05,   # GRL loss weight (start small, e.g. 0.05–0.2)
