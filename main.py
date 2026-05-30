@@ -41,6 +41,74 @@ def make_eval_dataset(samples, cfg):
 
 
 # ══════════════════════════════════════════════════════════════
+#  EXPERT DIAGNOSTIC PRINTER
+# ══════════════════════════════════════════════════════════════
+
+def print_expert_diagnostics(client_id, spectrum, rnd, diag, warmup_active):
+    """
+    Print MoE expert health signals for one client after each FL round.
+
+    Printed fields
+    ──────────────
+    Phase        : WARMUP (experts frozen) or ACTIVE (experts training).
+    Norms        : Per-expert B-weight L2 norm — proxy for residual magnitude.
+                   Expected near 0 during warmup (B is zero-initialised).
+                   Should grow post-warmup as each expert specialises.
+    Mean dist    : Mean pairwise cosine distance between expert weight vectors.
+                   0 = all experts identical (collapse), 1 = fully orthogonal.
+                   Values > 0.3 indicate healthy specialisation.
+    Min dist     : Minimum pairwise cosine distance.
+                   Near 0 → at least one pair of experts has collapsed.
+
+    What to watch for
+    ─────────────────
+    • During warmup: norms ~0, distances meaningless (B init to zero) — OK.
+    • First few post-warmup rounds: norms rise, distances start diverging — good.
+    • Plateau of norms + mean_dist > 0.3 after ~5 post-warmup rounds — healthy.
+    • Any expert norm staying at 0 long after warmup → dead expert.
+    • mean_dist < 0.05 persistently → collapse risk; consider diversity loss.
+    """
+    phase = "WARMUP" if warmup_active else "ACTIVE"
+    norms_str = "  ".join(
+        f"E{i}={v:.4f}" for i, v in enumerate(diag["output_norms"]))
+    print(f"    [MoE {phase}] Client {client_id} [{spectrum}] Rnd {rnd:04d} | "
+          f"Expert B-norms: {norms_str} | "
+          f"MeanPairDist={diag['mean_pairwise_dist']:.4f}  "
+          f"MinPairDist={diag['min_pairwise_dist']:.4f}")
+
+
+def print_expert_diagnostics_summary(rnd, all_diags, warmup_active):
+    """
+    Print a one-line cross-client summary of expert health after each round.
+
+    Averages mean_pairwise_dist and min_pairwise_dist across all clients that
+    report diagnostics. This gives a global view of expert diversity at a glance.
+
+    Collapse warning fires when any client's min_pairwise_dist < 0.05 outside
+    warmup — a strong signal that two or more experts are converging to the
+    same solution.
+    """
+    if not all_diags:
+        return
+    mean_dists = [d["mean_pairwise_dist"] for d in all_diags]
+    min_dists  = [d["min_pairwise_dist"]  for d in all_diags]
+    avg_mean   = sum(mean_dists) / len(mean_dists)
+    avg_min    = sum(min_dists)  / len(min_dists)
+    global_min = min(min_dists)
+    phase      = "WARMUP" if warmup_active else "ACTIVE"
+
+    collapse_warn = ""
+    if not warmup_active and global_min < 0.05:
+        collapse_warn = "  ⚠ COLLAPSE RISK: min_dist < 0.05"
+
+    print(f"  [MoE {phase} SUMMARY] Rnd {rnd:04d} | "
+          f"Avg MeanPairDist={avg_mean:.4f}  "
+          f"Avg MinPairDist={avg_min:.4f}  "
+          f"GlobalMin={global_min:.4f}"
+          + collapse_warn)
+
+
+# ══════════════════════════════════════════════════════════════
 #  FL CLIENT
 # ══════════════════════════════════════════════════════════════
 
@@ -81,6 +149,15 @@ class FLClient:
       Mixed mode is handled in main() by passing an empty bank for the
       first mixed_aug_round rounds and a full bank thereafter — local_train
       needs no special logic for it.
+
+    MoE warm-up
+    ───────────
+      When cfg["use_moe"]=True and cfg["moe_warmup_rounds"] > 0, the first
+      moe_warmup_rounds FL rounds train the base FC only (experts frozen).
+      local_train() calls model.set_moe_warmup() at the start of each round
+      based on the current round number passed in via the `rnd` argument.
+      No changes needed in the server or aggregation logic — expert parameters
+      are simply frozen (zero grad) during warmup and trained normally after.
     """
 
     def __init__(self, client_id, spectrum, train_samples, label_map,
@@ -151,11 +228,23 @@ class FLClient:
           non-empty → FFTAugmentedDataset (FFT + spatial aug)
         This means mixed-mode is transparent here — main() simply passes
         an empty bank for spatial rounds and a full bank for FFT rounds.
+
+        MoE warm-up is applied here by calling model.set_moe_warmup()
+        before building the optimiser. During warmup, expert parameters
+        have requires_grad=False so the Adam optimiser never creates moment
+        state for them and they receive no gradient updates.
         """
         model_name = self.cfg["model"].strip().lower()
         is_dino    = model_name == "dinov2"
         img_side   = self.cfg.get("dino_img_side", 224) if is_dino else self.cfg["img_side"]
         grayscale  = not is_dino
+
+        # ── MoE warm-up: freeze or unfreeze experts based on current round ──
+        use_moe        = self.cfg.get("use_moe", False) and model_name == "compnet"
+        warmup_rounds  = self.cfg.get("moe_warmup_rounds", 0)
+        warmup_active  = use_moe and (warmup_rounds > 0) and (rnd <= warmup_rounds)
+        if use_moe:
+            self.model.set_moe_warmup(warmup_active)
 
         if model_name in ("compnet", "dinov2"):
             det_donors  = False
@@ -215,7 +304,11 @@ class FLClient:
                 self.model.parameters(), lr=self.cfg["lr"],
                 weight_decay=self.cfg.get("dino_weight_decay", 1e-4))
         else:
-            optimizer = optim.Adam(self.model.parameters(), lr=self.cfg["lr"])
+            # Adam only over parameters that require grad — during warmup this
+            # automatically excludes expert parameters (requires_grad=False).
+            optimizer = optim.Adam(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=self.cfg["lr"])
 
         lambda_c = self.cfg.get("center_loss_weight", 0.0) \
                    if self.cfg.get("use_center_loss", False) else 0.0
@@ -248,7 +341,7 @@ class FLClient:
                     lambda_center    = lambda_c,
                 )
 
-        return avg_loss, accuracy
+        return avg_loss, accuracy, warmup_active
 
     # ── style template extraction ───────────────────────────────────────────
 
@@ -410,6 +503,8 @@ def main():
     base_dir   = cfg["base_results_dir"]
     is_dinov2  = cfg["model"].strip().lower() == "dinov2"
     aug_mode   = resolve_aug_mode(cfg)
+    use_moe    = cfg.get("use_moe", False) and cfg["model"].strip().lower() == "compnet"
+    warmup_rds = cfg.get("moe_warmup_rounds", 0) if use_moe else 0
     os.makedirs(base_dir, exist_ok=True)
 
     # ── header ───────────────────────────────────────────────────────────────
@@ -432,6 +527,12 @@ def main():
     else:
         print(f"  Aug mode : {aug_mode.upper()}   "
               f"M={cfg['M']}   beta={cfg['fft_beta']}")
+    if use_moe:
+        if warmup_rds > 0:
+            print(f"  MoE      : ENABLED  —  warm-up rounds 1–{warmup_rds} "
+                  f"(base FC only), experts active from round {warmup_rds+1}")
+        else:
+            print(f"  MoE      : ENABLED  —  no warm-up (experts active from round 1)")
     print(f"  LR       : {cfg['lr']} (constant, no scheduler)")
     print(f"{'='*62}\n")
 
@@ -465,13 +566,6 @@ def main():
     print(f"  Test  classes  : {len(test_label_map)}")
     print(f"  Gallery        : {len(gallery_samples)}  "
           f"Probe : {len(probe_samples)}\n")
-    # Local label mapping (0..num_classes-1 per client) — correct for our method.
-    # ArcFace is local and never sent back from the server, so each client
-    # must train a fully-dense head. Global label mapping would create a
-    # 156-class head where 130 rows stay random throughout — permanent noise
-    # in the softmax denominator that degrades the embedding space.
-    # Global mapping is only beneficial when the assembled global ArcFace is
-    # distributed back to all clients each round (FedPalm anchor model).
 
     # ── Step 0b: initialise server ────────────────────────────────────────
     print("Initialising server …")
@@ -494,8 +588,6 @@ def main():
     cfg["_n_clients"] = list(range(n_clients))
 
     # ── Step 0d: load or save initial model weights ───────────────────────
-    # Validate arc.weight shape — if checkpoint was saved with a different
-    # num_classes (e.g. during global-label-map experiments), regenerate.
     if os.path.exists(init_weights_path):
         _probe    = torch.load(init_weights_path, map_location="cpu")
         _ckpt_arc = _probe.get("arc.weight", None)
@@ -536,9 +628,6 @@ def main():
         f.write(f"Round\tAug_Mode\tGlobal_EER(%)\tGlobal_Rank1(%)\t{client_header}\n")
 
     # ── Step 0e: extract style templates (always, all runs) ───────────────
-    # Always extracted regardless of aug mode so that the random state
-    # consumed by extraction is identical across spatial, FFT, and mixed runs.
-    # DINOv2 returns empty lists — templates are incompatible with RGB input.
     print("\nExtracting style templates from all clients …")
     style_bank_full = {
         client.client_id: client.extract_style_templates()
@@ -550,8 +639,6 @@ def main():
               f"across {len(style_bank_full)} clients")
 
     # compute per-client mean template for domain-aware mixing
-    # mean_bank_full: {client_id: mean_amplitude_array}
-    # identity variation averages out over many samples leaving domain signal
     mean_bank_full = {
         cid: np.mean(templates, axis=0)
         for cid, templates in style_bank_full.items()
@@ -590,14 +677,28 @@ def main():
             style_bank_full, rnd, cfg, is_dinov2)
         mode_label = aug_mode_label(rnd, cfg, is_dinov2)
 
+        # Determine warm-up state for this round (for header print only;
+        # actual freeze/unfreeze happens inside FLClient.local_train)
+        rnd_warmup_active = use_moe and warmup_rds > 0 and rnd <= warmup_rds
+
+        # Print warm-up transition messages
+        if use_moe and warmup_rds > 0:
+            if rnd == 1:
+                print(f"\n  ► MoE WARMUP START: rounds 1–{warmup_rds} — "
+                      f"base FC only, experts frozen")
+            elif rnd == warmup_rds + 1:
+                print(f"\n  ► MoE WARMUP END: round {rnd} — "
+                      f"experts now ACTIVE (unfrozen for training)")
+
         global_weights = server.get_global_weights()
         client_weights = []
         client_metrics = []
+        all_diags      = []   # expert diagnostics across clients this round
 
         # ── Step 1: local training ────────────────────────────────────────
         for client in clients:
             client.set_weights(global_weights)
-            loss, acc = client.local_train(
+            loss, acc, warmup_active = client.local_train(
                 cfg["local_epochs"], active_style_bank, cfg["M"], rnd,
                 mean_bank = mean_bank_full
                             if cfg.get("domain_aware_mixing", False)
@@ -609,13 +710,23 @@ def main():
                 use_whitening=use_whitening)
             client_weights.append(client.get_weights())
             client_metrics.append({
-                "client_id" : client.client_id,
-                "spectrum"  : client.spectrum,
-                "train_loss": round(loss, 6),
-                "train_acc" : round(acc, 3),
-                "eer"       : round(c_eer, 6),
-                "rank1"     : round(c_rank1, 3),
+                "client_id"    : client.client_id,
+                "spectrum"     : client.spectrum,
+                "train_loss"   : round(loss, 6),
+                "train_acc"    : round(acc, 3),
+                "eer"          : round(c_eer, 6),
+                "rank1"        : round(c_rank1, 3),
+                "warmup_active": warmup_active,
             })
+
+            # Collect expert diagnostics if MoE is enabled
+            if use_moe:
+                diag = client.model.get_expert_diagnostics()
+                if diag is not None:
+                    all_diags.append(diag)
+                    print_expert_diagnostics(
+                        client.client_id, client.spectrum,
+                        rnd, diag, warmup_active)
 
         # ── Step 2: FedAvg (backbone only) + global evaluation ────────────
         server.aggregate(client_weights)
@@ -629,6 +740,11 @@ def main():
             recent_history.pop(0)
 
         ts = time.strftime("%H:%M:%S")
+
+        # Print MoE summary before the global metrics line
+        if use_moe and all_diags:
+            print_expert_diagnostics_summary(rnd, all_diags, rnd_warmup_active)
+
         print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']} [{mode_label}] | "
               f"Global EER={g_eer*100:.4f}%  Rank-1={g_rank1:.2f}%  "
               f"({elapsed:.1f}s)")
@@ -646,7 +762,7 @@ def main():
 
     # ── Final reporting ───────────────────────────────────────────────────
     avg_rounds   = cfg.get("avg_last_rounds", 5)
-    n_avg        = len(recent_history)          # may be < avg_rounds if few rounds ran
+    n_avg        = len(recent_history)
     avg_eer      = sum(e for e, _ in recent_history) / n_avg
     avg_rank1    = sum(r for _, r in recent_history) / n_avg
 
@@ -655,6 +771,10 @@ def main():
     print(f"  Dataset            : {cfg['dataset'].upper()}")
     print(f"  Model              : {cfg['model'].upper()}")
     print(f"  Aug mode           : {aug_mode.upper()}")
+    if use_moe:
+        wstr = (f"warm-up rounds 1–{warmup_rds}, active from {warmup_rds+1}"
+                if warmup_rds > 0 else "no warm-up")
+        print(f"  MoE                : ENABLED  ({wstr})")
     print(f"  Avg Global EER     : {avg_eer*100:.4f}%  "
           f"(last {n_avg} rounds)")
     print(f"  Avg Global Rank-1  : {avg_rank1:.2f}%  "
