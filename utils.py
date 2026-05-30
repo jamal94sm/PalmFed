@@ -147,12 +147,13 @@ def extract_features_dual(base_model, gallery_loader, probe_loader, device,
     expert_modules = {}
     gate_raws      = {}
     for cid, state in domain_expert_registry.items():
-        exp = _ResidualExpert(in_f, out_f, rank).to(device)
+        from models import _FeatureResidualExpert
+        exp = _FeatureResidualExpert(in_f, rank).to(device)
         exp.load_state_dict({k: v.to(device)
                              for k, v in state["domain_expert_state"].items()})
         exp.eval()
         expert_modules[cid] = exp
-        gate_raws[cid]      = state["gate_raw"].to(device)
+        gate_raws[cid]      = state.get("expert_weight", 0.5)  # fixed float
 
     def _extract(loader, domain_ids_list):
         base_model.eval()
@@ -170,9 +171,10 @@ def extract_features_dual(base_model, gallery_loader, probe_loader, device,
                         continue
                     mask = [i for i, did in enumerate(batch_ids) if did == d]
                     msk  = torch.tensor(mask, dtype=torch.long, device=device)
-                    g    = torch.sigmoid(gate_raws[d]) * cfg_fc.gate_scale
-                    res  = expert_modules[d](feat[msk])
-                    emb[msk] = base[msk] + g * res
+                    g           = gate_raws[d]                # fixed float
+                    correction  = expert_modules[d](feat[msk])  # [M, 9708]
+                    corr_feat   = feat[msk] + g * correction
+                    emb[msk]    = cfg_fc.base_expert(corr_feat)
 
             emb_np = torch.nn.functional.normalize(emb, p=2, dim=1).cpu().numpy()
             nan_rows = np.isnan(emb_np).any(axis=1)
@@ -308,7 +310,8 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                         lambda_center=0.0, lambda_style=0.0,
                         lambda_grl=0.0, lambda_load_balance=0.0,
                         lambda_supcon=0.0, temperature=0.07,
-                        collect_grad_norms=False):
+                        collect_grad_norms=False,
+                        lambda_domain_recon=0.0):
     """
     Train CompNet (or DINOv2) for one epoch.
 
@@ -324,6 +327,7 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
     avg_loss        : float
     accuracy        : float  (%)
     last_grad_norms : dict | None   — from model.get_grad_norms()
+    avg_recon_loss  : float         — avg domain reconstruction loss (0 if disabled)
     """
     model.train()
     if center_loss is not None:
@@ -342,9 +346,24 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
 
     def _get_emb(imgs, domain_ids=None):
         if hasattr(model, "_backbone"):
-            try:    return model._backbone(imgs, domain_ids)
-            except TypeError: return model._backbone(imgs)
+            try:
+                r = model._backbone(imgs, domain_ids)
+                return r[0] if isinstance(r, tuple) else r
+            except TypeError:
+                r = model._backbone(imgs)
+                return r[0] if isinstance(r, tuple) else r
         return model.backbone(imgs)
+
+    def _get_backbone_full(imgs, domain_ids=None):
+        if hasattr(model, "_backbone"):
+            try:
+                r = model._backbone(imgs, domain_ids)
+                if isinstance(r, tuple): return r
+                return r, None
+            except TypeError:
+                r = model._backbone(imgs)
+                return (r, None) if not isinstance(r, tuple) else r
+        return model.backbone(imgs), None
 
     def _get_logits(emb, labels):
         if hasattr(model, "drop"):
@@ -352,6 +371,11 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         return model.arc(emb, labels)
 
     running_loss = 0.0; correct = 0; total = 0
+    running_recon = 0.0
+    use_recon = (lambda_domain_recon > 0.0
+                 and hasattr(model, 'compute_domain_recon_loss')
+                 and hasattr(model, 'use_moe') and model.use_moe
+                 and not model.moe_is_warming_up)
     last_grad_norms = None
     batches = list(loader)
     n_batches = len(batches)
@@ -377,7 +401,14 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
         if use_center:
             center_optimizer.zero_grad()
 
-        emb_orig = _get_emb(orig, domain_ids)
+        if use_recon and domain_ids is not None and hasattr(model, '_gabor_feat'):
+            with torch.no_grad():
+                gabor_feat = model._gabor_feat(orig)
+            emb_orig, _ = _get_backbone_full(orig, domain_ids)
+        else:
+            gabor_feat = None
+            emb_orig   = _get_emb(orig, domain_ids)
+
         logits   = _get_logits(emb_orig, labels)
         loss     = criterion(logits, labels)
 
@@ -406,6 +437,13 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
                 loss_dom   = F.cross_entropy(dom_logits, domain_ids[real_mask])
                 loss       = loss + lambda_grl * loss_dom
 
+        # Domain reconstruction loss
+        if use_recon and gabor_feat is not None and domain_ids is not None:
+            l_recon, _ = model.compute_domain_recon_loss(
+                gabor_feat, domain_ids)
+            loss           = loss + lambda_domain_recon * l_recon
+            running_recon += float(l_recon) * orig.size(0)
+
         if use_center:
             loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
 
@@ -429,7 +467,8 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
 
     return (running_loss / max(total, 1),
             100.0 * correct / max(total, 1),
-            last_grad_norms)
+            last_grad_norms,
+            running_recon / max(total, 1))
 
 
 def train_ccnet_epoch(model, loader, criterion, optimizer, device,
@@ -483,4 +522,4 @@ def train_ccnet_epoch(model, loader, criterion, optimizer, device,
         correct      += logits1.argmax(1).eq(labels).sum().item()
         total        += img1.size(0)
 
-    return running_loss / max(total, 1), 100.0 * correct / max(total, 1), None
+    return running_loss / max(total, 1), 100.0 * correct / max(total, 1), None, 0.0
