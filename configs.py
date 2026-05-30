@@ -66,7 +66,7 @@ CONFIG = {
     # Domain routing uses explicit domain_id labels during training;
     # at inference domain_ids=None so only base_FC is used.
     # Requires use_fft_aug=True to generate cross-domain training signal.
-    "use_moe"          : True,  # True → MoEFC for CompNet
+    "use_moe"          : False,  # True → MoEFC for CompNet
     "n_experts"        : 6,      # number of domain experts (= n_clients)
     "lora_rank"        : 256,     # expert bottleneck rank
 
