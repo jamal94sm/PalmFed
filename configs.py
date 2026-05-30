@@ -46,7 +46,7 @@ CONFIG = {
     #
     # use_mixed_aug takes priority over use_fft_aug when both are True.
     "use_fft_aug"      : True,  # True → FFT aug for all rounds
-    "use_mixed_aug"    : True,  # True → spatial → FFT switch mid-training
+    "use_mixed_aug"    : False,  # True → spatial → FFT switch mid-training
     "mixed_aug_round"  : 10,     # round at which to switch (mixed mode only)
 
     # FFT augmentation parameters
