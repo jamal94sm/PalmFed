@@ -10,14 +10,14 @@
 #
 #  GlobalFull  — shared base_expert + all n_clients domain_experts stacked.
 #                After each round the server collects each client's
-#                domain_expert and gate_raw, stores them indexed by
+#                domain_gabor branches, stores them indexed by
 #                client_id, then evaluates with:
 #                  for sample with domain_id=k:
 #                    emb = base(x) + gate_k * domain_expert_k(x)
 #                Routing is deterministic by domain label — no learned router.
 #                get_embedding(x, domain_id=k) via
 #                get_embedding_with_external_expert(x, domain_experts[k],
-#                                                   gate_raws[k])
+#                                                   domain_gabors[k])
 # ==============================================================
 
 import os
@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 warnings.filterwarnings("ignore")
 
 from configs  import CONFIG
-from models   import build_model, _FeatureResidualExpert
+from models   import build_model
 from datasets import (PalmDataset, AugmentedDataset,
                       PairedDataset, FFTAugmentedDataset,
                       EvalDatasetDINO, get_federated_splits)
@@ -194,11 +194,11 @@ class FLClient:
     ─────────────────
     get_weights() returns only FedAvg-eligible keys:
       fc.base_expert.* and all Gabor/CB parameters.
-    Excludes: arc.*, fc.domain_expert.*, fc.gate_raw
+    Excludes: arc.*, cb1d.*, cb2d.*, cb3d.*
 
     set_weights() loads only FedAvg weights, preserving local keys unchanged.
 
-    domain_expert + gate_raw accumulate across ALL rounds without reset.
+    domain_gabor branches accumulate across ALL rounds without reset.
     """
 
     def __init__(self, client_id, spectrum, train_samples, label_map,
@@ -235,7 +235,7 @@ class FLClient:
     def get_weights(self):
         """
         FedAvg-eligible weights only:  fc.base_expert.* + Gabor/CB params.
-        Local-only keys excluded:      arc.*, fc.domain_expert.*, fc.gate_raw
+        Local-only keys excluded:      arc.*, cb1d.*, cb2d.*, cb3d.*
         """
         excl = self.model.local_only_keys() \
                if hasattr(self.model, "local_only_keys") else ("arc.",)
@@ -253,18 +253,17 @@ class FLClient:
 
     def get_domain_expert_state(self):
         """
-        Return the domain_expert and gate_raw for this client.
+        Return cb1d/cb2d/cb3d state dicts and expert_weight for GlobalFull.
         Used by FLServer to assemble GlobalFull after each round.
-        Returns dict with 'domain_expert_state' and 'gate_raw'.
+        Returns dict with cb1d/cb2d/cb3d state dicts and expert_weight.
         """
         if not (hasattr(self.model, "use_moe") and self.model.use_moe):
             return None
         return {
-            "domain_expert_state": {
-                k: v.cpu().clone()
-                for k, v in self.model.fc.domain_expert.state_dict().items()
-            },
-            "expert_weight": self.model.fc.expert_weight,
+            "cb1d_state"   : {k: v.cpu().clone() for k,v in self.model.cb1d.state_dict().items()},
+            "cb2d_state"   : {k: v.cpu().clone() for k,v in self.model.cb2d.state_dict().items()},
+            "cb3d_state"   : {k: v.cpu().clone() for k,v in self.model.cb3d.state_dict().items()},
+            "expert_weight": self.model.expert_weight,
             "client_id"    : self.client_id,
         }
 
@@ -276,10 +275,7 @@ class FLClient:
         ds     = PalmDataset(subset, self.cfg["img_side"])
         loader = DataLoader(ds, batch_size=n, shuffle=False, num_workers=0)
         imgs, _ = next(iter(loader))
-        self.model.eval()
-        feat = self.model._gabor_feat(imgs.to(self.device))
-        self.probe_feat = feat.detach()
-        self.model.train()
+        self.probe_feat = imgs.cpu()   # store images; moved to device in diagnostics
 
     # ── local training ──────────────────────────────────────────────────────
 
@@ -444,7 +440,7 @@ class FLServer:
         # GlobalBase model
         self.global_model = build_model(cfg, num_classes).to(device)
 
-        # Domain expert registry: client_id → {domain_expert_state, gate_raw}
+        # Domain gabor registry: client_id → {cb1d/cb2d/cb3d states}
         # Populated each round by collect_domain_experts()
         self.domain_expert_registry = {}
 
@@ -500,7 +496,7 @@ class FLServer:
 
     def collect_domain_experts(self, client_domain_states):
         """
-        Store each client's domain_expert state and gate_raw.
+        Store each client's domain_gabor branch states for GlobalFull assembly.
         Called after local training, before GlobalFull evaluation.
 
         client_domain_states : list of dicts from client.get_domain_expert_state()
@@ -510,8 +506,10 @@ class FLServer:
             if state is not None:
                 cid = state["client_id"]
                 self.domain_expert_registry[cid] = {
-                    "domain_expert_state": state["domain_expert_state"],
-                    "expert_weight"      : state.get("expert_weight", 0.5),
+                    "cb1d_state"   : state["cb1d_state"],
+                    "cb2d_state"   : state["cb2d_state"],
+                    "cb3d_state"   : state["cb3d_state"],
+                    "expert_weight": state.get("expert_weight", 0.5),
                 }
 
     def evaluate_base(self, use_whitening=False, warmup_active=False):
@@ -605,7 +603,7 @@ def main():
         gscal = cfg.get("moe_gate_scale", 2.0)
         wstr  = (f"warmup rds 1–{warmup_rds}" if warmup_rds > 0
                  else "no warmup")
-        print(f"  MoE      : DualExpertFC  gate={gmode}(init={ginit},max={gscal})")
+        print(f"  MoE      : DualBranchGabor  gate={gmode}(init={ginit},max={gscal})")
         print(f"             base_expert: FedAvg'd | "
               f"domain_expert+gate: local-only ({wstr})")
         print(f"  Eval     : GlobalBase (base only)  +  "
@@ -834,7 +832,7 @@ def main():
     print(f"  Model              : {cfg['model'].upper()}")
     print(f"  Aug mode           : {aug_mode.upper()}")
     if use_moe:
-        print(f"  MoE                : DualExpertFC  "
+        print(f"  MoE                : DualBranchGabor  "
               f"gate={cfg.get('moe_gate_mode','scalar')}"
               f"(init={cfg.get('moe_gate_init',1.0)}"
               f",max={cfg.get('moe_gate_scale',2.0)})")
