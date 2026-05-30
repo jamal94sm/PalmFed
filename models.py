@@ -173,32 +173,126 @@ class MoEFC(nn.Module):
       Inference: domain_ids=None → base_FC only (no residual). Base FC carries the
                  full domain-invariant representation; residuals are training-time only.
 
+    Warm-up phase (warmup=True):
+      Expert parameters are frozen (requires_grad=False equivalent via zero-grad mask).
+      Only base_FC is trained, allowing it to learn a strong domain-invariant
+      initialisation before experts start their corrections.
+      set_warmup(True/False) is called by CompNet at the start of each forward pass
+      based on the current FL round number.
+
     experts[k] after FedAvg:
       Client k contributes the strongest gradient to expert[k] (its own domain).
       Other clients contribute via FFT-augmented copies styled as domain k.
       Expert[k] converges toward the domain-k-specific correction, informed
       primarily by the client that owns that domain.
+
+    Diagnostics (get_expert_diagnostics):
+      Returns per-expert output norm and inter-expert cosine distance matrix,
+      which together signal whether experts are specialising or collapsing.
+      - Output norms near zero → expert not active yet (expected during warmup).
+      - All experts producing identical directions → collapse (bad).
+      - High pairwise cosine distances → healthy specialisation (good).
     """
     def __init__(self, in_features=9708, out_features=512,
                  n_experts=6, rank=64):
         super().__init__()
-        self.n_experts = n_experts
-        self.base      = nn.Linear(in_features, out_features)
-        self.experts   = nn.ModuleList([
+        self.n_experts   = n_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank        = rank
+        self.base        = nn.Linear(in_features, out_features)
+        self.experts     = nn.ModuleList([
             _ResidualExpert(in_features, out_features, rank)
             for _ in range(n_experts)
         ])
+        # warmup flag: when True, expert outputs are zeroed in forward pass
+        # (experts still receive gradients in the graph but their contribution
+        # is blocked; set_expert_grad() is called separately to freeze params)
+        self._warmup = False
+
+    def set_warmup(self, warmup: bool):
+        """
+        Enable or disable warm-up mode.
+        warmup=True  → freeze expert parameters (no grad) + zero expert output.
+        warmup=False → unfreeze experts for normal training.
+        """
+        self._warmup = warmup
+        for expert in self.experts:
+            for p in expert.parameters():
+                p.requires_grad = not warmup
+
+    @property
+    def is_warming_up(self):
+        return self._warmup
 
     def forward(self, x, domain_ids=None):
         base_out = self.base(x)                              # [B, 512]
-        if domain_ids is None:
-            return base_out                                  # inference: base only
+
+        # During warmup or inference (domain_ids=None): base only
+        if self._warmup or domain_ids is None:
+            return base_out
+
         residual = torch.zeros_like(base_out)
         for d in range(self.n_experts):
             mask = (domain_ids == d)
             if mask.any():
                 residual[mask] = self.experts[d](x[mask])
         return base_out + residual
+
+    @torch.no_grad()
+    def get_expert_diagnostics(self, probe_input=None):
+        """
+        Compute expert health signals on a fixed probe input.
+
+        If probe_input is None, uses the B-weight matrix columns of each
+        expert directly (parameter-space analysis, no forward pass needed).
+
+        Returns
+        -------
+        diag : dict with keys:
+          "output_norms"       : list[float]  — L2 norm of each expert's B weight
+                                  (proxy for how much each expert contributes)
+          "pairwise_cos_dist"  : list[list[float]]  — cosine distance matrix
+                                  between expert weight directions (0=identical, 1=orthogonal)
+          "mean_pairwise_dist" : float  — mean off-diagonal cosine distance
+                                  (higher → more specialised; ~0 → collapse)
+          "min_pairwise_dist"  : float  — min off-diagonal distance
+                                  (if near 0 → at least two experts have collapsed)
+        """
+        # Use B.weight as the "fingerprint" of each expert [out_features, rank]
+        # Flatten to a vector for cosine comparisons
+        fingerprints = []
+        output_norms = []
+        for expert in self.experts:
+            w = expert.B.weight.float()           # [out_features, rank]
+            output_norms.append(float(w.norm()))
+            fingerprints.append(w.flatten())
+
+        n = len(fingerprints)
+        cos_dist = [[0.0] * n for _ in range(n)]
+        off_diag_vals = []
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                fi = fingerprints[i]; fj = fingerprints[j]
+                cos_sim = float(F.cosine_similarity(fi.unsqueeze(0),
+                                                    fj.unsqueeze(0)))
+                dist = 1.0 - cos_sim          # 0=identical, 2=opposite; clamp to [0,1]
+                dist = max(0.0, min(dist, 1.0))
+                cos_dist[i][j] = round(dist, 4)
+                off_diag_vals.append(dist)
+
+        mean_dist = float(sum(off_diag_vals) / len(off_diag_vals)) \
+                    if off_diag_vals else 0.0
+        min_dist  = float(min(off_diag_vals)) if off_diag_vals else 0.0
+
+        return {
+            "output_norms"       : [round(v, 4) for v in output_norms],
+            "pairwise_cos_dist"  : cos_dist,
+            "mean_pairwise_dist" : round(mean_dist, 4),
+            "min_pairwise_dist"  : round(min_dist, 4),
+        }
 
 
 class CompNet(nn.Module):
@@ -212,6 +306,11 @@ class CompNet(nn.Module):
 
     Optional MoE branch (use_moe=True):
       FC replaced by MoEFC with domain-conditioned residual experts.
+
+    MoE warm-up:
+      set_moe_warmup(True/False) delegates to MoEFC.set_warmup().
+      Called by FLClient.local_train() before each round based on rnd vs
+      moe_warmup_rounds — no change needed elsewhere in training logic.
     """
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25,
@@ -233,6 +332,20 @@ class CompNet(nn.Module):
         self.domain_classifier = (DomainClassifier(embedding_dim, n_domains)
                                    if use_grl else None)
 
+    def set_moe_warmup(self, warmup: bool):
+        """
+        Enable/disable MoE warm-up mode. No-op if use_moe=False.
+        warmup=True  → only base_FC trained; expert params frozen.
+        warmup=False → all MoE params trainable.
+        """
+        if self.use_moe:
+            self.fc.set_warmup(warmup)
+
+    @property
+    def moe_is_warming_up(self):
+        """True if MoE experts are currently frozen (warm-up phase)."""
+        return self.use_moe and self.fc.is_warming_up
+
     def _backbone(self, x, domain_ids=None):
         feat = torch.cat([self.cb1(x).flatten(1),
                           self.cb2(x).flatten(1),
@@ -248,6 +361,32 @@ class CompNet(nn.Module):
     def get_embedding(self, x):
         """L2-normalised 512-d embedding — base FC only (no MoE residual)."""
         return F.normalize(self._backbone(x, domain_ids=None), p=2, dim=1)
+
+    @torch.no_grad()
+    def get_expert_diagnostics(self):
+        """
+        Delegate to MoEFC.get_expert_diagnostics(). Returns None if use_moe=False.
+
+        Diagnostic signals and what to watch for
+        ─────────────────────────────────────────
+        output_norms  : Expert residual magnitude.
+          - All near zero during warm-up (expected — B is zero-initialised).
+          - Should grow after warm-up as experts specialise.
+          - If one expert stays near zero after many post-warmup rounds → dead expert.
+
+        mean_pairwise_dist  : Average cosine distance between expert weight vectors.
+          - Near 0 → experts are identical (collapse) — bad.
+          - Near 1 → experts are fully orthogonal (max specialisation) — ideal.
+          - Values > 0.3 after several post-warmup rounds indicate healthy diversity.
+
+        min_pairwise_dist  : Minimum pairwise distance.
+          - Near 0 → at least one expert pair has collapsed — needs attention.
+          - If consistently below 0.05 after post-warmup round 5+ → consider
+            adding an expert diversity regularisation loss.
+        """
+        if not self.use_moe:
+            return None
+        return self.fc.get_expert_diagnostics()
 
 
 # ══════════════════════════════════════════════════════════════
