@@ -113,7 +113,94 @@ def extract_features(model, loader, device, domain_ids_list=None):
         labels_out.append(labs.numpy())
         sample_idx += B
 
+
     return np.concatenate(feats), np.concatenate(labels_out)
+
+
+@torch.no_grad()
+def extract_features_dual(base_model, gallery_loader, probe_loader, device,
+                           gallery_domain_ids, probe_domain_ids,
+                           domain_expert_registry, use_whitening=False):
+    """
+    GlobalFull evaluation: for each sample with domain_id=k, compute:
+        emb = base_expert(feat) + gate_k * domain_expert_k(feat)
+
+    domain_expert_registry : dict {client_id: {"domain_expert_state": ..., "gate_raw": ...}}
+      Built by FLServer.collect_domain_experts() from client states.
+
+    For domain_ids not in registry (e.g. warmup or missing client):
+      falls back to base-only embedding.
+
+    Returns (eer, rank1) or (None, None) if registry is empty.
+    """
+    from models import _ResidualExpert
+
+    if not domain_expert_registry:
+        return None, None
+
+    cfg_fc = base_model.fc  # DualExpertFC
+    in_f   = cfg_fc.in_features
+    out_f  = cfg_fc.out_features
+    rank   = cfg_fc.domain_expert.A.weight.shape[0]  # detect rank from local expert
+
+    # materialise one _ResidualExpert per registered client on correct device
+    expert_modules = {}
+    gate_raws      = {}
+    for cid, state in domain_expert_registry.items():
+        exp = _ResidualExpert(in_f, out_f, rank).to(device)
+        exp.load_state_dict({k: v.to(device)
+                             for k, v in state["domain_expert_state"].items()})
+        exp.eval()
+        expert_modules[cid] = exp
+        gate_raws[cid]      = state["gate_raw"].to(device)
+
+    def _extract(loader, domain_ids_list):
+        base_model.eval()
+        feats_out = []; labels_out = []; idx = 0
+        for imgs, labs in loader:
+            B    = imgs.size(0)
+            feat = base_model._gabor_feat(imgs.to(device))
+            base = cfg_fc.base_expert(feat)
+
+            emb = base.clone()
+            if domain_ids_list is not None:
+                batch_ids = domain_ids_list[idx: idx + B]
+                for d in set(batch_ids):
+                    if d not in expert_modules:
+                        continue
+                    mask = [i for i, did in enumerate(batch_ids) if did == d]
+                    msk  = torch.tensor(mask, dtype=torch.long, device=device)
+                    g    = torch.sigmoid(gate_raws[d]) * cfg_fc.gate_scale
+                    res  = expert_modules[d](feat[msk])
+                    emb[msk] = base[msk] + g * res
+
+            emb_np = torch.nn.functional.normalize(emb, p=2, dim=1).cpu().numpy()
+            nan_rows = np.isnan(emb_np).any(axis=1)
+            if nan_rows.any(): emb_np[nan_rows] = 0.0
+            feats_out.append(emb_np)
+            labels_out.append(labs.numpy())
+            idx += B
+        return np.concatenate(feats_out), np.concatenate(labels_out)
+
+    gal_feats, gal_labels = _extract(gallery_loader, gallery_domain_ids)
+    prb_feats, prb_labels = _extract(probe_loader,   probe_domain_ids)
+
+    if use_whitening:
+        gal_feats, prb_feats = whiten_features(gal_feats, prb_feats)
+
+    sim_matrix = np.nan_to_num(prb_feats @ gal_feats.T, nan=0.0)
+    scores_list = []; labels_list = []
+    for i in range(len(prb_feats)):
+        for j in range(len(gal_feats)):
+            scores_list.append(float(sim_matrix[i, j]))
+            labels_list.append(1 if prb_labels[i] == gal_labels[j] else -1)
+
+    eer    = compute_eer(np.column_stack([scores_list, labels_list]))
+    nn_idx = np.argmax(sim_matrix, axis=1)
+    correct = sum(prb_labels[i] == gal_labels[nn_idx[i]]
+                  for i in range(len(prb_feats)))
+    rank1  = 100.0 * correct / max(len(prb_feats), 1)
+    return eer, rank1
 
 
 def compute_eer(scores_array):
@@ -310,10 +397,14 @@ def train_compnet_epoch(model, loader, criterion, optimizer, device,
             loss  = loss + lambda_supcon * supcon_criterion(feats, labels)
 
         if use_grl and domain_ids is not None:
-            emb_grl    = GRL.apply(emb_orig, lambda_grl)
-            dom_logits = model.domain_classifier(emb_grl)
-            loss_dom   = F.cross_entropy(dom_logits, domain_ids)
-            loss       = loss + lambda_grl * loss_dom
+            # Filter out sentinel samples (domain_id == -1, FFT-only, no expert)
+            # GRL domain classification only makes sense for real domain samples.
+            real_mask = (domain_ids >= 0)
+            if real_mask.any():
+                emb_grl    = GRL.apply(emb_orig[real_mask], lambda_grl)
+                dom_logits = model.domain_classifier(emb_grl)
+                loss_dom   = F.cross_entropy(dom_logits, domain_ids[real_mask])
+                loss       = loss + lambda_grl * loss_dom
 
         if use_center:
             loss = loss + lambda_center * center_loss(emb_orig.detach(), labels)
