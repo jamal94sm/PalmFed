@@ -68,7 +68,7 @@ CONFIG = {
     # Requires use_fft_aug=True to generate cross-domain training signal.
     "use_moe"          : True,  # True → MoEFC for CompNet
     "n_experts"        : 6,      # number of domain experts (= n_clients)
-    "lora_rank"        : 256,     # expert bottleneck rank
+    "lora_rank"        : 16,     # expert bottleneck rank
 
     # MoE warm-up: freeze domain experts for the first moe_warmup_rounds
     # FL rounds so the shared base FC learns a strong domain-invariant
