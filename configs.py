@@ -50,32 +50,50 @@ CONFIG = {
     "mixed_aug_round"  : 10,     # round at which to switch (mixed mode only)
 
     # FFT augmentation parameters
-    "fft_beta"         : 0.15,   # Gaussian mask sigma as fraction of image size
+    "fft_beta"         : 0.1,   # Gaussian mask sigma as fraction of image size
     "M"                : 2,      # samples per original (1 original + M-1 FFT copies)
 
     # ── FL hyperparameters ─────────────────────────────────────
     "n_rounds"         : 30,    # R: total communication rounds
     "local_epochs"     : 1,      # E: local training epochs per round
 
-    # ── Mixture of Experts — CompNet only ─────────────────────
-    # When use_moe=True, the single FC(9708→512) bottleneck in CompNet
-    # is replaced by MoEFC: base_FC(x) + expert[domain_id](x).
-    # base_FC learns the domain-invariant projection (shared via FedAvg).
-    # Each expert[d] is a low-rank residual (9708→rank→512) that learns
-    # the domain-d-specific correction on top of the shared base.
-    # Domain routing uses explicit domain_id labels during training;
-    # at inference domain_ids=None so only base_FC is used.
-    # Requires use_fft_aug=True to generate cross-domain training signal.
-    "use_moe"          : True,  # True → MoEFC for CompNet
-    "n_experts"        : 6,      # number of domain experts (= n_clients)
-    "lora_rank"        : 16,     # expert bottleneck rank
+    # ── Dual-Expert FC — CompNet only ─────────────────────────
+    # When use_moe=True, the single FC(9708→512) is replaced by DualExpertFC:
+    #
+    #   base_expert   : FC(9708→512) — updated by ALL samples, FedAvg'd.
+    #                   Learns domain-invariant projection.
+    #   domain_expert : _ResidualExpert(9708→rank→512) — updated ONLY by
+    #                   real own-domain samples (NOT FFT sentinel).
+    #                   NEVER FedAvg'd — stays local to owning client.
+    #                   Learns domain-specific correction.
+    #
+    # Combination: emb = base_expert(x) + gate * domain_expert(x)
+    # FFT samples:  emb = base_expert(x)  (domain_expert skipped via sentinel -1)
+    #
+    # Two global models evaluated each round:
+    #   GlobalBase: base_expert only   (domain_id=None at inference)
+    #   GlobalFull: base_expert + domain_expert[k] for sample domain_id=k
+    "use_moe"          : True,  # True → DualExpertFC for CompNet
+    "lora_rank"        : 32,     # domain_expert bottleneck rank (9708→rank→512)
+
+    # Expert gate — controls residual magnitude
+    # gate_mode  : "scalar"  → one learnable scalar α per expert (simple, recommended)
+    #              "network" → small MLP per expert conditioned on base output (expressive)
+    # gate_init  : initial effective gate value (before sigmoid*scale)
+    # gate_scale : maximum gate value = sigmoid(raw) * gate_scale
+    #   Effective gate range: (0, gate_scale).
+    #   With gate_init=1.0 and gate_scale=2.0: starts at 1.0, can grow to 2.0.
+    #   This ensures the residual starts at a meaningful magnitude and can grow.
+    "moe_gate_mode"    : "scalar",  # "scalar" | "network"
+    "moe_gate_init"    : 1.0,       # initial gate value
+    "moe_gate_scale"   : 2.0,       # maximum gate value (gate lives in (0, scale))
 
     # MoE warm-up: freeze domain experts for the first moe_warmup_rounds
     # FL rounds so the shared base FC learns a strong domain-invariant
     # initialisation before experts start their domain-specific corrections.
     # After warm-up, experts are unfrozen and trained normally.
     # Setting moe_warmup_rounds=0 disables warm-up (original behaviour).
-    "moe_warmup_rounds": 0,     # rounds to train base only; 0 = no warmup
+    "moe_warmup_rounds": 10,     # rounds to train base only; 0 = no warmup
 
     # ── GRL ─────────────────────
     "use_grl"          : False,  # True → domain adversarial training (GRL)
