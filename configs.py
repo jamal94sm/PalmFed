@@ -75,7 +75,7 @@ CONFIG = {
     # initialisation before experts start their domain-specific corrections.
     # After warm-up, experts are unfrozen and trained normally.
     # Setting moe_warmup_rounds=0 disables warm-up (original behaviour).
-    "moe_warmup_rounds": 10,     # rounds to train base only; 0 = no warmup
+    "moe_warmup_rounds": 0,     # rounds to train base only; 0 = no warmup
 
     # ── GRL ─────────────────────
     "use_grl"          : False,  # True → domain adversarial training (GRL)
