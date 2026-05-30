@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 warnings.filterwarnings("ignore")
 
 from configs  import CONFIG
-from models   import build_model, _ResidualExpert
+from models   import build_model, _FeatureResidualExpert
 from datasets import (PalmDataset, AugmentedDataset,
                       PairedDataset, FFTAugmentedDataset,
                       EvalDatasetDINO, get_federated_splits)
