@@ -439,8 +439,10 @@ class CompNet(nn.Module):
             # High similarity → domain branch hasn't diverged yet (expected early)
             # Lower similarity → domain branch specialising
             def _flat_params(cb):
+                # Include ALL parameters regardless of requires_grad
+                # (during warmup domain_gabor params are frozen but still diagnosable)
                 return torch.cat([p.data.flatten()
-                                  for p in cb.parameters() if p.requires_grad])
+                                  for p in cb.parameters()])
             base_p   = torch.cat([_flat_params(self.cb1b),
                                    _flat_params(self.cb2b),
                                    _flat_params(self.cb3b)])
