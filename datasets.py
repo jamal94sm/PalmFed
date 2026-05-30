@@ -1,26 +1,8 @@
 # ==============================================================
 #  datasets.py — dataset classes and federated data partitioning
 # ==============================================================
-#
-#  Normalisation:
-#    NormSingleROI
-#
-#  Dataset classes:
-#    PalmDataset          — gallery/probe evaluation (no augmentation)
-#    AugmentedDataset     — standard spatial aug (CompNet baseline)
-#    PairedDataset        — paired same-class images (CCNet training)
-#    FFTAugmentedDataset  — FFT style swap + spatial aug (CompNet FFT run)
-#
-#  Data loading — CASIA-MS:
-#    parse_casia_ms
-#    build_federated_splits          (6 clients, one per spectrum)
-#
-#  Data loading — XJTU:
-#    parse_xjtu_domains
-#    build_federated_splits_xjtu     (4 clients, one per device+lighting)
-#
-#  Dispatcher:
-#    get_federated_splits            (calls correct builder from cfg["dataset"])
+# SENTINEL VALUE: domain_id == -1 means "base FC only, no expert update"
+# Used for FFT-augmented samples so experts only see real own-domain data.
 # ==============================================================
 
 import os
@@ -42,13 +24,7 @@ from configs import XJTU_VARIATIONS
 # ══════════════════════════════════════════════════════════════
 
 class NormSingleROI:
-    """
-    Per-image normalisation over foreground pixels only (value > 0).
-    Background zero-padding is excluded so it does not distort the
-    mean/std of the actual palm ROI region.
-    """
     def __init__(self, outchannels=1): self.outchannels = outchannels
-
     def __call__(self, tensor):
         c, h, w = tensor.size(); tensor = tensor.view(c, h * w)
         idx = tensor > 0; t = tensor[idx]
@@ -64,12 +40,6 @@ class NormSingleROI:
 # ══════════════════════════════════════════════════════════════
 
 class PalmDataset(Dataset):
-    """
-    Plain dataset for gallery/probe evaluation — no augmentation.
-    Samples can be (path, label) or (path, label, domain_id).
-    Returns (img, label) — domain_id is not returned here;
-    it is extracted separately via get_domain_ids().
-    """
     def __init__(self, samples, img_side=128):
         self.samples   = samples
         self.transform = T.Compose([
@@ -77,19 +47,13 @@ class PalmDataset(Dataset):
             T.ToTensor(),
             NormSingleROI(outchannels=1),
         ])
-
     def __len__(self): return len(self.samples)
-
     def __getitem__(self, idx):
         path, label = self.samples[idx][0], self.samples[idx][1]
         return self.transform(Image.open(path).convert("L")), label
-
     def get_paths(self):
-        """Return list of image paths (for FFT descriptor extraction)."""
         return [s[0] for s in self.samples]
-
     def get_domain_ids(self):
-        """Return domain_id list if stored, else None."""
         if len(self.samples[0]) >= 3:
             return [s[2] for s in self.samples]
         return None
@@ -98,13 +62,8 @@ class PalmDataset(Dataset):
 class AugmentedDataset(Dataset):
     """
     Training dataset with standard spatial/photometric augmentation.
-    Returns ([orig, aug], label):
-      orig — original image, resize + normalise only (anchor for losses)
-      aug  — spatially augmented copy
-
-    Enables style consistency loss in train_compnet_epoch:
-      loss += lambda_style × (1 - cosine_sim(emb(orig), emb(aug)))
-    ArcFace uses orig only.
+    Returns ([orig, aug], label, client_id).
+    domain_id == client_id for all samples (real own-domain data).
     """
     def __init__(self, samples, img_side=128, grayscale=True, client_id=0):
         self.samples   = samples
@@ -118,48 +77,33 @@ class AugmentedDataset(Dataset):
                 T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
                 T.RandomPerspective(distortion_scale=0.15, p=1.0),
                 T.RandomChoice([
-                    T.RandomRotation(10, expand=False,
-                                     center=(int(0.5*img_side), 0)),
-                    T.RandomRotation(10, expand=False,
-                                     center=(0, int(0.5*img_side))),
+                    T.RandomRotation(10, expand=False, center=(int(0.5*img_side), 0)),
+                    T.RandomRotation(10, expand=False, center=(0, int(0.5*img_side))),
                 ]),
             ]),
         ]
-
         if grayscale:
             norm = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
         else:
             norm = T.Compose([T.ToTensor(),
                               T.Normalize(mean=[0.485, 0.456, 0.406],
                                           std =[0.229, 0.224, 0.225])])
-
         self.transform_orig = T.Compose([T.Resize((img_side, img_side))] + [norm])
         self.transform_aug  = T.Compose(aug_transforms + [norm])
 
     def __len__(self): return len(self.samples)
-
     def __getitem__(self, idx):
         path, label = self.samples[idx][0], self.samples[idx][1]
         mode = "L" if self.grayscale else "RGB"
         img  = Image.open(path).convert(mode)
+        # domain_id = client_id: real own-domain data → routes to own expert
         return ([self.transform_orig(img), self.transform_aug(img)],
                 label,
                 self.client_id)
 
 
 class PairedDataset(Dataset):
-    """
-    Paired same-class dataset for CCNet contrastive training.
-
-    Returns ([img1, img2], label) where img2 is a different sample of the
-    same identity — required to form the two views for SupConLoss.
-
-    Augmentation modes (controlled by style_bank argument):
-      style_bank empty → standard spatial augmentation on both views
-      style_bank filled → FFT style swap + spatial aug on both views
-                          (each view independently gets a random template
-                           from a random other client)
-    """
+    """Paired same-class dataset for CCNet contrastive training."""
     def __init__(self, samples, img_side=128,
                  style_bank=None, client_id=None, beta=0.15):
         self.samples    = samples
@@ -180,38 +124,22 @@ class PairedDataset(Dataset):
             T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
             T.RandomPerspective(distortion_scale=0.15, p=1.0),
             T.RandomChoice([
-                T.RandomRotation(10, expand=False,
-                                 center=(int(0.5*img_side), 0)),
-                T.RandomRotation(10, expand=False,
-                                 center=(0, int(0.5*img_side))),
+                T.RandomRotation(10, expand=False, center=(int(0.5*img_side), 0)),
+                T.RandomRotation(10, expand=False, center=(0, int(0.5*img_side))),
             ]),
         ])
-
         self.to_tensor = T.Compose([
-            T.Resize((img_side, img_side)),
-            T.ToTensor(),
-            NormSingleROI(outchannels=1),
-        ])
-        # no T.Resize — _load_np already resizes
-        self.to_tensor_fft = T.Compose([
-            T.ToTensor(),
-            NormSingleROI(outchannels=1),
-        ])
+            T.Resize((img_side, img_side)), T.ToTensor(), NormSingleROI(outchannels=1)])
+        self.to_tensor_fft = T.Compose([T.ToTensor(), NormSingleROI(outchannels=1)])
 
     def __len__(self): return len(self.samples)
 
     def _load_np(self, path):
-        """Load, resize, return grayscale float32 in [0, 1]."""
         img = Image.open(path).convert("L").resize(
             (self.img_side, self.img_side), Image.BILINEAR)
         return np.array(img, dtype=np.float32) / 255.0
 
     def _augment_image(self, path):
-        """
-        Load one image and apply the configured augmentation.
-        FFT mode: FFT style swap from random other client + spatial aug.
-        Spatial mode: spatial augmentation only.
-        """
         if self.use_fft:
             img_np        = self._load_np(path)
             rand_client   = random.choice(self.other_ids)
@@ -240,27 +168,25 @@ class PairedDataset(Dataset):
 class FFTAugmentedDataset(Dataset):
     """
     Training dataset with FFT style augmentation.
-    Returns ([orig, aug], label) — always a pair per index.
 
-    Index layout with M multiplier:
-      indices [i*M .. i*M+M-1] map to sample i.
-      aug_idx == 0  → ([orig, spatial_aug(orig)], label)
-      aug_idx >= 1  → ([orig, fft_aug(orig)],     label)
+    Asymmetric expert routing via domain_id sentinel
+    ─────────────────────────────────────────────────
+    aug_idx == 0  (real own-domain sample):
+      domain_id = client_id   → routes to expert[client_id] + base
+      This is the only signal that trains domain-specific experts.
 
-    orig is always the clean, unaugmented image — it anchors ArcFace,
-    CenterLoss, and the style consistency loss.
-    aug is either spatial-only (aug_idx=0) or FFT-styled (aug_idx>=1).
+    aug_idx >= 1  (FFT-styled synthetic sample):
+      domain_id = -1  (SENTINEL)   → base FC only, NO expert update
+      FFT styling approximates the target domain's amplitude but retains
+      the source domain's identity/texture. Routing these to an expert
+      would contaminate it with cross-domain noise. The base FC still
+      receives their gradient and learns domain-invariant features.
 
-    Style consistency loss is now directly applicable:
-      loss += λ_style × (1 - cosine_sim(emb(orig), emb(fft_aug)))
-    This explicitly enforces that embeddings are invariant to domain style
-    transfer — the feature-level complement of FFT augmentation.
-
-    Notes
-    ─────
-    • Grayscale for CompNet/CCNet; RGB for DINOv2.
-    • Domain-aware donor selection via mean_bank + prefer_distant.
+    This replaces the previous scheme where FFT samples routed to the
+    donor's expert[donor_id], which was the primary source of contamination.
     """
+
+    EXPERT_SKIP = -1   # sentinel: skip expert branch, base FC only
 
     def __init__(self, samples, style_bank, client_id, M, beta, img_side,
                  grayscale=True, mean_bank=None,
@@ -286,10 +212,8 @@ class FFTAugmentedDataset(Dataset):
             T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
             T.RandomPerspective(distortion_scale=0.15, p=1.0),
             T.RandomChoice([
-                T.RandomRotation(10, expand=False,
-                                 center=(int(0.5 * img_side), 0)),
-                T.RandomRotation(10, expand=False,
-                                 center=(0, int(0.5 * img_side))),
+                T.RandomRotation(10, expand=False, center=(int(0.5 * img_side), 0)),
+                T.RandomRotation(10, expand=False, center=(0, int(0.5 * img_side))),
             ]),
         ])
 
@@ -298,13 +222,9 @@ class FFTAugmentedDataset(Dataset):
         else:
             norm_base = T.Compose([
                 T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406],
-                            std =[0.229, 0.224, 0.225]),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
-
-        # orig: resize to img_side, no spatial randomness
         self.norm_orig = T.Compose([T.Resize((img_side, img_side)), norm_base])
-        # aug: _load_np already resizes, apply spatial aug before norm
         self.norm_aug  = norm_base
 
     def __len__(self):
@@ -317,12 +237,10 @@ class FFTAugmentedDataset(Dataset):
         return np.array(img, dtype=np.float32) / 255.0
 
     def _to_orig_tensor(self, path):
-        """Clean original — resize + normalise only, no spatial aug."""
         mode = "L" if self.grayscale else "RGB"
         return self.norm_orig(Image.open(path).convert(mode))
 
     def _to_aug_tensor(self, img_np):
-        """numpy → PIL → spatial aug → normalised tensor."""
         mode = "L" if self.grayscale else "RGB"
         pil  = Image.fromarray((img_np * 255).astype(np.uint8), mode=mode)
         return self.norm_aug(self.spatial_aug(pil))
@@ -351,17 +269,15 @@ class FFTAugmentedDataset(Dataset):
         path, label = self.samples[sample_idx][0], self.samples[sample_idx][1]
         img_np = self._load_np(path)
 
-        # orig: spatially augmented original — consistent with old file where
-        # _to_tensor applied spatial aug to every sample. ArcFace sees a
-        # spatially augmented view; style consistency loss compares it to
-        # a second independently augmented (or FFT-styled) view.
         orig = self._to_aug_tensor(img_np)
 
         if aug_idx == 0 or not self.other_ids:
-            # two independent spatial augmentations of same image
+            # Real own-domain sample → domain_id = client_id → updates expert[k] + base
             return [orig, self._to_aug_tensor(img_np)], label, self.client_id
 
-        # FFT style augmentation — select donor
+        # FFT-styled synthetic sample → domain_id = SENTINEL (-1) → base FC only
+        # Expert branch is completely skipped for this sample.
+        # The base FC still receives gradient and learns cross-domain invariance.
         if self.deterministic_donors:
             rand_client = self.donor_order[(aug_idx - 1) % len(self.donor_order)]
         elif self.donor_order and self.mean_bank:
@@ -376,23 +292,15 @@ class FFTAugmentedDataset(Dataset):
             rand_template = random.choice(self.style_bank[rand_client])
 
         img_syn = apply_style_template(img_np, rand_template, self.beta)
-        # domain_id = donor client (domain this sample was styled as)
-        return [orig, self._to_aug_tensor(img_syn)], label, rand_client
+        # Sentinel -1: expert branch skipped in MoEFC.forward()
+        return [orig, self._to_aug_tensor(img_syn)], label, self.EXPERT_SKIP
 
 
 # ══════════════════════════════════════════════════════════════
-#  DATA LOADING & PARTITIONING
+#  DATA LOADING — CASIA-MS
 # ══════════════════════════════════════════════════════════════
 
 def parse_casia_ms(data_root):
-    """
-    Scan data_root for CASIA-MS ROI images.
-    Filename format: {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
-
-    Returns
-    -------
-    data : dict  spectrum → identity → [path, ...]
-    """
     data     = defaultdict(lambda: defaultdict(list))
     img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
     for fname in sorted(os.listdir(data_root)):
@@ -401,39 +309,19 @@ def parse_casia_ms(data_root):
         parts = os.path.splitext(fname)[0].split("_")
         if len(parts) < 4:
             continue
-        identity = f"{parts[0]}_{parts[1]}"   # e.g. "001_L"
+        identity = f"{parts[0]}_{parts[1]}"
         spectrum = parts[2]
         data[spectrum][identity].append(os.path.join(data_root, fname))
     return data
 
 
 def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
-    """
-    Build per-client training sets and a fixed shared gallery/probe test set.
-
-    Protocol: Open-Set, Non-Shared-ID, Cross-Domain.
-      - n_ids identities are sampled from those common to all spectra.
-      - k_test fraction → test IDs; remainder → train IDs (disjoint).
-      - Train IDs are partitioned round-robin across clients (no overlap).
-      - All clients are trimmed to min partition size (equalised).
-      - Test IDs across all spectra form the gallery/probe split.
-
-    Returns
-    -------
-    client_data     : list of dicts {spectrum, train_samples, label_map, num_classes}
-    gallery_samples : list of (path, label)
-    probe_samples   : list of (path, label)
-    test_label_map  : {identity: int}
-    spectra         : list of spectrum strings
-    """
     rng  = random.Random(seed)
     data = parse_casia_ms(data_root)
-
     spectra   = sorted(data.keys())
     n_clients = len(spectra)
     print(f"  Spectra found ({n_clients}): {spectra}")
 
-    # identities present in ALL spectra
     common_ids = set(data[spectra[0]].keys())
     for sp in spectra[1:]:
         common_ids &= set(data[sp].keys())
@@ -441,55 +329,40 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
     print(f"  Identities common to all spectra: {len(common_ids)}")
 
     if len(common_ids) < n_ids:
-        raise ValueError(
-            f"Requested {n_ids} IDs but only {len(common_ids)} "
-            f"are present in all spectra.")
+        raise ValueError(f"Requested {n_ids} IDs but only {len(common_ids)} present.")
 
-    # sample n_ids, shuffle, split into test / train ID sets
-    selected_ids = sorted(rng.sample(common_ids, n_ids))
+    selected_ids   = sorted(rng.sample(common_ids, n_ids))
     rng.shuffle(selected_ids)
     n_test_ids     = max(1, round(n_ids * k_test))
     test_ids       = sorted(selected_ids[:n_test_ids])
     train_ids      = sorted(selected_ids[n_test_ids:])
     test_label_map = {ident: i for i, ident in enumerate(test_ids)}
-
     print(f"  Total train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
 
-    # round-robin partition — no two clients share a train ID
     rng.shuffle(train_ids)
     client_id_splits = [[] for _ in range(n_clients)]
     for i, ident in enumerate(train_ids):
         client_id_splits[i % n_clients].append(ident)
 
-    # equalise by trimming to smallest partition
     min_ids = min(len(ids) for ids in client_id_splits)
     client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
     n_dropped = len(train_ids) - min_ids * n_clients
     print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
 
-    # build per-client local train sets — each has its own label space
     client_data = []
     for i, sp in enumerate(spectra):
         c_ids       = client_id_splits[i]
         c_label_map = {ident: j for j, ident in enumerate(c_ids)}
-        local_train = [
-            (p, c_label_map[ident])
-            for ident in c_ids
-            for p in data[sp][ident]
-        ]
+        local_train = [(p, c_label_map[ident])
+                       for ident in c_ids for p in data[sp][ident]]
         client_data.append({
             "spectrum"      : sp,
             "train_samples" : local_train,
             "label_map"     : c_label_map,
             "num_classes"   : min_ids,
         })
-        print(f"    Client {i} [{sp:>6}]  "
-              f"train IDs={min_ids}  samples={len(local_train)}")
+        print(f"    Client {i} [{sp:>6}]  train IDs={min_ids}  samples={len(local_train)}")
 
-    # fixed global test set — split within each (spectrum, identity) pair
-    # Each sample is (path, identity_label, domain_id) where domain_id is
-    # the spectrum index (0..n_spectra-1). Known for gallery; predicted for
-    # probe via FFT descriptor matching at inference.
     gallery_samples, probe_samples = [], []
     for sp_idx, sp in enumerate(spectra):
         for ident in test_ids:
@@ -500,42 +373,19 @@ def build_federated_splits(data_root, n_ids, k_test, gallery_ratio, seed=42):
             for p in paths[:n_gal]:
                 gallery_samples.append((p, label, sp_idx))
             for p in paths[n_gal:]:
-                probe_samples.append((p, label, sp_idx))   # sp_idx stored but not used at eval
+                probe_samples.append((p, label, sp_idx))
 
     print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
-    return (client_data, gallery_samples, probe_samples,
-            test_label_map, spectra)
+    return (client_data, gallery_samples, probe_samples, test_label_map, spectra)
+
 
 # ══════════════════════════════════════════════════════════════
-#  XJTU DATA LOADING & PARTITIONING
+#  DATA LOADING — XJTU
 # ══════════════════════════════════════════════════════════════
 
 def parse_xjtu_domains(data_root, seed=42):
-    """
-    Scan data_root for XJTU-UP images organised by (device, condition) domain.
-
-    Directory layout:
-      data_root/
-        {device}/
-          {condition}/
-            {L|R}_{subjectID}/
-              *.jpg
-
-    Domain keys: (device, condition) tuples from XJTU_VARIATIONS, e.g.
-      ("iPhone", "Flash"), ("iPhone", "Nature"),
-      ("huawei", "Flash"), ("huawei", "Nature")
-
-    Identity key: the folder name, e.g. "L_001" or "R_002".
-
-    Returns
-    -------
-    data : dict  (device, condition) → identity → [path, ...]
-           Same structure as parse_casia_ms (spectrum → identity → paths)
-           so build_federated_splits_xjtu mirrors build_federated_splits.
-    """
     IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
     data     = defaultdict(lambda: defaultdict(list))
-
     for device, condition in XJTU_VARIATIONS:
         var_dir = os.path.join(data_root, device, condition)
         if not os.path.isdir(var_dir):
@@ -553,45 +403,20 @@ def parse_xjtu_domains(data_root, seed=42):
                     continue
                 data[(device, condition)][id_folder].append(
                     os.path.join(id_dir, fname))
-
     for domain in XJTU_VARIATIONS:
         n_ids  = len(data[domain])
         n_imgs = sum(len(v) for v in data[domain].values())
-        print(f"  [XJTU] {domain[0]}/{domain[1]:6s}  "
-              f"IDs={n_ids}  images={n_imgs}")
+        print(f"  [XJTU] {domain[0]}/{domain[1]:6s}  IDs={n_ids}  images={n_imgs}")
     return data
 
 
 def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42):
-    """
-    Build per-client training sets and a fixed shared gallery/probe test set
-    for the XJTU dataset.
-
-    Protocol: Open-Set, Non-Shared-ID, Cross-Domain.
-      - 4 clients, one per (device, condition) domain.
-      - n_ids identities are sampled from those common to all 4 domains.
-      - k_test fraction → test IDs; remainder → train IDs (fully disjoint).
-      - Train IDs are partitioned round-robin across clients (no overlap).
-      - All clients are trimmed to min partition size (equalised).
-      - Test IDs across all 4 domains form the gallery/probe split.
-
-    Returns
-    -------
-    client_data     : list of dicts {domain_label, train_samples,
-                                     label_map, num_classes}
-    gallery_samples : list of (path, label)
-    probe_samples   : list of (path, label)
-    test_label_map  : {identity: int}
-    domain_labels   : list of "{device}/{condition}" strings (client names)
-    """
     rng  = random.Random(seed)
     data = parse_xjtu_domains(data_root, seed=seed)
-
-    domains       = XJTU_VARIATIONS          # 4 (device, condition) tuples
+    domains       = XJTU_VARIATIONS
     n_clients     = len(domains)
     domain_labels = [f"{d}/{c}" for d, c in domains]
 
-    # identities present in ALL 4 domains
     common_ids = set(data[domains[0]].keys())
     for dom in domains[1:]:
         common_ids &= set(data[dom].keys())
@@ -599,45 +424,35 @@ def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42
     print(f"  Identities common to all {n_clients} domains: {len(common_ids)}")
 
     if len(common_ids) < n_ids:
-        raise ValueError(
-            f"Requested {n_ids} IDs but only {len(common_ids)} "
-            f"are present in all {n_clients} XJTU domains.")
+        raise ValueError(f"Requested {n_ids} IDs but only {len(common_ids)} present.")
 
-    # sample n_ids, shuffle, split into test / train ID sets
     selected_ids   = sorted(rng.sample(common_ids, n_ids))
     rng.shuffle(selected_ids)
     n_test_ids     = max(1, round(n_ids * k_test))
     test_ids       = sorted(selected_ids[:n_test_ids])
     train_ids      = sorted(selected_ids[n_test_ids:])
     test_label_map = {ident: i for i, ident in enumerate(test_ids)}
-
     print(f"  Total train IDs: {len(train_ids)}  |  Test IDs: {len(test_ids)}")
 
-    # round-robin partition — no two clients share a train ID
     rng.shuffle(train_ids)
     client_id_splits = [[] for _ in range(n_clients)]
     for i, ident in enumerate(train_ids):
         client_id_splits[i % n_clients].append(ident)
 
-    # equalise by trimming to smallest partition
     min_ids = min(len(ids) for ids in client_id_splits)
     client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
     n_dropped = len(train_ids) - min_ids * n_clients
     print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
 
-    # build per-client local train sets — each has its own label space
     client_data = []
     for i, dom in enumerate(domains):
         c_ids       = client_id_splits[i]
         c_label_map = {ident: j for j, ident in enumerate(c_ids)}
-        local_train = [
-            (p, c_label_map[ident])
-            for ident in c_ids
-            for p in data[dom][ident]
-        ]
+        local_train = [(p, c_label_map[ident])
+                       for ident in c_ids for p in data[dom][ident]]
         client_data.append({
-            "spectrum"      : domain_labels[i],   # reuse "spectrum" key for compatibility
-            "domain"        : dom,                # (device, condition) tuple
+            "spectrum"      : domain_labels[i],
+            "domain"        : dom,
             "train_samples" : local_train,
             "label_map"     : c_label_map,
             "num_classes"   : min_ids,
@@ -645,7 +460,6 @@ def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42
         print(f"    Client {i} [{domain_labels[i]:>14}]  "
               f"train IDs={min_ids}  samples={len(local_train)}")
 
-    # fixed global test set — split within each (domain, identity) pair
     gallery_samples, probe_samples = [], []
     for dom_idx, dom in enumerate(domains):
         for ident in test_ids:
@@ -659,8 +473,7 @@ def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42
                 probe_samples.append((p, label, dom_idx))
 
     print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
-    return (client_data, gallery_samples, probe_samples,
-            test_label_map, domain_labels)
+    return (client_data, gallery_samples, probe_samples, test_label_map, domain_labels)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -668,65 +481,36 @@ def build_federated_splits_xjtu(data_root, n_ids, k_test, gallery_ratio, seed=42
 # ══════════════════════════════════════════════════════════════
 
 def get_federated_splits(cfg, seed=42):
-    """
-    Call the correct split builder based on cfg["dataset"].
-
-    Returns the same 5-tuple for both datasets:
-      (client_data, gallery_samples, probe_samples, test_label_map, domain_names)
-
-    This uniform interface means main.py needs no dataset-specific branching
-    beyond this single call.
-    """
     dataset = cfg["dataset"].strip().lower()
-
     if dataset == "casiams":
         return build_federated_splits(
             cfg["data_root"], cfg["n_ids"], cfg["k_test"],
             cfg["gallery_ratio"], seed=seed)
-
     elif dataset == "xjtu":
         return build_federated_splits_xjtu(
             cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
             cfg["gallery_ratio"], seed=seed)
-
     else:
-        raise ValueError(
-            f"Unknown dataset: '{cfg['dataset']}'. "
-            f"Choose 'casiams' or 'xjtu'.")
-
+        raise ValueError(f"Unknown dataset: '{cfg['dataset']}'. Choose 'casiams' or 'xjtu'.")
 
 
 # ══════════════════════════════════════════════════════════════
-#  DINOV2 EVALUATION DATASET  (RGB + ImageNet normalisation)
+#  DINOV2 EVAL DATASET
 # ══════════════════════════════════════════════════════════════
-# DINOv2 training uses AugmentedDataset / FFTAugmentedDataset with
-# grayscale=False — same augmentation policy as CompNet.  Only the
-# gallery/probe evaluation loader needs a dedicated class because it
-# must convert the grayscale palmprint to RGB and apply ImageNet norm.
 
 def _dino_eval_transform(img_side=224):
-    """Eval transform for DINOv2: resize + RGB + ImageNet norm."""
     return T.Compose([
         T.Resize((img_side, img_side)),
         T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406],
-                    std =[0.229, 0.224, 0.225]),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
 
 class EvalDatasetDINO(Dataset):
-    """
-    Evaluation dataset for DINOv2 gallery/probe sets.
-    No augmentation — resize + ImageNet norm only.
-    Grayscale palmprint images are replicated to 3 channels via
-    convert("RGB") to match the ImageNet-pretrained backbone's input.
-    """
     def __init__(self, samples, img_side=224):
         self.samples   = samples
         self.transform = _dino_eval_transform(img_side)
-
     def __len__(self): return len(self.samples)
-
     def __getitem__(self, idx):
-        path, label = self.samples[idx]
+        path, label = self.samples[idx][0], self.samples[idx][1]
         return self.transform(Image.open(path).convert("RGB")), label
