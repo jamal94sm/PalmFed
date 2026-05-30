@@ -77,7 +77,7 @@ class CompetitiveBlock(nn.Module):
 
 
 class ArcMarginProduct(nn.Module):
-    """ArcFace angular margin product layer (shared by CompNet and CCNet)."""
+    """ArcFace angular margin product layer."""
     def __init__(self, in_features, out_features, s=30.0, m=0.50,
                  easy_margin=False):
         super().__init__()
@@ -103,12 +103,7 @@ class ArcMarginProduct(nn.Module):
 
 
 class GRL(torch.autograd.Function):
-    """
-    Gradient Reversal Layer (Ganin & Lempitsky, DANN 2016).
-    Forward pass: identity.
-    Backward pass: gradient multiplied by -λ.
-    λ controls the strength of domain adversarial signal.
-    """
+    """Gradient Reversal Layer."""
     @staticmethod
     def forward(ctx, x, lam):
         ctx.lam = lam
@@ -120,17 +115,7 @@ class GRL(torch.autograd.Function):
 
 
 class DomainClassifier(nn.Module):
-    """
-    Shared domain classification head used with GRL.
-    Receives GRL-reversed embeddings and tries to predict domain.
-    The reversed gradient pushes the backbone away from domain-discriminative
-    features.
-
-    Shared via FedAvg: each client sees only its own domain during training,
-    but after aggregation the classifier has knowledge of all 6 domains.
-    The GRL signal therefore drives backbone toward globally domain-invariant
-    representations.
-    """
+    """Shared domain classification head used with GRL."""
     def __init__(self, in_features, n_domains):
         super().__init__()
         self.net = nn.Sequential(
@@ -144,10 +129,7 @@ class DomainClassifier(nn.Module):
 
 
 class _ResidualExpert(nn.Module):
-    """
-    Low-rank domain-specific residual adapter: Linear(in→rank) → ReLU → Linear(rank→out).
-    B initialised to zero → zero contribution at round 0, learned from training.
-    """
+    """Low-rank residual adapter: A(in->rank)->ReLU->B(rank->out). B init=0."""
     def __init__(self, in_features, out_features, rank):
         super().__init__()
         self.A = nn.Linear(in_features, rank, bias=False)
@@ -162,60 +144,48 @@ class _ResidualExpert(nn.Module):
 class MoEFC(nn.Module):
     """
     Mixture-of-Experts FC bottleneck for CompNet.
-    Replaces the single nn.Linear(9708→512) with:
-        output = base_FC(x) + expert[domain_id](x)
 
-    base_FC  — shared across all clients via FedAvg; learns domain-invariant projection.
-    expert[d] — low-rank residual (9708→rank→512); learns domain-specific correction.
+    Asymmetric routing (training)
+    ─────────────────────────────
+    For each sample, only expert[domain_id] is called in forward.
+    Unrouted experts are never touched → zero gradient → not updated by Adam.
+    This enforces strict asymmetric specialisation:
+      • real samples from client k   → domain_id = k → updates expert[k] + base
+      • FFT samples styled as domain d → domain_id = d → updates expert[d] + base
 
-    Domain routing:
-      Training:  domain_ids tensor [B] selects one expert per sample (exact routing).
-      Inference: domain_ids=None → base_FC only (no residual). Base FC carries the
-                 full domain-invariant representation; residuals are training-time only.
+    Domain-aware inference
+    ──────────────────────
+    embed(feat, domain_id=int) → base(feat) + expert[domain_id](feat)
+    embed(feat, domain_id=None) → base(feat) only
 
-    Warm-up phase (warmup=True):
-      Expert parameters are frozen (requires_grad=False equivalent via zero-grad mask).
-      Only base_FC is trained, allowing it to learn a strong domain-invariant
-      initialisation before experts start their corrections.
-      set_warmup(True/False) is called by CompNet at the start of each forward pass
-      based on the current FL round number.
-
-    experts[k] after FedAvg:
-      Client k contributes the strongest gradient to expert[k] (its own domain).
-      Other clients contribute via FFT-augmented copies styled as domain k.
-      Expert[k] converges toward the domain-k-specific correction, informed
-      primarily by the client that owns that domain.
-
-    Diagnostics (get_expert_diagnostics):
-      Returns per-expert output norm and inter-expert cosine distance matrix,
-      which together signal whether experts are specialising or collapsing.
-      - Output norms near zero → expert not active yet (expected during warmup).
-      - All experts producing identical directions → collapse (bad).
-      - High pairwise cosine distances → healthy specialisation (good).
+    Diagnostics (5 signals + weight-space signals)
+    ───────────────────────────────────────────────
+    Signal 1 — Expert B-weight norms           : get_weight_diagnostics()
+    Signal 2 — Pairwise cosine dist (weights)  : get_weight_diagnostics()
+    Signal 3 — Routing counts per expert       : get_routing_stats()
+    Signal 4 — Expert gradient norms           : get_grad_norms()  [after backward]
+    Signal 5 — Residual/base magnitude ratio   : get_activation_diagnostics()
+             — Pairwise cosine dist (activations): get_activation_diagnostics()
     """
-    def __init__(self, in_features=9708, out_features=512,
-                 n_experts=6, rank=64):
+
+    def __init__(self, in_features=9708, out_features=512, n_experts=6, rank=64):
         super().__init__()
-        self.n_experts   = n_experts
-        self.in_features = in_features
+        self.n_experts    = n_experts
+        self.in_features  = in_features
         self.out_features = out_features
-        self.rank        = rank
-        self.base        = nn.Linear(in_features, out_features)
-        self.experts     = nn.ModuleList([
+        self.rank         = rank
+        self.base         = nn.Linear(in_features, out_features)
+        self.experts      = nn.ModuleList([
             _ResidualExpert(in_features, out_features, rank)
             for _ in range(n_experts)
         ])
-        # warmup flag: when True, expert outputs are zeroed in forward pass
-        # (experts still receive gradients in the graph but their contribution
-        # is blocked; set_expert_grad() is called separately to freeze params)
         self._warmup = False
+        self.register_buffer("_route_counts",
+                             torch.zeros(n_experts, dtype=torch.long))
+
+    # ── warmup ──────────────────────────────────────────────────────────────
 
     def set_warmup(self, warmup: bool):
-        """
-        Enable or disable warm-up mode.
-        warmup=True  → freeze expert parameters (no grad) + zero expert output.
-        warmup=False → unfreeze experts for normal training.
-        """
         self._warmup = warmup
         for expert in self.experts:
             for p in expert.parameters():
@@ -225,92 +195,142 @@ class MoEFC(nn.Module):
     def is_warming_up(self):
         return self._warmup
 
-    def forward(self, x, domain_ids=None):
-        base_out = self.base(x)                              # [B, 512]
+    # ── routing stats (Signal 3) ─────────────────────────────────────────────
 
-        # During warmup or inference (domain_ids=None): base only
+    def reset_routing_stats(self):
+        self._route_counts.zero_()
+
+    def get_routing_stats(self):
+        return self._route_counts.tolist()
+
+    # ── forward ─────────────────────────────────────────────────────────────
+
+    def forward(self, x, domain_ids=None):
+        """
+        Asymmetric forward: only expert[domain_id] is called per sample.
+        Unrouted experts receive no gradient.
+        """
+        base_out = self.base(x)
         if self._warmup or domain_ids is None:
             return base_out
-
         residual = torch.zeros_like(base_out)
         for d in range(self.n_experts):
             mask = (domain_ids == d)
             if mask.any():
                 residual[mask] = self.experts[d](x[mask])
+                if self.training:
+                    self._route_counts[d] += mask.sum().item()
         return base_out + residual
 
+    # ── domain-aware inference ───────────────────────────────────────────────
+
+    def embed(self, feat, domain_id=None):
+        """
+        Inference embedding: base + expert[domain_id].
+        All samples in the batch share the same domain_id (called once per
+        domain group in evaluate_model).
+        """
+        base_out = self.base(feat)
+        if domain_id is None or self._warmup:
+            return base_out
+        return base_out + self.experts[domain_id](feat)
+
+    # ── Signal 4: gradient norms (call after backward, before step) ──────────
+
+    def get_grad_norms(self):
+        """
+        Returns:
+          base_grad_norm    : float | None
+          expert_grad_norms : list[float | None]  — None if no grad (not routed)
+        """
+        def _norm(p):
+            return round(float(p.grad.norm()), 4) if (p.grad is not None) else None
+        return {
+            "base_grad_norm"   : _norm(self.base.weight),
+            "expert_grad_norms": [_norm(e.B.weight) for e in self.experts],
+        }
+
+    # ── Signals 1+2: weight-space diagnostics ───────────────────────────────
+
     @torch.no_grad()
-    def get_expert_diagnostics(self, probe_input=None):
+    def get_weight_diagnostics(self):
         """
-        Compute expert health signals on a fixed probe input.
-
-        If probe_input is None, uses the B-weight matrix columns of each
-        expert directly (parameter-space analysis, no forward pass needed).
-
-        Returns
-        -------
-        diag : dict with keys:
-          "output_norms"       : list[float]  — L2 norm of each expert's B weight
-                                  (proxy for how much each expert contributes)
-          "pairwise_cos_dist"  : list[list[float]]  — cosine distance matrix
-                                  between expert weight directions (0=identical, 1=orthogonal)
-          "mean_pairwise_dist" : float  — mean off-diagonal cosine distance
-                                  (higher → more specialised; ~0 → collapse)
-          "min_pairwise_dist"  : float  — min off-diagonal distance
-                                  (if near 0 → at least two experts have collapsed)
+        Signal 1 — B-weight L2 norms per expert.
+        Signal 2 — Pairwise cosine distance matrix (weight space).
         """
-        # Use B.weight as the "fingerprint" of each expert [out_features, rank]
-        # Flatten to a vector for cosine comparisons
         fingerprints = []
         output_norms = []
         for expert in self.experts:
-            w = expert.B.weight.float()           # [out_features, rank]
+            w = expert.B.weight.float()
             output_norms.append(float(w.norm()))
             fingerprints.append(w.flatten())
 
         n = len(fingerprints)
-        cos_dist = [[0.0] * n for _ in range(n)]
-        off_diag_vals = []
+        off_diag = []
         for i in range(n):
             for j in range(n):
                 if i == j:
                     continue
-                fi = fingerprints[i]; fj = fingerprints[j]
-                cos_sim = float(F.cosine_similarity(fi.unsqueeze(0),
-                                                    fj.unsqueeze(0)))
-                dist = 1.0 - cos_sim          # 0=identical, 2=opposite; clamp to [0,1]
-                dist = max(0.0, min(dist, 1.0))
-                cos_dist[i][j] = round(dist, 4)
-                off_diag_vals.append(dist)
-
-        mean_dist = float(sum(off_diag_vals) / len(off_diag_vals)) \
-                    if off_diag_vals else 0.0
-        min_dist  = float(min(off_diag_vals)) if off_diag_vals else 0.0
+                sim = float(F.cosine_similarity(
+                    fingerprints[i].unsqueeze(0), fingerprints[j].unsqueeze(0)))
+                off_diag.append(max(0.0, min(1.0 - sim, 1.0)))
 
         return {
-            "output_norms"       : [round(v, 4) for v in output_norms],
-            "pairwise_cos_dist"  : cos_dist,
-            "mean_pairwise_dist" : round(mean_dist, 4),
-            "min_pairwise_dist"  : round(min_dist, 4),
+            "output_norms"      : [round(v, 4) for v in output_norms],
+            "mean_pairwise_dist": round(sum(off_diag) / len(off_diag), 4),
+            "min_pairwise_dist" : round(min(off_diag), 4),
+        }
+
+    # ── Signal 5: activation-space diagnostics ───────────────────────────────
+
+    @torch.no_grad()
+    def get_activation_diagnostics(self, feat):
+        """
+        Signal 5a — Residual/base magnitude ratio per expert.
+        Signal 5b — Pairwise cosine distance between expert outputs (activation space).
+
+        feat : Tensor [N, in_features]  — raw Gabor features (no grad needed).
+        """
+        feat = feat.float()
+        base_out  = self.base(feat)
+        base_norm = float(base_out.norm(dim=1).mean())
+        base_norm_safe = max(base_norm, 1e-8)
+
+        expert_outs    = []
+        residual_norms = []
+        for expert in self.experts:
+            out = expert(feat)
+            expert_outs.append(out)
+            residual_norms.append(float(out.norm(dim=1).mean()))
+
+        # pairwise cosine distance between mean expert output vectors
+        mean_outs = [o.mean(dim=0) for o in expert_outs]
+        n = len(mean_outs)
+        off_diag = []
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                sim = float(F.cosine_similarity(
+                    mean_outs[i].unsqueeze(0), mean_outs[j].unsqueeze(0)))
+                off_diag.append(max(0.0, min(1.0 - sim, 1.0)))
+
+        return {
+            "base_norm"          : round(base_norm, 4),
+            "residual_norms"     : [round(v, 4) for v in residual_norms],
+            "residual_base_ratio": [round(v / base_norm_safe, 4)
+                                    for v in residual_norms],
+            "act_mean_dist"      : round(sum(off_diag) / len(off_diag), 4),
+            "act_min_dist"       : round(min(off_diag), 4),
         }
 
 
 class CompNet(nn.Module):
     """
-    CompNet = CB1 // CB2 // CB3 + FC(9708→512) + Dropout + ArcFace.
+    CompNet = CB1 // CB2 // CB3 + MoEFC(9708->512) + Dropout + ArcFace.
 
-    Optional GRL branch (use_grl=True):
-      emb [B,512] → GRL(λ) → DomainClassifier(512→n_domains) → domain CE loss
-      The reversed gradient pushes the backbone toward domain-invariant features.
-      DomainClassifier is shared via FedAvg (not excluded from get_weights).
-
-    Optional MoE branch (use_moe=True):
-      FC replaced by MoEFC with domain-conditioned residual experts.
-
-    MoE warm-up:
-      set_moe_warmup(True/False) delegates to MoEFC.set_warmup().
-      Called by FLClient.local_train() before each round based on rnd vs
-      moe_warmup_rounds — no change needed elsewhere in training logic.
+    Training  : domain_ids routed asymmetrically — only target expert updated.
+    Inference : get_embedding(x, domain_id) activates base + expert[domain_id].
     """
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25,
@@ -333,23 +353,20 @@ class CompNet(nn.Module):
                                    if use_grl else None)
 
     def set_moe_warmup(self, warmup: bool):
-        """
-        Enable/disable MoE warm-up mode. No-op if use_moe=False.
-        warmup=True  → only base_FC trained; expert params frozen.
-        warmup=False → all MoE params trainable.
-        """
         if self.use_moe:
             self.fc.set_warmup(warmup)
 
     @property
     def moe_is_warming_up(self):
-        """True if MoE experts are currently frozen (warm-up phase)."""
         return self.use_moe and self.fc.is_warming_up
 
-    def _backbone(self, x, domain_ids=None):
-        feat = torch.cat([self.cb1(x).flatten(1),
+    def _gabor_feat(self, x):
+        return torch.cat([self.cb1(x).flatten(1),
                           self.cb2(x).flatten(1),
                           self.cb3(x).flatten(1)], dim=1)   # [B, 9708]
+
+    def _backbone(self, x, domain_ids=None):
+        feat = self._gabor_feat(x)
         if self.use_moe:
             return self.fc(feat, domain_ids)
         return self.fc(feat)
@@ -358,35 +375,36 @@ class CompNet(nn.Module):
         return self.arc(self.drop(self._backbone(x, domain_ids)), y)
 
     @torch.no_grad()
-    def get_embedding(self, x):
-        """L2-normalised 512-d embedding — base FC only (no MoE residual)."""
-        return F.normalize(self._backbone(x, domain_ids=None), p=2, dim=1)
-
-    @torch.no_grad()
-    def get_expert_diagnostics(self):
+    def get_embedding(self, x, domain_id=None):
         """
-        Delegate to MoEFC.get_expert_diagnostics(). Returns None if use_moe=False.
-
-        Diagnostic signals and what to watch for
-        ─────────────────────────────────────────
-        output_norms  : Expert residual magnitude.
-          - All near zero during warm-up (expected — B is zero-initialised).
-          - Should grow after warm-up as experts specialise.
-          - If one expert stays near zero after many post-warmup rounds → dead expert.
-
-        mean_pairwise_dist  : Average cosine distance between expert weight vectors.
-          - Near 0 → experts are identical (collapse) — bad.
-          - Near 1 → experts are fully orthogonal (max specialisation) — ideal.
-          - Values > 0.3 after several post-warmup rounds indicate healthy diversity.
-
-        min_pairwise_dist  : Minimum pairwise distance.
-          - Near 0 → at least one expert pair has collapsed — needs attention.
-          - If consistently below 0.05 after post-warmup round 5+ → consider
-            adding an expert diversity regularisation loss.
+        L2-normalised embedding.
+        domain_id : int  → base + expert[domain_id]   (domain-aware inference)
+                    None → base only                   (domain-unknown fallback)
         """
-        if not self.use_moe:
-            return None
-        return self.fc.get_expert_diagnostics()
+        feat = self._gabor_feat(x)
+        if self.use_moe:
+            emb = self.fc.embed(feat, domain_id)
+        else:
+            emb = self.fc(feat)
+        return F.normalize(emb, p=2, dim=1)
+
+    # ── diagnostic delegation ───────────────────────────────────────────────
+
+    def reset_routing_stats(self):
+        if self.use_moe:
+            self.fc.reset_routing_stats()
+
+    def get_routing_stats(self):
+        return self.fc.get_routing_stats() if self.use_moe else None
+
+    def get_grad_norms(self):
+        return self.fc.get_grad_norms() if self.use_moe else None
+
+    def get_weight_diagnostics(self):
+        return self.fc.get_weight_diagnostics() if self.use_moe else None
+
+    def get_activation_diagnostics(self, probe_feat):
+        return self.fc.get_activation_diagnostics(probe_feat) if self.use_moe else None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -394,10 +412,7 @@ class CompNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class SupConLoss(nn.Module):
-    """
-    Supervised Contrastive Loss (CCNet/loss.py — exact copy).
-    Expects features of shape [batch, n_views, embed_dim].
-    """
+    """Supervised Contrastive Loss. Expects [batch, n_views, embed_dim]."""
     def __init__(self, temperature=0.07, contrast_mode='all',
                  base_temperature=0.07):
         super().__init__()
@@ -448,7 +463,7 @@ class SupConLoss(nn.Module):
 
 
 class CCGaborConv2d(nn.Module):
-    """Learnable Gabor Convolution layer — CCNet version (stride=2, padding)."""
+    """Learnable Gabor Convolution layer — CCNet version."""
     def __init__(self, channel_in, channel_out, kernel_size,
                  stride=1, padding=0, init_ratio=1):
         super().__init__()
@@ -512,12 +527,7 @@ class SELayer(nn.Module):
 
 
 class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
-    """
-    Multi-Order Comprehensive Competition Block (CCNet).
-    1st order: LGC → spatial+channel competition → SE → conv → pool
-    2nd order: LGC(on 1st Gabor) → competition → SE → conv → pool
-    Output: concatenation of 1st and 2nd order flattened features.
-    """
+    """Multi-Order Comprehensive Competition Block (CCNet)."""
     def __init__(self, channel_in, n_competitor, ksize, stride, padding,
                  weight, init_ratio=1, o1=32, o2=12):
         super().__init__()
@@ -527,9 +537,9 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
         self.gabor_conv2d2 = CCGaborConv2d(n_competitor, n_competitor, ksize,
                                            stride=2, padding=ksize//2,
                                            init_ratio=init_ratio)
-        self.argmax   = nn.Softmax(dim=1)   # channel competition
-        self.argmax_x = nn.Softmax(dim=2)   # spatial-x competition
-        self.argmax_y = nn.Softmax(dim=3)   # spatial-y competition
+        self.argmax   = nn.Softmax(dim=1)
+        self.argmax_x = nn.Softmax(dim=2)
+        self.argmax_y = nn.Softmax(dim=3)
         self.conv1_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
         self.conv2_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
         self.maxpool  = nn.MaxPool2d(2, 2)
@@ -539,13 +549,11 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
         self.weight_spa  = (1 - weight) / 2
 
     def forward(self, x):
-        # 1st order
         x = self.gabor_conv2d(x)
         x_1 = self.weight_chan * self.argmax(x) + self.weight_spa * (
               self.argmax_x(x) + self.argmax_y(x))
         x_1 = self.se1(x_1)
         x_1 = self.maxpool(self.conv1_1(x_1))
-        # 2nd order
         x = self.gabor_conv2d2(x)
         x_2 = self.weight_chan * self.argmax(x) + self.weight_spa * (
               self.argmax_x(x) + self.argmax_y(x))
@@ -556,13 +564,7 @@ class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
 
 
 class CCNet(nn.Module):
-    """
-    CCNet = CB1 // CB2 // CB3 + FC(13152→4096→2048) + Dropout + ArcFace.
-    FC input size 13152 is fixed for 128×128 input images.
-
-    forward() returns (logits, normalised_6144d_contrastive_features)
-    get_embedding() returns L2-normalised 2048-d matching embedding.
-    """
+    """CCNet = CB1//CB2//CB3 + FC(13152->4096->2048) + Dropout + ArcFace."""
     def __init__(self, num_classes, comp_weight=0.8, dropout=0.5,
                  arcface_s=30.0, arcface_m=0.50):
         super().__init__()
@@ -580,24 +582,20 @@ class CCNet(nn.Module):
                                          s=arcface_s, m=arcface_m)
 
     def _extract(self, x):
-        x1 = self.cb1(x); x2 = self.cb2(x); x3 = self.cb3(x)
-        return torch.cat((x1, x2, x3), dim=1)
+        return torch.cat((self.cb1(x), self.cb2(x), self.cb3(x)), dim=1)
 
     def forward(self, x, y=None):
         x  = self._extract(x)
         x1 = self.fc(x)
         x  = self.fc1(x1)
-        # 6144-d normalised features for SupConLoss
         fe = F.normalize(torch.cat((x1, x), dim=1), dim=-1)
-        logits = self.arclayer(self.drop(x), y)
-        return logits, fe
+        return self.arclayer(self.drop(x), y), fe
 
     @torch.no_grad()
-    def get_embedding(self, x):
-        """L2-normalised 2048-d embedding for matching."""
-        x  = self._extract(x)
+    def get_embedding(self, x, domain_id=None):
+        """domain_id unused — kept for uniform interface."""
+        x = self._extract(x)
         return F.normalize(self.fc1(self.fc(x)), p=2, dim=1)
-
 
 
 # ══════════════════════════════════════════════════════════════
@@ -605,13 +603,7 @@ class CCNet(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class DINOBackbone(nn.Module):
-    """
-    DINOv2 ViT-S/14 backbone with selective unfreezing.
-    All parameters are frozen except blocks 10 and 11 of the ViT,
-    which are fine-tuned to adapt to palmprint recognition.
-    forward() returns the L2-normalised CLS token (384-d).
-    Requires: torch.hub access to facebookresearch/dinov2
-    """
+    """DINOv2 ViT-S/14 with blocks 10+11 unfrozen."""
     EMBED_DIM = 384
 
     def __init__(self):
@@ -625,23 +617,16 @@ class DINOBackbone(nn.Module):
         self.backbone = backbone
 
     def forward(self, x):
-        """Returns L2-normalised 384-d CLS token."""
         out = self.backbone.forward_features(x)
-        cls = out["x_norm_clstoken"]
-        return F.normalize(cls, p=2, dim=1)
+        return F.normalize(out["x_norm_clstoken"], p=2, dim=1)
 
 
 class LoRAExpert(nn.Module):
-    pass  # kept as placeholder — remove after confirming no external references
+    pass  # placeholder
 
 
 class DINOv2Model(nn.Module):
-    """
-    DINOv2 FL model = DINOBackbone + ArcFace.
-    backbone(x) → L2-normalised 384-d CLS token → ArcFace → logits.
-    Weight sharing: backbone.* via FedAvg; arc.* kept local.
-    Input: RGB 224×224 with ImageNet normalisation.
-    """
+    """DINOv2 FL model = DINOBackbone + ArcFace."""
     def __init__(self, num_classes, arcface_s=16.0, arcface_m=0.30):
         super().__init__()
         self.backbone = DINOBackbone()
@@ -652,8 +637,7 @@ class DINOv2Model(nn.Module):
         return self.arc(self.backbone(x), y)
 
     @torch.no_grad()
-    def get_embedding(self, x):
-        """L2-normalised 384-d CLS embedding."""
+    def get_embedding(self, x, domain_id=None):
         return self.backbone(x)
 
 
@@ -662,7 +646,6 @@ class DINOv2Model(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 def build_model(cfg, num_classes):
-    """Instantiate and return the model specified in cfg["model"]."""
     name = cfg["model"].strip().lower()
     if name == "compnet":
         return CompNet(
