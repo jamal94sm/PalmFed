@@ -1,858 +1,497 @@
-# ==============================================================
-#  main.py — FLClient, FLServer, and federated training loop
-# ==============================================================
-#
-#  Two global models (MoE mode):
-#
-#  GlobalBase  — shared base_expert (FedAvg only).
-#                Used for domain-unknown evaluation.
-#                get_embedding(x, domain_id=None)
-#
-#  GlobalFull  — shared base_expert + all n_clients domain_experts stacked.
-#                After each round the server collects each client's
-#                domain_gabor branches, stores them indexed by
-#                client_id, then evaluates with:
-#                  for sample with domain_id=k:
-#                    emb = base(x) + gate_k * domain_expert_k(x)
-#                Routing is deterministic by domain label — no learned router.
-#                get_embedding(x, domain_id=k) via
-#                get_embedding_with_external_expert(x, domain_experts[k],
-#                                                   domain_gabors[k])
-# ==============================================================
+"""
+main.py — TENT Test-Time Adaptation.
 
-import os
-import time
-import random
-import pickle
-import warnings
+CASIA-MS open-set verification pipeline:
+  Phase 1: Train backbone (25%) + head_A on train_spectrums × train_IDs
+  Phase 2: Freeze backbone. Train head_B on train_spectrums × test_IDs
+  Phase 3: Baseline eval: backbone + head_B on test_spectrums × test_IDs
+  Phase 4: TENT: adapt BN on test_spectrums × test_IDs
+  Phase 5: Post-TENT eval on test_spectrums × test_IDs
+
+ImageNet-C classification:
+  Standard TENT on each corruption.
+"""
+
+import os, json, time, random
 import numpy as np
-from PIL import Image
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
-warnings.filterwarnings("ignore")
+from config import get_cfg, CASIA_ORACLE_LOOKUP, CASIA_ORACLE_DOMAINS
+from backbones import build_model, ArcFaceHead, ArcFaceModel
+import tent
+from datasets import (
+    get_imagenet_c_loaders, get_casia_ms_train_test,
+    split_gallery_probe, extract_embeddings, evaluate_verification,
+)
 
-from configs  import CONFIG
-from models   import build_model
-from datasets import (PalmDataset, AugmentedDataset,
-                      PairedDataset, FFTAugmentedDataset,
-                      EvalDatasetDINO, get_federated_splits)
-from utils    import (extract_style_template, evaluate_model,
-                      extract_features_dual,
-                      train_compnet_epoch, train_ccnet_epoch,
-                      CenterLoss)
 
-
-# ══════════════════════════════════════════════════════════════
-#  EVAL DATASET HELPER
-# ══════════════════════════════════════════════════════════════
-
-def make_eval_dataset(samples, cfg):
-    if cfg["model"].strip().lower() == "dinov2":
-        return EvalDatasetDINO(samples, cfg.get("dino_img_side", 224))
-    return PalmDataset(samples, cfg["img_side"])
-
-
-# ══════════════════════════════════════════════════════════════
-#  DIAGNOSTIC PRINTER
-# ══════════════════════════════════════════════════════════════
-
-def _fmt(v, width=8, dec=4):
-    if v is None: return " " * width
-    return f"{v:.{dec}f}".rjust(width)
-
-def print_moe_diagnostics(rnd, client_records, warmup_active):
-    """
-    Structured diagnostic block printed once per round.
-
-    client_records : list of dicts, one per client:
-      client_id, spectrum, weight_diag, act_diag, grad_norms,
-      routing, warmup
-
-    Signals reported
-    ────────────────
-    S1  base_weight_norm   — shared base_expert weight magnitude
-    S2  domain_weight_norm — local domain_expert B-weight magnitude
-    S3  gate_value         — current effective gate (sigmoid*scale)
-    S4  routing real/skip  — real samples vs FFT-sentinel samples this epoch
-    S5  grad norms         — base, domain_expert, gate after last batch
-    S6  gated_base_ratio   — ||gate*domain_expert(x)|| / ||base(x)||
-    S7  base_full_cos_sim  — cosine between base-only and full embeddings
-                             (1 = domain_expert adds nothing,
-                              0 = 90° correction = strong specialisation)
-    """
-    phase = "WARMUP" if warmup_active else "ACTIVE"
-    sep   = "─" * 74
-
-    # Guard: if weight_diag has old-format keys (from a stale models.py),
-    # skip the block rather than crashing with a KeyError.
-    if client_records:
-        wd0 = client_records[0].get("weight_diag") or {}
-        if wd0 and "output_norms" in wd0:
-            print(f"  [MoE diag] WARNING: stale models.py detected "
-                  f"(old MoEFC keys). Replace models.py and restart.")
-            return
-
-    print(f"\n  ┌─ MoE [{phase}] · Rnd {rnd:04d} " + "─" * 46 + "┐")
-
-    # ── S1-S3: weight norms and gate ────────────────────────────────────────
-    print(f"  │  [S1-S3] Weight norms & gate values")
-    print(f"  │   Clt  Spectrum   BaseNorm  DomNorm   Gate")
-    for r in client_records:
-        wd = r["weight_diag"]
-        if wd:
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}  "
-                  f"{_fmt(wd['base_weight_norm'],9,4)}"
-                  f"{_fmt(wd['domain_weight_norm'],9,4)}"
-                  f"{_fmt(wd['gate_value'],7,4)}")
-        else:
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}  (warmup)")
-
-    # ── S4: routing ──────────────────────────────────────────────────────────
-    print(f"  │  {sep}")
-    print(f"  │  [S4] Routing  (real=domain_expert updated · skip=base only)")
-    print(f"  │   Clt  Spectrum    Real    Skip   Real%")
-    for r in client_records:
-        rt = r["routing"]
-        if rt:
-            real = rt["real"]; skip = rt["skip"]
-            total = real + skip
-            pct   = 100.0 * real / total if total > 0 else 0.0
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}"
-                  f"  {real:6d}  {skip:6d}  {pct:5.1f}%")
-        else:
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}  (warmup)")
-
-    # ── S5: gradient norms ───────────────────────────────────────────────────
-    print(f"  │  {sep}")
-    print(f"  │  [S5] Gradient norms  (last batch)")
-    print(f"  │   Clt  Spectrum    BaseGrad  DomGrad   GateGrad")
-    for r in client_records:
-        gn = r["grad_norms"]
-        if gn:
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}  "
-                  f"{_fmt(gn['base_grad_norm'],9,4)}"
-                  f"{_fmt(gn['domain_grad_norm'],9,4)}"
-                  f"{_fmt(gn['gate_grad_norm'],9,4)}")
-        else:
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}  (warmup)")
-
-    # ── S6-S7: activation diagnostics ────────────────────────────────────────
-    print(f"  │  {sep}")
-    print(f"  │  [S6-S7] Activation space  "
-          f"(GatedRatio=||gated_res||/||base||  CosSim=base·full)")
-    print(f"  │   Clt  Spectrum   BaseNorm  DomNorm   GatedRat  Gate     CosSim")
-    for r in client_records:
-        ad = r["act_diag"]
-        if ad:
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}  "
-                  f"{_fmt(ad['base_norm'],9,3)}"
-                  f"{_fmt(ad['domain_gated_norm'],9,4)}"
-                  f"{_fmt(ad['gated_base_ratio'],9,4)}"
-                  f"{_fmt(ad['gate_value'],8,4)}"
-                  f"{_fmt(ad['base_full_cos_sim'],8,4)}")
-        else:
-            print(f"  │   C{r['client_id']}  {r['spectrum']:>8s}  (warmup)")
-
-    # ── summary ──────────────────────────────────────────────────────────────
-    print(f"  │  {sep}")
-    print(f"  │  [SUMMARY]")
-    act_diags = [r["act_diag"] for r in client_records if r["act_diag"]]
-    if act_diags:
-        avg_ratio  = sum(a["gated_base_ratio"]    for a in act_diags) / len(act_diags)
-        avg_cos    = sum(a["base_full_cos_sim"]    for a in act_diags) / len(act_diags)
-        avg_gate   = sum(a["gate_value"]           for a in act_diags) / len(act_diags)
-        print(f"  │   ExpertWeight (fixed)  : {avg_gate:.4f}")
-        print(f"  │   Avg feat-corr/feat    : {avg_ratio:.4f}"
-              f"  (>0.1 = meaningful feature correction)")
-        print(f"  │   Avg base·full CosSim  : {avg_cos:.4f}"
-              f"  (<0.99 = domain_expert shifting embedding direction)")
-        recon_vals = [r.get("recon_loss") for r in client_records
-                      if r.get("recon_loss") is not None]
-        if recon_vals:
-            avg_r = sum(recon_vals) / len(recon_vals)
-            print(f"  │   Avg domain recon loss : {avg_r:.6f}"
-                  f"  (decreasing = domain_expert learning domain signal)")
-        if not warmup_active and avg_ratio < 0.05:
-            print(f"  │   ⚠ feature correction very small — "
-                  f"consider larger moe_expert_weight")
-    print(f"  └" + "─" * 73 + "┘")
-
-
-# ══════════════════════════════════════════════════════════════
-#  FL CLIENT
-# ══════════════════════════════════════════════════════════════
-
-class FLClient:
-    """
-    One federated learning client.
-
-    Weight management
-    ─────────────────
-    get_weights() returns only FedAvg-eligible keys:
-      fc.base_expert.* and all Gabor/CB parameters.
-    Excludes: arc.*, cb1d.*, cb2d.*, cb3d.*
-
-    set_weights() loads only FedAvg weights, preserving local keys unchanged.
-
-    domain_gabor branches accumulate across ALL rounds without reset.
-    """
-
-    def __init__(self, client_id, spectrum, train_samples, label_map,
-                 num_classes, cfg, device):
-        self.client_id     = client_id
-        self.spectrum      = spectrum
-        self.train_samples = train_samples
-        self.label_map     = label_map
-        self.num_classes   = num_classes
-        self.cfg           = cfg
-        self.device        = device
-
-        self.model = build_model(cfg, num_classes).to(device)
-
-        model_name = cfg["model"].strip().lower()
-        if cfg.get("use_center_loss", False):
-            embed_dim = (cfg["embedding_dim"] if model_name == "compnet"
-                         else 2048 if model_name == "ccnet" else 384)
-            self.center_loss      = CenterLoss(num_classes, embed_dim, device)
-            self.center_optimizer = optim.SGD(
-                self.center_loss.parameters(),
-                lr=cfg.get("center_loss_lr", 0.5))
-        else:
-            self.center_loss = None; self.center_optimizer = None
-
-        # fixed probe Gabor features for activation diagnostics
-        self.probe_feat = None
-
-        print(f"  Client {client_id} [{spectrum}] [{cfg['model']}] — "
-              f"train IDs: {num_classes}  samples: {len(train_samples)}")
-
-    # ── weight management ───────────────────────────────────────────────────
-
-    def get_weights(self):
-        """
-        FedAvg-eligible weights only:  fc.base_expert.* + Gabor/CB params.
-        Local-only keys excluded:      arc.*, cb1d.*, cb2d.*, cb3d.*
-        """
-        excl = self.model.local_only_keys() \
-               if hasattr(self.model, "local_only_keys") else ("arc.",)
-        return {k: v.cpu().clone()
-                for k, v in self.model.state_dict().items()
-                if not any(k.startswith(p) for p in excl)}
-
-    def set_weights(self, backbone_state_dict):
-        """Load FedAvg weights; local-only keys preserved unchanged."""
-        local_state = self.model.state_dict()
-        for key, val in backbone_state_dict.items():
-            if key in local_state and local_state[key].shape == val.shape:
-                local_state[key] = val.clone()
-        self.model.load_state_dict(local_state)
-
-    def get_domain_expert_state(self):
-        """
-        Return cb1d/cb2d/cb3d state dicts and expert_weight for GlobalFull.
-        Used by FLServer to assemble GlobalFull after each round.
-        Returns dict with cb1d/cb2d/cb3d state dicts and expert_weight.
-        """
-        if not (hasattr(self.model, "use_moe") and self.model.use_moe):
-            return None
-        return {
-            "cb1d_state"   : {k: v.cpu().clone() for k,v in self.model.cb1d.state_dict().items()},
-            "cb2d_state"   : {k: v.cpu().clone() for k,v in self.model.cb2d.state_dict().items()},
-            "cb3d_state"   : {k: v.cpu().clone() for k,v in self.model.cb3d.state_dict().items()},
-            "expert_weight": self.model.expert_weight,
-            "client_id"    : self.client_id,
-        }
-
-    # ── probe feature extraction ────────────────────────────────────────────
-
-    @torch.no_grad()
-    def _build_probe_feat(self, n=64):
-        subset = self.train_samples[:n]
-        ds     = PalmDataset(subset, self.cfg["img_side"])
-        loader = DataLoader(ds, batch_size=n, shuffle=False, num_workers=0)
-        imgs, _ = next(iter(loader))
-        self.probe_feat = imgs.cpu()   # store images; moved to device in diagnostics
-
-    # ── local training ──────────────────────────────────────────────────────
-
-    def local_train(self, local_epochs, active_style_bank, M, rnd,
-                    mean_bank=None):
-        model_name    = self.cfg["model"].strip().lower()
-        is_dino       = model_name == "dinov2"
-        img_side      = self.cfg.get("dino_img_side", 224) if is_dino \
-                        else self.cfg["img_side"]
-        grayscale     = not is_dino
-
-        use_moe       = self.cfg.get("use_moe", False) and model_name == "compnet"
-        warmup_rounds = self.cfg.get("moe_warmup_rounds", 0)
-        warmup_active = use_moe and (warmup_rounds > 0) and (rnd <= warmup_rounds)
-        if use_moe:
-            self.model.set_moe_warmup(warmup_active)
-
-        if use_moe and not warmup_active:
-            self.model.reset_routing_stats()
-
-        if model_name in ("compnet", "dinov2"):
-            if active_style_bank and M > 1:
-                dataset = FFTAugmentedDataset(
-                    samples              = self.train_samples,
-                    style_bank           = active_style_bank,
-                    client_id            = self.client_id,
-                    M                    = M,
-                    beta                 = self.cfg["fft_beta"],
-                    img_side             = img_side,
-                    grayscale            = grayscale,
-                    mean_bank            = mean_bank
-                                           if self.cfg.get("domain_aware_mixing", False)
-                                           else None,
-                    prefer_distant       = self.cfg.get("prefer_distant_domain", True),
-                    use_mean_template    = self.cfg.get("use_mean_template", False),
-                    deterministic_donors = False,
-                )
-            else:
-                dataset = AugmentedDataset(self.train_samples, img_side,
-                                           grayscale=grayscale,
-                                           client_id=self.client_id)
-        elif model_name == "ccnet":
-            dataset = PairedDataset(
-                samples=self.train_samples, img_side=img_side,
-                style_bank=active_style_bank,
-                client_id=self.client_id, beta=self.cfg["fft_beta"])
-        else:
-            raise ValueError(f"Unknown model: '{self.cfg['model']}'")
-
-        round_seed = self.cfg["random_seed"] + rnd * 1000 + self.client_id
-        train_loader = DataLoader(
-            dataset, batch_size=self.cfg["batch_size"], shuffle=True,
-            num_workers=self.cfg["num_workers"], pin_memory=True,
-            worker_init_fn=lambda wid, s=round_seed: (
-                np.random.seed(s+wid), random.seed(s+wid),
-                torch.manual_seed(s+wid)),
-        )
-
-        criterion = nn.CrossEntropyLoss()
-        is_dino_opt = model_name == "dinov2"
-        if is_dino_opt:
-            optimizer = optim.AdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=self.cfg["lr"],
-                weight_decay=self.cfg.get("dino_weight_decay", 1e-4))
-        else:
-            optimizer = optim.Adam(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=self.cfg["lr"])
-
-        lambda_c = (self.cfg.get("center_loss_weight", 0.0)
-                    if self.cfg.get("use_center_loss", False) else 0.0)
-
-        avg_loss, accuracy, last_grad_norms = 0.0, 0.0, None
-        for _ in range(local_epochs):
-            if model_name in ("compnet", "dinov2"):
-                avg_loss, accuracy, last_grad_norms, avg_recon = train_compnet_epoch(
-                    self.model, train_loader, criterion, optimizer, self.device,
-                    center_loss        = self.center_loss,
-                    center_optimizer   = self.center_optimizer,
-                    lambda_center      = lambda_c,
-                    lambda_style       = self.cfg.get("lambda_style", 0.0),
-                    lambda_grl         = self.cfg.get("lambda_grl", 0.0)
-                                         if self.cfg.get("use_grl", False) else 0.0,
-                    lambda_supcon      = self.cfg.get("lambda_supcon", 0.0)
-                                         if self.cfg.get("use_supcon", False) else 0.0,
-                    temperature        = self.cfg.get("temperature", 0.07),
-                    collect_grad_norms  = use_moe and not warmup_active,
-                    lambda_domain_recon = self.cfg.get("lambda_domain_recon", 0.0)
-                                          if use_moe and not warmup_active else 0.0,
-                )
-            elif model_name == "ccnet":
-                avg_loss, accuracy, _, avg_recon = train_ccnet_epoch(
-                    self.model, train_loader, criterion, optimizer, self.device,
-                    ce_weight=self.cfg.get("ce_weight", 0.8),
-                    con_weight=self.cfg.get("con_weight", 0.2),
-                    temperature=self.cfg.get("temperature", 0.07),
-                    center_loss=self.center_loss,
-                    center_optimizer=self.center_optimizer,
-                    lambda_center=lambda_c)
-
-        # ── collect diagnostics ──────────────────────────────────────────────
-        diags = None
-        if use_moe:
-            if not warmup_active and self.probe_feat is None:
-                self._build_probe_feat()
-            diags = {
-                "weight_diag": self.model.get_weight_diagnostics(),
-                "act_diag"   : (self.model.get_activation_diagnostics(self.probe_feat)
-                                if self.probe_feat is not None else None),
-                "grad_norms" : last_grad_norms,
-                "routing"    : (self.model.get_routing_stats()
-                                if not warmup_active else None),
-                "recon_loss" : avg_recon if not warmup_active else None,
-                "warmup"     : warmup_active,
-            }
-
-        return avg_loss, accuracy, warmup_active, diags
-
-    # ── style template extraction ───────────────────────────────────────────
-
-    def extract_style_templates(self):
-        model_name = self.cfg["model"].strip().lower()
-        is_dino    = model_name == "dinov2"
-        img_side   = self.cfg.get("dino_img_side", 224) if is_dino \
-                     else self.cfg["img_side"]
-        mode = "RGB" if is_dino else "L"
-        templates = []
-        for path, _ in self.train_samples:
-            img    = Image.open(path).convert(mode).resize(
-                (img_side, img_side), Image.BILINEAR)
-            img_np = np.array(img, dtype=np.float32) / 255.0
-            templates.append(extract_style_template(img_np))
-        print(f"  Client {self.client_id} [{self.spectrum}] "
-              f"— extracted {len(templates)} style templates")
-        return templates
-
-
-# ══════════════════════════════════════════════════════════════
-#  FL SERVER  (two global models)
-# ══════════════════════════════════════════════════════════════
-
-class FLServer:
-    """
-    Central server managing two global models.
-
-    GlobalBase  — base_expert only (FedAvg of fc.base_expert.*).
-                  Evaluated with domain_id=None.
-
-    GlobalFull  — base_expert + all n_clients domain_experts stacked.
-                  Assembled each round after receiving client domain states.
-                  Routing at inference: domain_id=k → use client_k's expert.
-                  Evaluated via extract_features_dual() in utils.py.
-    """
-
-    def __init__(self, num_classes, gallery_samples, probe_samples,
-                 cfg, device, n_clients):
-        self.cfg       = cfg
-        self.device    = device
-        self.n_clients = n_clients
-
-        # GlobalBase model
-        self.global_model = build_model(cfg, num_classes).to(device)
-
-        # Domain gabor registry: client_id → {cb1d/cb2d/cb3d states}
-        # Populated each round by collect_domain_experts()
-        self.domain_expert_registry = {}
-
-        self.gallery_samples = gallery_samples
-        self.probe_samples   = probe_samples
-
-        self.gallery_loader = DataLoader(
-            make_eval_dataset(gallery_samples, cfg),
-            batch_size=cfg["batch_size"], shuffle=False,
-            num_workers=cfg["num_workers"], pin_memory=True)
-        self.probe_loader = DataLoader(
-            make_eval_dataset(probe_samples, cfg),
-            batch_size=cfg["batch_size"], shuffle=False,
-            num_workers=cfg["num_workers"], pin_memory=True)
-
-        use_moe = cfg.get("use_moe", False) and cfg["model"].strip().lower() == "compnet"
-        if use_moe:
-            self.gallery_domain_ids = [s[2] for s in gallery_samples
-                                       if len(s) >= 3]
-            self.probe_domain_ids   = [s[2] for s in probe_samples
-                                       if len(s) >= 3]
-            if len(self.gallery_domain_ids) != len(gallery_samples):
-                self.gallery_domain_ids = None
-            if len(self.probe_domain_ids) != len(probe_samples):
-                self.probe_domain_ids = None
-        else:
-            self.gallery_domain_ids = None
-            self.probe_domain_ids   = None
-
-        print(f"  Server [{cfg['model']}] — "
-              f"gallery: {len(gallery_samples)}  probe: {len(probe_samples)}"
-              + ("  [GlobalBase + GlobalFull]" if use_moe else ""))
-
-    def get_global_weights(self):
-        """FedAvg-eligible weights from GlobalBase model."""
-        excl = self.global_model.local_only_keys() \
-               if hasattr(self.global_model, "local_only_keys") else ("arc.",)
-        return {k: v.cpu().clone()
-                for k, v in self.global_model.state_dict().items()
-                if not any(k.startswith(p) for p in excl)}
-
-    def aggregate(self, client_weight_dicts):
-        """FedAvg on base_expert + Gabor params."""
-        n        = len(client_weight_dicts)
-        avg_dict = {}
-        for key in client_weight_dicts[0].keys():
-            stacked      = torch.stack(
-                [client_weight_dicts[i][key].float() for i in range(n)], dim=0)
-            avg_dict[key] = stacked.mean(dim=0)
-        gs = self.global_model.state_dict()
-        gs.update(avg_dict)
-        self.global_model.load_state_dict(gs)
-
-    def collect_domain_experts(self, client_domain_states):
-        """
-        Store each client's domain_gabor branch states for GlobalFull assembly.
-        Called after local training, before GlobalFull evaluation.
-
-        client_domain_states : list of dicts from client.get_domain_expert_state()
-        """
-        self.domain_expert_registry = {}
-        for state in client_domain_states:
-            if state is not None:
-                cid = state["client_id"]
-                self.domain_expert_registry[cid] = {
-                    "cb1d_state"   : state["cb1d_state"],
-                    "cb2d_state"   : state["cb2d_state"],
-                    "cb3d_state"   : state["cb3d_state"],
-                    "expert_weight": state.get("expert_weight", 0.5),
-                }
-
-    def evaluate_base(self, use_whitening=False, warmup_active=False):
-        """Evaluate GlobalBase (base_expert only, domain_id=None)."""
-        return evaluate_model(
-            self.global_model,
-            self.gallery_loader, self.probe_loader, self.device,
-            use_whitening      = use_whitening,
-            gallery_domain_ids = None,
-            probe_domain_ids   = None)
-
-    def evaluate_full(self, use_whitening=False):
-        """
-        Evaluate GlobalFull.
-        For each sample with domain_id=k, uses:
-          global_model.base_expert(feat) + gate_k * domain_expert_k(feat)
-        where gate_k and domain_expert_k come from client k's local state.
-        """
-        if not self.domain_expert_registry:
-            return None, None
-        return extract_features_dual(
-            base_model          = self.global_model,
-            gallery_loader      = self.gallery_loader,
-            probe_loader        = self.probe_loader,
-            device              = self.device,
-            gallery_domain_ids  = self.gallery_domain_ids,
-            probe_domain_ids    = self.probe_domain_ids,
-            domain_expert_registry = self.domain_expert_registry,
-            use_whitening       = use_whitening,
-        )
-
-
-# ══════════════════════════════════════════════════════════════
-#  AUGMENTATION HELPERS
-# ══════════════════════════════════════════════════════════════
-
-def resolve_aug_mode(cfg):
-    if cfg.get("use_mixed_aug", False): return "mixed"
-    if cfg.get("use_fft_aug",   False): return "fft"
-    return "spatial"
-
-def get_active_style_bank(style_bank_full, rnd, cfg, is_dinov2):
-    mode = resolve_aug_mode(cfg)
-    if mode == "spatial": return {}
-    if mode == "fft":     return style_bank_full
-    switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
-    return style_bank_full if rnd > switch else {}
-
-def aug_mode_label(rnd, cfg, is_dinov2):
-    mode = resolve_aug_mode(cfg)
-    if mode == "spatial": return "Spatial"
-    if mode == "fft":     return "FFT"
-    switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
-    return "FFT" if rnd > switch else "Spatial"
-
-
-# ══════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════
-
-def main():
-    cfg  = CONFIG
-    seed = cfg["random_seed"]
+def set_seed(seed):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
 
-    device     = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    base_dir   = cfg["base_results_dir"]
-    is_dinov2  = cfg["model"].strip().lower() == "dinov2"
-    aug_mode   = resolve_aug_mode(cfg)
-    use_moe    = cfg.get("use_moe", False) and cfg["model"].strip().lower() == "compnet"
-    warmup_rds = cfg.get("moe_warmup_rounds", 0) if use_moe else 0
-    os.makedirs(base_dir, exist_ok=True)
 
-    print(f"\n{'='*62}")
-    print(f"  Federated Learning — Palmprint")
-    print(f"  Dataset  : {cfg['dataset'].upper()}")
-    print(f"  Model    : {cfg['model'].upper()}")
-    print(f"  Device   : {device}")
-    print(f"  Rounds   : {cfg['n_rounds']}   "
-          f"Local epochs: {cfg['local_epochs']}")
-    if aug_mode == "mixed":
-        switch = cfg.get("mixed_aug_round", cfg["n_rounds"] // 2)
-        print(f"  Aug mode : MIXED  (Spatial rds 1–{switch}, "
-              f"FFT rds {switch+1}–{cfg['n_rounds']})")
-    else:
-        print(f"  Aug mode : {aug_mode.upper()}   M={cfg['M']}  β={cfg['fft_beta']}")
-    if use_moe:
-        gmode = cfg.get("moe_gate_mode", "scalar")
-        ginit = cfg.get("moe_gate_init", 1.0)
-        gscal = cfg.get("moe_gate_scale", 2.0)
-        wstr  = (f"warmup rds 1–{warmup_rds}" if warmup_rds > 0
-                 else "no warmup")
-        print(f"  MoE      : DualBranchGabor  gate={gmode}(init={ginit},max={gscal})")
-        print(f"             base_expert: FedAvg'd | "
-              f"domain_expert+gate: local-only ({wstr})")
-        print(f"  Eval     : GlobalBase (base only)  +  "
-              f"GlobalFull (base + domain_expert[k])")
-    print(f"{'='*62}\n")
+# ══════════════════════════════════════════════════════════════
+#  Helpers
+# ══════════════════════════════════════════════════════════════
 
-    # ── data splits ───────────────────────────────────────────────────────────
-    dataset_key       = cfg["dataset"].strip().lower()
-    model_key         = cfg["model"].strip().lower()
-    splits_path       = cfg["splits_path"].format(dataset=dataset_key)
-    init_weights_path = cfg["init_weights_path"].format(
-                            dataset=dataset_key, model=model_key)
+def eval_test_spectrums(model, test_loaders, cfg, tag=""):
+    """Evaluate EER + Rank-1 on each test spectrum."""
+    was_training = model.training
+    model.eval()
+    results = {}
+    for sname, loader, ds in test_loaders:
+        gallery_idx, probe_idx = split_gallery_probe(
+            ds, cfg.gallery_ratio, cfg.seed)
+        all_idx = list(range(len(ds)))
+        feats, labels = extract_embeddings(
+            model, ds, all_idx, cfg.batch_size, cfg.device, cfg.num_workers)
+        feats_t = feats.to(cfg.device)
+        ver = evaluate_verification(feats_t, labels, gallery_idx, probe_idx)
+        results[sname] = ver
+        print(f"  {tag}{sname:>6s} → EER: {ver['eer']:.2f}% | "
+              f"Rank-1: {ver['rank1']:.2f}% | "
+              f"Gal: {ver['n_gallery']} | Probe: {ver['n_probe']}")
+    mean_eer = np.mean([r['eer'] for r in results.values()])
+    mean_r1 = np.mean([r['rank1'] for r in results.values()])
+    print(f"  {tag}Mean EER: {mean_eer:.2f}% | Mean Rank-1: {mean_r1:.2f}%")
+    if was_training:
+        model.train()
+    return results
 
-    os.makedirs(os.path.dirname(splits_path), exist_ok=True)
-    if os.path.exists(splits_path):
-        print(f"Loading splits from: {splits_path}")
-        with open(splits_path, "rb") as f:
-            splits = pickle.load(f)
-    else:
-        print(f"Building splits for {cfg['dataset'].upper()} …")
-        splits = get_federated_splits(cfg, seed=seed)
-        with open(splits_path, "wb") as f:
-            pickle.dump(splits, f)
-        print(f"  Splits saved.")
 
-    client_data, gallery_samples, probe_samples, test_label_map, domain_names = splits
-    num_classes = client_data[0]["num_classes"]
-    n_clients   = len(client_data)
-    print(f"  Clients: {n_clients}  {domain_names}")
-    print(f"  IDs/client: {num_classes}  |  Test classes: {len(test_label_map)}")
-    print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}\n")
+def train_arcface(model, train_loader, train_params, cfg, epochs, tag,
+                  test_loaders=None, ckpt_path=None, lr=None):
+    """Generic ArcFace training loop. Returns best checkpoint path."""
+    lr = lr or cfg.arcface_lr
+    optimizer = torch.optim.AdamW(train_params, lr=lr,
+                                   weight_decay=cfg.arcface_wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6)
+    ce_loss = nn.CrossEntropyLoss()
 
-    # ── server + clients ──────────────────────────────────────────────────────
-    print("Initialising server …")
-    server = FLServer(num_classes, gallery_samples, probe_samples,
-                      cfg, device, n_clients)
+    best_rank1 = 0.0
+    model.train()
 
-    print("Initialising clients …")
-    clients = [FLClient(
-        client_id=i, spectrum=cd["spectrum"],
-        train_samples=cd["train_samples"], label_map=cd["label_map"],
-        num_classes=num_classes, cfg=cfg, device=device)
-        for i, cd in enumerate(client_data)]
-    cfg["_n_clients"] = list(range(n_clients))
+    for epoch in range(1, epochs + 1):
+        ep_loss = 0.0; ep_corr = 0; ep_tot = 0
 
-    # ── init weights ──────────────────────────────────────────────────────────
-    if os.path.exists(init_weights_path):
-        _probe    = torch.load(init_weights_path, map_location="cpu")
-        _ckpt_arc = _probe.get("arc.weight", None)
-        _mod_arc  = server.global_model.state_dict()["arc.weight"]
-        if _ckpt_arc is None or _ckpt_arc.shape != _mod_arc.shape:
-            print("Init weights shape mismatch — regenerating.")
-            os.remove(init_weights_path)
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(cfg.device), labels.to(cfg.device)
+            optimizer.zero_grad()
+            logits = model.train_forward(imgs, labels)
+            loss = ce_loss(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(train_params, 5.0)
+            optimizer.step()
 
-    if os.path.exists(init_weights_path):
-        print(f"Loading initial weights from: {init_weights_path}")
-        init_state = torch.load(init_weights_path, map_location=device)
-        server.global_model.load_state_dict(init_state, strict=False)
-        backbone_init = server.get_global_weights()
-        for client in clients:
-            client.set_weights(backbone_init)
-        print("  Loaded.")
-    else:
-        print(f"Saving initial weights to: {init_weights_path}")
-        torch.save(server.global_model.state_dict(), init_weights_path)
-        backbone_init = server.get_global_weights()
-        for client in clients:
-            client.set_weights(backbone_init)
-        print("  Saved.")
+            ep_loss += loss.item()
+            with torch.no_grad():
+                ep_corr += (logits.argmax(1) == labels).sum().item()
+                ep_tot += labels.shape[0]
 
-    # ── results file ──────────────────────────────────────────────────────────
-    results_path  = os.path.join(base_dir, "results.txt")
-    client_header = "\t".join(
-        f"C{i}_EER\tC{i}_R1" for i in range(n_clients))
-    with open(results_path, "w") as f:
-        f.write(f"Rnd\tAug\t"
-                f"Base_EER\tBase_R1\tFull_EER\tFull_R1\t"
-                f"{client_header}\n")
-
-    # ── style templates ───────────────────────────────────────────────────────
-    print("\nExtracting style templates …")
-    style_bank_full = {c.client_id: c.extract_style_templates()
-                       for c in clients}
-    mean_bank_full  = {cid: np.mean(tmpl, axis=0)
-                       for cid, tmpl in style_bank_full.items()
-                       if len(tmpl) > 0}
-    total = sum(len(v) for v in style_bank_full.values())
-    print(f"  {total} templates across {len(style_bank_full)} clients\n")
-
-    use_whitening = cfg.get("use_whitening", False)
-
-    # ── Round 0 ───────────────────────────────────────────────────────────────
-    print("─" * 62)
-    print("  Round 0 (random init)")
-    g_eer_b, g_r1_b = server.evaluate_base(use_whitening=use_whitening,
-                                            warmup_active=True)
-    print(f"  GlobalBase  → EER={g_eer_b*100:.4f}%  Rank-1={g_r1_b:.2f}%")
-    print("─" * 62)
-    with open(results_path, "a") as f:
-        f.write(f"0\tInit\t{g_eer_b*100:.4f}\t{g_r1_b:.2f}\t-\t-\t"
-                + "\t".join("-\t-" for _ in range(n_clients)) + "\n")
-
-    recent_base = []; recent_full = []
-
-    # ── FL rounds ─────────────────────────────────────────────────────────────
-    for rnd in range(1, cfg["n_rounds"] + 1):
-        t_start = time.time()
-
-        active_style_bank = get_active_style_bank(
-            style_bank_full, rnd, cfg, is_dinov2)
-        mode_label = aug_mode_label(rnd, cfg, is_dinov2)
-        rnd_warmup = use_moe and warmup_rds > 0 and rnd <= warmup_rds
-
-        if use_moe and warmup_rds > 0:
-            if rnd == 1:
-                print(f"\n  ► MoE WARMUP START: rds 1–{warmup_rds} "
-                      f"(base_expert only, domain_expert frozen)")
-            elif rnd == warmup_rds + 1:
-                print(f"\n  ► MoE WARMUP END: rd {rnd} "
-                      f"— domain_expert + gate now training")
-
-        global_weights         = server.get_global_weights()
-        client_weights         = []
-        client_metrics         = []
-        client_diag_records    = []
-        client_domain_states   = []
-
-        # ── local training ────────────────────────────────────────────────────
-        for client in clients:
-            client.set_weights(global_weights)
-            loss, acc, warmup_active, diags = client.local_train(
-                cfg["local_epochs"], active_style_bank, cfg["M"], rnd,
-                mean_bank=mean_bank_full
-                          if cfg.get("domain_aware_mixing", False) else None)
-
-            # evaluate local model (base only during warmup)
-            gal_ids = (None if warmup_active else server.gallery_domain_ids)
-            prb_ids = (None if warmup_active else server.probe_domain_ids)
-            c_eer, c_rank1 = evaluate_model(
-                client.model,
-                server.gallery_loader, server.probe_loader, device,
-                use_whitening      = use_whitening,
-                gallery_domain_ids = gal_ids,
-                probe_domain_ids   = prb_ids)
-
-            client_weights.append(client.get_weights())
-            client_domain_states.append(client.get_domain_expert_state())
-
-            client_metrics.append({
-                "client_id" : client.client_id,
-                "spectrum"  : client.spectrum,
-                "loss"      : round(loss, 4),
-                "acc"       : round(acc, 1),
-                "eer"       : round(c_eer, 6),
-                "rank1"     : round(c_rank1, 2),
-            })
-            if use_moe and diags is not None:
-                client_diag_records.append({
-                    "client_id": client.client_id,
-                    "spectrum" : client.spectrum,
-                    **diags,
-                })
-
-        # ── FedAvg (base_expert only) + collect domain experts ───────────────
-        server.aggregate(client_weights)
-        if use_moe:
-            server.collect_domain_experts(client_domain_states)
-
-        # ── evaluate GlobalBase and GlobalFull ────────────────────────────────
-        g_eer_b, g_r1_b = server.evaluate_base(
-            use_whitening=use_whitening, warmup_active=rnd_warmup)
-
-        g_eer_f = g_r1_f = None
-        if use_moe and not rnd_warmup:
-            g_eer_f, g_r1_f = server.evaluate_full(use_whitening=use_whitening)
-
-        elapsed = time.time() - t_start
-
-        avg_rounds = cfg.get("avg_last_rounds", 5)
-        recent_base.append((g_eer_b, g_r1_b))
-        if len(recent_base) > avg_rounds: recent_base.pop(0)
-        if g_eer_f is not None:
-            recent_full.append((g_eer_f, g_r1_f))
-            if len(recent_full) > avg_rounds: recent_full.pop(0)
-
-        # ── print diagnostics ─────────────────────────────────────────────────
-        if use_moe and client_diag_records:
-            print_moe_diagnostics(rnd, client_diag_records, rnd_warmup)
-
+        scheduler.step()
+        acc = 100.0 * ep_corr / max(ep_tot, 1)
+        n = len(train_loader)
         ts = time.strftime("%H:%M:%S")
-        print(f"\n  [{ts}] Rnd {rnd:04d}/{cfg['n_rounds']} [{mode_label}]  "
-              f"({elapsed:.1f}s)")
-        print(f"  GlobalBase  EER={g_eer_b*100:.4f}%  Rank-1={g_r1_b:.2f}%")
-        if g_eer_f is not None:
-            print(f"  GlobalFull  EER={g_eer_f*100:.4f}%  Rank-1={g_r1_f:.2f}%")
-        elif use_moe and rnd_warmup:
-            print(f"  GlobalFull  — (warmup, domain_expert not yet active)")
+        print(f"  [{ts}] {tag} ep {epoch:03d}/{epochs}  "
+              f"loss={ep_loss/n:.4f}  acc={acc:.2f}%")
 
-        print(f"\n  {'Clt':>3}  {'Spectrum':>8}  {'Loss':>7}  "
-              f"{'Acc%':>5}  {'EER%':>6}  {'R1%':>5}")
-        print(f"  {'─'*3}  {'─'*8}  {'─'*7}  {'─'*5}  {'─'*6}  {'─'*5}")
-        for cm in client_metrics:
-            print(f"  C{cm['client_id']}   {cm['spectrum']:>8s}  "
-                  f"{cm['loss']:>7.4f}  {cm['acc']:>5.1f}  "
-                  f"{cm['eer']*100:>6.3f}  {cm['rank1']:>5.2f}")
-        print()
+        if test_loaders and (epoch % cfg.arcface_eval_every == 0 or
+                             epoch == epochs):
+            print(f"  --- eval at epoch {epoch} ---")
+            ver = eval_test_spectrums(model, test_loaders, cfg, tag="  ")
+            model.train()
+            mean_r1 = np.mean([r['rank1'] for r in ver.values()])
+            if mean_r1 > best_rank1 and ckpt_path:
+                best_rank1 = mean_r1
+                torch.save({
+                    "epoch": epoch,
+                    "backbone": model.backbone.state_dict(),
+                    "head": model.head.state_dict(),
+                    "rank1": best_rank1,
+                }, ckpt_path)
+                print(f"  *** New best Rank-1: {best_rank1:.2f}% → saved ***")
 
-        full_str = (f"{g_eer_f*100:.4f}\t{g_r1_f:.2f}"
-                    if g_eer_f is not None else "-\t-")
-        client_cols = "\t".join(
-            f"{cm['eer']*100:.4f}\t{cm['rank1']:.2f}"
-            for cm in client_metrics)
-        with open(results_path, "a") as f:
-            f.write(f"{rnd}\t{mode_label}\t"
-                    f"{g_eer_b*100:.4f}\t{g_r1_b:.2f}\t"
-                    f"{full_str}\t{client_cols}\n")
-
-    # ── final summary ─────────────────────────────────────────────────────────
-    n_avg = len(recent_base)
-    avg_eer_b  = sum(e for e, _ in recent_base) / n_avg
-    avg_r1_b   = sum(r for _, r in recent_base) / n_avg
-
-    print(f"\n{'='*62}")
-    print(f"  FL COMPLETE — {cfg['n_rounds']} rounds")
-    print(f"  Dataset            : {cfg['dataset'].upper()}")
-    print(f"  Model              : {cfg['model'].upper()}")
-    print(f"  Aug mode           : {aug_mode.upper()}")
-    if use_moe:
-        print(f"  MoE                : DualBranchGabor  "
-              f"gate={cfg.get('moe_gate_mode','scalar')}"
-              f"(init={cfg.get('moe_gate_init',1.0)}"
-              f",max={cfg.get('moe_gate_scale',2.0)})")
-    print(f"  Avg GlobalBase EER : {avg_eer_b*100:.4f}%  (last {n_avg} rds)")
-    print(f"  Avg GlobalBase R1  : {avg_r1_b:.2f}%")
-    if recent_full:
-        n_f = len(recent_full)
-        avg_eer_f = sum(e for e, _ in recent_full) / n_f
-        avg_r1_f  = sum(r for _, r in recent_full) / n_f
-        print(f"  Avg GlobalFull EER : {avg_eer_f*100:.4f}%  (last {n_f} rds)")
-        print(f"  Avg GlobalFull R1  : {avg_r1_f:.2f}%")
-    print(f"  Results saved      : {results_path}")
-    print(f"{'='*62}")
-
-    with open(results_path, "a") as f:
-        f.write(f"\n# Average of last {n_avg} rounds\n")
-        f.write(f"avg_base\t—\t{avg_eer_b*100:.4f}\t{avg_r1_b:.2f}\t-\t-\n")
-        if recent_full:
-            f.write(f"avg_full\t—\t-\t-\t{avg_eer_f*100:.4f}\t{avg_r1_f:.2f}\n")
+    return best_rank1
 
 
+# ══════════════════════════════════════════════════════════════
+#  ImageNet-C (Classification)
+# ══════════════════════════════════════════════════════════════
+
+def adapt_imagenet_c(cfg):
+    print(f"\n{'='*80}")
+    print(f"  TENT — ImageNet-C Classification")
+    print(f"  Backbone: {cfg.backbone} | LR: {cfg.tent_lr} | "
+          f"Steps/batch: {cfg.tent_steps} | Episodic: {cfg.tent_episodic}")
+    print(f"{'='*80}\n")
+
+    model = build_model(cfg)
+    norm_mean = getattr(cfg, '_norm_mean', (0.5, 0.5, 0.5))
+    norm_std = getattr(cfg, '_norm_std', (0.5, 0.5, 0.5))
+    loaders = get_imagenet_c_loaders(
+        cfg.data_dir, cfg.severity, cfg.batch_size, cfg.num_workers,
+        cfg.img_size, cfg.corruptions, list(norm_mean), list(norm_std))
+
+    # Baseline
+    baseline = {}
+    if cfg.eval_backbone:
+        print("[Baseline] Evaluating frozen backbone...")
+        model.eval()
+        with torch.no_grad():
+            for cname, loader in loaders:
+                correct = total = 0
+                for imgs, labs in loader:
+                    imgs, labs = imgs.to(cfg.device), labs.to(cfg.device)
+                    preds = model(imgs).argmax(1)
+                    correct += (preds == labs).sum().item()
+                    total += labs.shape[0]
+                err = 100.0 * (1 - correct / total)
+                baseline[cname] = err
+                print(f"  {cname:25s} → {err:.1f}%")
+        print(f"[Baseline] Mean: {np.mean(list(baseline.values())):.1f}%\n")
+
+    # TENT
+    model = tent.configure_model(model)
+    tent.check_model(model)
+    params, _ = tent.collect_params(model)
+    optimizer = torch.optim.Adam(params, lr=cfg.tent_lr)
+    tented = tent.Tent(model, optimizer, steps=cfg.tent_steps,
+                        episodic=cfg.tent_episodic)
+    print(f"[TENT] {len(params)} BN params ({sum(p.numel() for p in params)} values)")
+
+    results = {}
+    for seg_idx, (cname, loader) in enumerate(loaders):
+        if cfg.tent_episodic: tented.reset()
+        n_batches = len(loader); seg_correct = seg_total = 0; t0 = time.time()
+
+        print(f"\n{'─'*70}")
+        print(f"  [{seg_idx+1}/{len(loaders)}] {cname} ({len(loader.dataset)} samples)")
+        print(f"{'─'*70}")
+        print(f"  {'bat':>5} │{'err%':>6} │{'H':>6}")
+
+        for batch_idx, (imgs, labs) in enumerate(loader):
+            imgs, labs = imgs.to(cfg.device), labs.to(cfg.device)
+            logits = tented(imgs)
+            preds = logits.argmax(1)
+            correct = (preds == labs).sum().item()
+            seg_correct += correct; seg_total += labs.shape[0]
+            err = 100.0 * (1 - correct / labs.shape[0])
+            if batch_idx < 5 or batch_idx % 100 == 0 or batch_idx == n_batches - 1:
+                H = tent.softmax_entropy(logits).mean().item()
+                print(f"  {batch_idx:5d} │{err:5.1f} │{H:6.3f}")
+
+        seg_err = 100.0 * (1 - seg_correct / seg_total)
+        results[cname] = seg_err
+        b_err = baseline.get(cname)
+        print(f"\n  ┌── {cname}")
+        if b_err is not None:
+            imp = b_err - seg_err
+            print(f"  │ Backbone: {b_err:.1f}% → TENT: {seg_err:.1f}% "
+                  f"({'↓' if imp > 0 else '↑'}{abs(imp):.1f}%)")
+        else:
+            print(f"  │ TENT: {seg_err:.1f}%")
+        print(f"  │ Time: {time.time()-t0:.1f}s")
+        print(f"  └{'─'*50}")
+
+    # Summary
+    print(f"\n{'='*80}\n  FINAL RESULTS\n{'='*80}")
+    mean_t = np.mean(list(results.values()))
+    for c, te in results.items():
+        if baseline and c in baseline:
+            be = baseline[c]; d = be - te
+            print(f"  {c:<25} {be:>9.1f}% {te:>9.1f}% "
+                  f"{'↓' if d > 0 else '↑'}{abs(d):>8.1f}%")
+        else:
+            print(f"  {c:<25} {te:>9.1f}%")
+    if baseline:
+        mb = np.mean(list(baseline.values())); d = mb - mean_t
+        print(f"  {'MEAN':<25} {mb:>9.1f}% {mean_t:>9.1f}% "
+              f"{'↓' if d > 0 else '↑'}{abs(d):>8.1f}%")
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    p = os.path.join(cfg.output_dir, f"imagenetc_{cfg.backbone}_seed{cfg.seed}.json")
+    with open(p, "w") as f:
+        json.dump({"tent": results, **({"baseline": baseline} if baseline else {})},
+                  f, indent=2)
+    print(f"\n  Saved: {p}")
+
+
+# ══════════════════════════════════════════════════════════════
+#  CASIA-MS (Open-Set Verification)
+# ══════════════════════════════════════════════════════════════
+
+def adapt_casia_ms(cfg):
+    method_label = cfg.tta_method.upper()
+    print(f"\n{'='*80}")
+    print(f"  TTA — CASIA-MS Palmprint Verification (Open-Set)")
+    print(f"  Backbone: ArcFace iResNet100 | Method: {method_label}")
+    print(f"  ID split: {100*(1-cfg.test_id_ratio):.0f}% train / "
+          f"{100*cfg.test_id_ratio:.0f}% test")
+    print(f"  Phase 1: Train backbone ({100*(1-cfg.arcface_freeze_ratio):.0f}%)"
+          f" + head_A ({cfg.arcface_epochs} ep)")
+    print(f"  Phase 2: Train head_B ({cfg.arcface_head_epochs} ep, "
+          f"LR={cfg.arcface_lr_phase2}, m={cfg.arcface_m_phase2})")
+    print(f"  Phase 4: {method_label} on target domains")
+    print(f"  Gallery ratio: {cfg.gallery_ratio}")
+    print(f"{'='*80}\n")
+
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    # ── Build datasets ──
+    (train_ids, test_ids, train_id_map, test_id_map,
+     backbone_train_loader, test_head_train_loader,
+     test_loaders) = get_casia_ms_train_test(
+        cfg.data_dir, cfg.train_spectrums, cfg.batch_size,
+        cfg.num_workers, cfg.img_size, cfg.test_id_ratio, cfg.seed)
+
+    n_train_cls = len(train_id_map)
+    n_test_cls = len(test_id_map)
+
+    # ══════════════════════════════════════════════════════════
+    #  PHASE 1: Train backbone + head_A
+    # ══════════════════════════════════════════════════════════
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 1: Train backbone + train-ID head ({n_train_cls} classes)")
+    print(f"  {len(backbone_train_loader.dataset)} samples, "
+          f"{cfg.arcface_epochs} epochs")
+    print(f"{'─'*70}")
+
+    cfg.arcface_num_classes = n_train_cls
+    model = build_model(cfg)
+
+    train_params = ([p for p in model.backbone.parameters() if p.requires_grad]
+                    + list(model.head.parameters()))
+    n_unfrozen = sum(1 for p in model.backbone.parameters() if p.requires_grad)
+    print(f"[Phase 1] {n_unfrozen} unfrozen backbone tensors + "
+          f"head_A ({n_train_cls}×512)")
+
+    ckpt1 = os.path.join(cfg.output_dir, "phase1_best.pth")
+    train_arcface(model, backbone_train_loader, train_params, cfg,
+                  cfg.arcface_epochs, "P1", ckpt_path=ckpt1)
+
+    if os.path.exists(ckpt1):
+        ckpt = torch.load(ckpt1, map_location=cfg.device, weights_only=False)
+        model.backbone.load_state_dict(ckpt["backbone"])
+        print(f"\n  Loaded best Phase 1 backbone (epoch {ckpt['epoch']}, "
+              f"Rank-1={ckpt['rank1']:.2f}%)")
+
+    # ══════════════════════════════════════════════════════════
+    #  PHASE 2: Train head_B for test IDs (tent & contrastive)
+    #           BNA skips this phase
+    # ══════════════════════════════════════════════════════════
+    model.backbone.requires_grad_(False)
+
+    if cfg.tta_method in ("tent", "contrastive"):
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 2: Train test-ID head ({n_test_cls} classes)")
+        print(f"  Source domain: {cfg.train_spectrums}")
+        print(f"  {len(test_head_train_loader.dataset)} samples, "
+              f"{cfg.arcface_head_epochs} epochs, LR={cfg.arcface_lr_phase2}")
+        print(f"  Backbone: FROZEN")
+        print(f"{'─'*70}")
+
+        head_B = ArcFaceHead(n_test_cls, embedding_size=512,
+                              s=cfg.arcface_s, m=cfg.arcface_m_phase2
+                              ).to(cfg.device)
+        model.head = head_B
+
+        head_params = list(model.head.parameters())
+        print(f"[Phase 2] Head_B: {n_test_cls} classes, "
+              f"{sum(p.numel() for p in head_params)} params, "
+              f"margin={cfg.arcface_m_phase2}")
+
+        ckpt2 = os.path.join(cfg.output_dir, "phase2_best.pth")
+        train_arcface(model, test_head_train_loader, head_params, cfg,
+                      cfg.arcface_head_epochs, "P2",
+                      test_loaders=test_loaders, ckpt_path=ckpt2,
+                      lr=cfg.arcface_lr_phase2)
+
+        if os.path.exists(ckpt2):
+            ckpt = torch.load(ckpt2, map_location=cfg.device, weights_only=False)
+            model.head.load_state_dict(ckpt["head"])
+            print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
+                  f"Rank-1={ckpt['rank1']:.2f}%)")
+    else:
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 2: SKIPPED (BNA needs no classification head)")
+        print(f"{'─'*70}")
+
+    # ══════════════════════════════════════════════════════════
+    #  PHASE 3: Pre-TTA baseline
+    # ══════════════════════════════════════════════════════════
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 3: Pre-TTA Baseline on Target Domains")
+    print(f"{'─'*70}")
+    baseline = eval_test_spectrums(model, test_loaders, cfg, tag="[pre-TTA] ")
+
+    # ══════════════════════════════════════════════════════════
+    #  PHASE 4: TTA adaptation
+    # ══════════════════════════════════════════════════════════
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 4: {method_label} on Target Domains")
+    print(f"{'─'*70}")
+
+    # Build domain sequence
+    if cfg.oracle_domains:
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for sn, ld, ds in test_loaders:
+            gn, gid = CASIA_ORACLE_LOOKUP.get(sn, ("unk", -1))
+            if gid not in groups:
+                groups[gid] = {"name": gn, "spectrums": []}
+            groups[gid]["spectrums"].append((sn, ld, ds))
+        dom_seq = [(g["name"], gi, g["spectrums"])
+                   for gi, g in groups.items()]
+    else:
+        dom_seq = [(s, i, [(s, ld, ds)])
+                   for i, (s, ld, ds) in enumerate(test_loaders)]
+
+    # ── TENT ──
+    if cfg.tta_method == "tent":
+        model = tent.configure_model(model)
+        tent.check_model(model)
+        params, _ = tent.collect_params(model)
+        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+        tented = tent.Tent(model, opt, steps=cfg.tent_steps,
+                           episodic=cfg.tent_episodic)
+        print(f"[TENT] {len(params)} BN params "
+              f"({sum(p.numel() for p in params)} values)")
+        print(f"[TENT] Entropy from: head_B ({n_test_cls} classes)")
+
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            if cfg.tent_episodic: tented.reset()
+            tb = sum(len(l) for _, l, _ in slist)
+            t0 = time.time()
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
+            print(f"  {'bat':>5} │{'spec':>6} │{'H':>6}")
+            gb = 0
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    logits = tented(imgs.to(cfg.device))
+                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                        H = tent.softmax_entropy(logits).mean().item()
+                        print(f"  {gb:5d} │{sn:>6s} │{H:6.3f}")
+                    gb += 1
+            print(f"  Time: {time.time()-t0:.1f}s")
+
+    # ── CONTRASTIVE: entropy(head_B) + NT-Xent ──
+    elif cfg.tta_method == "contrastive":
+        model = tent.configure_model(model)
+        tent.check_model(model)
+        params, _ = tent.collect_params(model)
+        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+        aug_tf = tent.get_tta_augmentation(cfg.img_size)
+        con = tent.ContrastiveTent(
+            model, opt, aug_tf,
+            contrastive_lambda=cfg.contrastive_lambda,
+            contrastive_temp=cfg.contrastive_temp,
+            steps=cfg.tent_steps, episodic=cfg.tent_episodic,
+            use_entropy=True)
+        print(f"[CONTRASTIVE] {len(params)} BN params "
+              f"({sum(p.numel() for p in params)} values)")
+        print(f"[CONTRASTIVE] Entropy from: head_B ({n_test_cls} classes)")
+        print(f"[CONTRASTIVE] λ={cfg.contrastive_lambda}, "
+              f"τ={cfg.contrastive_temp}")
+
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            if cfg.tent_episodic: con.reset()
+            tb = sum(len(l) for _, l, _ in slist)
+            t0 = time.time()
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
+            print(f"  {'bat':>5} │{'spec':>6} │{'H':>6} │"
+                  f"{'con':>6} │{'total':>6}")
+            gb = 0
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    logits, info = con(imgs.to(cfg.device))
+                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                        print(f"  {gb:5d} │{sn:>6s} │"
+                              f"{info.get('entropy',0):6.3f} │"
+                              f"{info.get('contrastive',0):6.3f} │"
+                              f"{info.get('total',0):6.3f}")
+                    gb += 1
+            print(f"  Time: {time.time()-t0:.1f}s")
+
+    # ── BNA ──
+    elif cfg.tta_method == "bna":
+        model = tent.configure_model_bna(model)
+        print(f"[BNA] BN running stats reset. Adapting via forward pass...")
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            t0 = time.time()
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
+            gb = 0
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    tent.forward_bna(imgs.to(cfg.device), model)
+                    gb += 1
+            print(f"  {gb} batches | Time: {time.time()-t0:.1f}s")
+
+    # ══════════════════════════════════════════════════════════
+    #  PHASE 5: Post-TTA eval
+    # ══════════════════════════════════════════════════════════
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 5: Post-{method_label} Evaluation")
+    print(f"{'─'*70}")
+    model.eval()
+    post_tta = eval_test_spectrums(model, test_loaders, cfg,
+                                    tag=f"[post-{method_label}] ")
+
+    # ── Final comparison ──
+    print(f"\n{'='*80}")
+    print(f"  FINAL COMPARISON ({method_label})")
+    print(f"  Train IDs: {n_train_cls} | Test IDs: {n_test_cls}")
+    print(f"  Source: {cfg.train_spectrums} | Target: "
+          f"{[s for s,_,_ in test_loaders]}")
+    print(f"{'='*80}")
+    print(f"\n  {'Spectrum':<10} {'Pre EER':>9} {'Pre R1':>8} "
+          f"{'Post EER':>9} {'Post R1':>8} {'ΔEER':>8} {'ΔR1':>8}")
+    print(f"  {'─'*65}")
+
+    for sn in post_tta:
+        b = baseline.get(sn, {}); n = post_tta[sn]
+        de = b.get("eer", 0) - n["eer"]
+        dr = n["rank1"] - b.get("rank1", 0)
+        print(f"  {sn:<10} {b.get('eer',-1):>8.2f}% {b.get('rank1',-1):>7.2f}% "
+              f"{n['eer']:>8.2f}% {n['rank1']:>7.2f}% "
+              f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
+              f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
+
+    def _m(d, k):
+        return np.mean([r[k] for r in d.values()]) if d else -1
+    be = _m(baseline, 'eer'); br = _m(baseline, 'rank1')
+    te = _m(post_tta, 'eer'); tr = _m(post_tta, 'rank1')
+    de = be - te; dr = tr - br
+    print(f"  {'─'*65}")
+    print(f"  {'MEAN':<10} {be:>8.2f}% {br:>7.2f}% "
+          f"{te:>8.2f}% {tr:>7.2f}% "
+          f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
+          f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
+
+    save_data = {
+        "tta_method": cfg.tta_method, "baseline": {k: dict(v) for k, v in baseline.items()},
+        "post_tta": {k: dict(v) for k, v in post_tta.items()},
+        "n_train_ids": n_train_cls, "n_test_ids": n_test_cls,
+        "train_spectrums": cfg.train_spectrums,
+    }
+    p = os.path.join(cfg.output_dir, f"casia_{cfg.tta_method}_seed{cfg.seed}.json")
+    with open(p, "w") as f:
+        json.dump(save_data, f, indent=2)
+    print(f"\n  Saved: {p}")
+
+
+# ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    main()
+    cfg = get_cfg()
+    set_seed(cfg.seed)
+    if cfg.dataset == "casia_ms":
+        adapt_casia_ms(cfg)
+    elif cfg.dataset == "imagenet_c":
+        adapt_imagenet_c(cfg)
+    else:
+        raise ValueError(f"Unknown dataset: {cfg.dataset}")
