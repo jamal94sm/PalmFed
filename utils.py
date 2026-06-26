@@ -514,3 +514,248 @@ def train_ccnet_epoch(model, loader, criterion, optimizer, device,
         total        += img1.size(0)
 
     return running_loss / max(total, 1), 100.0 * correct / max(total, 1), None, 0.0
+
+
+# ══════════════════════════════════════════════════════════════
+#  DOMAIN PREDICTOR UTILITIES
+# ══════════════════════════════════════════════════════════════
+
+def extract_dp_features(img_np, pool_size=16, mode="style"):
+    """
+    Extract FFT-based features for domain predictor.
+
+    mode="full"  → full FFT amplitude, pooled to pool_size×pool_size
+    mode="style" → low-frequency components only (Gaussian-masked),
+                   pooled to pool_size×pool_size
+    """
+    if img_np.ndim == 3:
+        img_np = img_np.mean(axis=-1)
+
+    fft_amp = np.abs(np.fft.fftshift(np.fft.fft2(img_np)))
+
+    if mode == "style":
+        H, W = fft_amp.shape
+        mask = gaussian_mask(H, W, beta=0.3)
+        fft_amp = fft_amp * mask
+
+    # Log scale for better dynamic range
+    fft_amp = np.log1p(fft_amp)
+
+    # Pool to fixed size
+    from PIL import Image as PILImage
+    fft_pil = PILImage.fromarray(fft_amp.astype(np.float32))
+    fft_pil = fft_pil.resize((pool_size, pool_size), PILImage.BILINEAR)
+    features = np.array(fft_pil, dtype=np.float32)
+
+    # Normalize
+    features = (features - features.mean()) / (features.std() + 1e-6)
+    return features
+
+
+def build_dp_dataset(style_bank, client_ids, pool_size=16, mode="style"):
+    """
+    Build training dataset for domain predictor from style bank.
+
+    style_bank : dict[client_id → list[np.array]]
+                 Each entry is a list of FFT amplitude templates.
+    client_ids : list of client IDs (domain labels)
+
+    Returns: features [N, pool_size*pool_size], labels [N]
+    """
+    features, labels = [], []
+    for label_idx, cid in enumerate(client_ids):
+        templates = style_bank[cid]
+        for tmpl in templates:
+            if mode == "style":
+                H, W = tmpl.shape[:2]
+                mask = gaussian_mask(H, W, beta=0.3)
+                feat = tmpl * mask if tmpl.ndim == 2 else tmpl[..., 0] * mask
+            else:
+                feat = tmpl if tmpl.ndim == 2 else tmpl[..., 0]
+
+            feat = np.log1p(feat)
+            from PIL import Image as PILImage
+            feat_pil = PILImage.fromarray(feat.astype(np.float32))
+            feat_pil = feat_pil.resize((pool_size, pool_size), PILImage.BILINEAR)
+            feat_arr = np.array(feat_pil, dtype=np.float32)
+            feat_arr = (feat_arr - feat_arr.mean()) / (feat_arr.std() + 1e-6)
+
+            features.append(feat_arr.flatten())
+            labels.append(label_idx)
+
+    return np.array(features), np.array(labels)
+
+
+def train_domain_predictor(predictor, features, labels, cfg, device="cuda"):
+    """
+    Train domain predictor on FFT features.
+    Returns: trained predictor, final accuracy.
+    """
+    from torch.utils.data import TensorDataset, DataLoader
+
+    X = torch.tensor(features, dtype=torch.float32)
+    Y = torch.tensor(labels, dtype=torch.long)
+    ds = TensorDataset(X, Y)
+    loader = DataLoader(ds, batch_size=cfg["dp_batch_size"], shuffle=True)
+
+    predictor = predictor.to(device)
+    opt = torch.optim.Adam(predictor.parameters(), lr=cfg["dp_lr"])
+    loss_fn = nn.CrossEntropyLoss()
+
+    best_acc = 0
+    for epoch in range(cfg["dp_epochs"]):
+        predictor.train()
+        total_loss = 0; correct = 0; total = 0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            logits = predictor(xb)
+            loss = loss_fn(logits, yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+            total_loss += loss.item()
+            correct += (logits.argmax(1) == yb).sum().item()
+            total += yb.size(0)
+
+        acc = 100.0 * correct / max(total, 1)
+        if acc > best_acc:
+            best_acc = acc
+        if (epoch + 1) % 20 == 0 or epoch == cfg["dp_epochs"] - 1:
+            print(f"    [DP] ep {epoch+1:3d}/{cfg['dp_epochs']}  "
+                  f"loss={total_loss/len(loader):.4f}  acc={acc:.1f}%")
+
+    print(f"    [DP] Best accuracy: {best_acc:.1f}%")
+    predictor.eval()
+    return predictor, best_acc
+
+
+@torch.no_grad()
+def predict_domain_alpha(predictor, images, local_domain_idx,
+                          pool_size=16, mode="style", device="cuda"):
+    """
+    Predict α = P(local_domain | batch) using domain predictor.
+
+    Returns: α (scalar, batch-level), per-image probs [B, K]
+    """
+    predictor.eval()
+    features = []
+    for i in range(images.size(0)):
+        img_np = images[i].cpu().numpy()
+        if img_np.ndim == 3:
+            img_np = img_np.mean(axis=0) if img_np.shape[0] <= 4 else img_np.mean(axis=-1)
+        feat = extract_dp_features(img_np, pool_size, mode)
+        features.append(feat.flatten())
+
+    X = torch.tensor(np.array(features), dtype=torch.float32).to(device)
+    logits = predictor(X)
+    probs = torch.softmax(logits, dim=1)
+
+    # α = batch-level probability of local domain
+    alpha_per_image = probs[:, local_domain_idx]
+    alpha = alpha_per_image.mean().item()
+
+    return alpha, probs
+
+
+@torch.no_grad()
+def compute_fused_embeddings(personal_model, general_model,
+                              domain_predictor, images, local_domain_idx,
+                              cfg, device="cuda"):
+    """
+    Compute fused embeddings using soft routing.
+
+    Returns: final_emb [B, D], alpha (scalar)
+    """
+    routing = cfg.get("routing_mode", "soft")
+
+    emb_p = personal_model.get_embedding(images)
+    emb_g = general_model.get_embedding(images)
+
+    if routing == "personal":
+        return emb_p, 1.0
+    elif routing == "general":
+        return emb_g, 0.0
+    else:  # soft
+        alpha, _ = predict_domain_alpha(
+            domain_predictor, images, local_domain_idx,
+            pool_size=cfg["dp_pool_size"],
+            mode=cfg["dp_input"], device=device)
+
+        final = alpha * emb_p + (1.0 - alpha) * emb_g
+        final = F.normalize(final, p=2, dim=1)
+        return final, alpha
+
+
+def evaluate_with_routing(personal_model, general_model, domain_predictor,
+                           gallery_loader, probe_loader,
+                           local_domain_idx, cfg, device="cuda"):
+    """
+    Full evaluation: extract embeddings with domain-aware routing,
+    compute EER + Rank-1.
+
+    Returns dict with eer, rank1, alpha_gallery, alpha_probe.
+    """
+    personal_model.eval(); general_model.eval()
+
+    # Gallery embeddings
+    gal_feats, gal_labels, gal_alphas = [], [], []
+    for imgs, labels in gallery_loader:
+        imgs = imgs.to(device)
+        emb, alpha = compute_fused_embeddings(
+            personal_model, general_model, domain_predictor,
+            imgs, local_domain_idx, cfg, device)
+        gal_feats.append(emb.cpu())
+        gal_labels.append(labels)
+        gal_alphas.append(alpha)
+
+    # Probe embeddings
+    prb_feats, prb_labels, prb_alphas = [], [], []
+    for imgs, labels in probe_loader:
+        imgs = imgs.to(device)
+        emb, alpha = compute_fused_embeddings(
+            personal_model, general_model, domain_predictor,
+            imgs, local_domain_idx, cfg, device)
+        prb_feats.append(emb.cpu())
+        prb_labels.append(labels)
+        prb_alphas.append(alpha)
+
+    gal_feats = torch.cat(gal_feats)
+    gal_labels = torch.cat(gal_labels)
+    prb_feats = torch.cat(prb_feats)
+    prb_labels = torch.cat(prb_labels)
+
+    # Cosine similarity
+    sim = prb_feats @ gal_feats.T
+
+    # Rank-1
+    top_idx = sim.argmax(dim=1)
+    predicted = gal_labels[top_idx]
+    rank1 = (predicted == prb_labels).float().mean().item() * 100
+
+    # EER
+    genuine, impostor = [], []
+    for i in range(len(prb_labels)):
+        pid = prb_labels[i].item()
+        sims = sim[i].numpy()
+        glabs = gal_labels.numpy()
+        gen_mask = glabs == pid
+        imp_mask = glabs != pid
+        if gen_mask.any():
+            genuine.extend(sims[gen_mask].tolist())
+        if imp_mask.any():
+            impostor.extend(sims[imp_mask].tolist())
+
+    genuine = np.array(genuine); impostor = np.array(impostor)
+    all_labels = np.concatenate([np.ones(len(genuine)), np.zeros(len(impostor))])
+    all_scores = np.concatenate([genuine, impostor])
+    fpr, tpr, _ = roc_curve(all_labels, all_scores)
+    fnr = 1 - tpr
+    eer_idx = np.argmin(np.abs(fpr - fnr))
+    eer = float((fpr[eer_idx] + fnr[eer_idx]) / 2) * 100
+
+    return {
+        "eer": eer,
+        "rank1": rank1,
+        "n_gallery": len(gal_labels),
+        "n_probe": len(prb_labels),
+        "alpha_gallery": np.mean(gal_alphas),
+        "alpha_probe": np.mean(prb_alphas),
+    }
