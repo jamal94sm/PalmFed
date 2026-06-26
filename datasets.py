@@ -514,3 +514,154 @@ class EvalDatasetDINO(Dataset):
     def __getitem__(self, idx):
         path, label = self.samples[idx][0], self.samples[idx][1]
         return self.transform(Image.open(path).convert("RGB")), label
+
+
+# ══════════════════════════════════════════════════════════════
+#  CLOSED-SET SPLIT: same IDs in train and test (held-out samples)
+# ══════════════════════════════════════════════════════════════
+
+def build_federated_splits_closed_set(data_root, n_ids, gallery_ratio,
+                                       sample_holdout=0.20, seed=42):
+    """
+    Closed-set, non-shared-ID, cross-domain split.
+
+    All IDs are train IDs (no separate test IDs).
+    Train IDs are partitioned round-robin across clients (non-shared).
+    For each client, hold out sample_holdout of same-spectrum samples.
+
+    Test set = held-out same-spectrum samples + ALL cross-spectrum samples
+    for ALL client IDs.
+
+    Returns same 5-tuple as build_federated_splits for compatibility.
+    """
+    rng  = random.Random(seed)
+    data = parse_casia_ms(data_root)
+
+    spectra   = sorted(data.keys())
+    n_clients = len(spectra)
+
+    common_ids = set(data[spectra[0]].keys())
+    for sp in spectra[1:]:
+        common_ids &= set(data[sp].keys())
+    common_ids = sorted(common_ids)
+
+    if len(common_ids) < n_ids:
+        raise ValueError(f"Requested {n_ids} IDs but only {len(common_ids)} common.")
+
+    selected_ids = sorted(rng.sample(common_ids, n_ids))
+    rng.shuffle(selected_ids)
+
+    # ALL IDs are train IDs (closed-set)
+    train_ids      = selected_ids
+    test_label_map = {ident: i for i, ident in enumerate(sorted(selected_ids))}
+
+    print(f"  [Closed-set] All {len(train_ids)} IDs used for training + testing")
+
+    # Round-robin partition (non-shared)
+    rng.shuffle(train_ids)
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(train_ids):
+        client_id_splits[i % n_clients].append(ident)
+
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+    n_dropped = len(train_ids) - min_ids * n_clients
+    print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
+
+    # Build per-client train sets + held-out samples
+    all_train_ids_set = set()
+    for ids in client_id_splits:
+        all_train_ids_set.update(ids)
+
+    client_data = []
+    held_out_samples = []  # (path, label, spectrum_idx) — same-spectrum held out
+
+    for i, sp in enumerate(spectra):
+        c_ids       = client_id_splits[i]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+
+        # Split samples: train vs held-out
+        local_all = []
+        for ident in c_ids:
+            for p in data[sp][ident]:
+                local_all.append((p, c_label_map[ident], ident))
+
+        rng.shuffle(local_all)
+        n_holdout   = max(1, int(len(local_all) * sample_holdout))
+        local_held  = local_all[:n_holdout]
+        local_train = [(p, label) for p, label, _ in local_all[n_holdout:]]
+
+        # Track held-out for test set
+        for p, _, ident in local_held:
+            held_out_samples.append((p, test_label_map[ident], i))
+
+        client_data.append({
+            "spectrum"      : sp,
+            "train_samples" : local_train,
+            "label_map"     : c_label_map,
+            "num_classes"   : min_ids,
+        })
+        print(f"    Client {i} [{sp:>6}]  "
+              f"train={len(local_train)}  held_out={len(local_held)}")
+
+    # Build global test set:
+    # 1. Held-out same-spectrum samples (from above)
+    # 2. ALL cross-spectrum samples for all client IDs
+    cross_spectrum_samples = []
+    for sp_idx, sp in enumerate(spectra):
+        client_ids_for_sp = set(client_id_splits[sp_idx])
+        for other_sp_idx, other_sp in enumerate(spectra):
+            if other_sp_idx == sp_idx:
+                continue  # skip same spectrum (already in held-out)
+            for ident in client_id_splits[sp_idx]:
+                for p in data[other_sp][ident]:
+                    cross_spectrum_samples.append(
+                        (p, test_label_map[ident], other_sp_idx))
+
+    all_test = held_out_samples + cross_spectrum_samples
+    print(f"  Test pool: {len(held_out_samples)} held-out + "
+          f"{len(cross_spectrum_samples)} cross-spectrum = {len(all_test)}")
+
+    # Split into gallery / probe
+    by_id = defaultdict(list)
+    for s in all_test:
+        by_id[s[1]].append(s)
+
+    gallery_samples, probe_samples = [], []
+    for label, samples in by_id.items():
+        rng.shuffle(samples)
+        n_gal = max(1, round(len(samples) * gallery_ratio))
+        gallery_samples.extend(samples[:n_gal])
+        probe_samples.extend(samples[n_gal:])
+
+    print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, spectra)
+
+
+def get_federated_splits(cfg, seed=42):
+    """
+    Dispatcher: calls correct split builder based on dataset + eval_protocol.
+    """
+    dataset  = cfg["dataset"].strip().lower()
+    protocol = cfg.get("eval_protocol", "open_set").strip().lower()
+
+    if dataset == "casiams":
+        if protocol == "closed_set":
+            return build_federated_splits_closed_set(
+                cfg["data_root"], cfg["n_ids"], cfg["gallery_ratio"],
+                cfg.get("closed_set_sample_ratio", 0.20), seed=seed)
+        else:
+            return build_federated_splits(
+                cfg["data_root"], cfg["n_ids"], cfg["k_test"],
+                cfg["gallery_ratio"], seed=seed)
+
+    elif dataset == "xjtu":
+        if protocol == "closed_set":
+            print("[WARN] Closed-set not implemented for XJTU, using open-set")
+        return build_federated_splits_xjtu(
+            cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
+            cfg["gallery_ratio"], seed=seed)
+
+    else:
+        raise ValueError(f"Unknown dataset: '{dataset}'")
