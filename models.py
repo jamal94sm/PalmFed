@@ -684,3 +684,92 @@ def build_model(cfg, num_classes):
         )
     else:
         raise ValueError(f"Unknown model: '{cfg['model']}'.")
+
+
+# ══════════════════════════════════════════════════════════════
+#  DOMAIN PREDICTOR — classifies FFT amplitudes → domain label
+# ══════════════════════════════════════════════════════════════
+
+class DomainPredictorMLP(nn.Module):
+    """Simple MLP on pooled FFT amplitude features."""
+    def __init__(self, input_dim, n_domains, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, n_domains),
+        )
+
+    def forward(self, x):
+        return self.net(x.flatten(1))
+
+
+class DomainPredictorCNN(nn.Module):
+    """Small CNN on 2D FFT amplitude maps."""
+    def __init__(self, pool_size, n_domains, hidden=64):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 4, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, n_domains),
+        )
+
+    def forward(self, x):
+        if x.dim() == 2:
+            s = int(x.shape[1] ** 0.5)
+            x = x.view(x.shape[0], 1, s, s)
+        elif x.dim() == 3:
+            x = x.unsqueeze(1)
+        return self.classifier(self.features(x))
+
+
+class DomainPredictorTransformer(nn.Module):
+    """Lightweight transformer on patched FFT amplitude."""
+    def __init__(self, input_dim, n_domains, hidden=128, n_heads=4, depth=2):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, hidden)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden))
+        enc = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=n_heads,
+            dim_feedforward=hidden * 2,
+            batch_first=True, dropout=0.1)
+        self.encoder = nn.TransformerEncoder(enc, depth)
+        self.head = nn.Linear(hidden, n_domains)
+
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x.flatten(1)
+        x = self.proj(x).unsqueeze(1)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.encoder(x)
+        return self.head(x[:, 0])
+
+
+def build_domain_predictor(cfg, n_domains):
+    """Factory for domain predictor architectures."""
+    pool_size = cfg["dp_pool_size"]
+    input_dim = pool_size * pool_size
+    hidden = cfg["dp_hidden"]
+    arch = cfg["dp_arch"].lower()
+
+    if arch == "mlp":
+        return DomainPredictorMLP(input_dim, n_domains, hidden)
+    elif arch == "cnn":
+        return DomainPredictorCNN(pool_size, n_domains, hidden)
+    elif arch == "transformer":
+        return DomainPredictorTransformer(input_dim, n_domains, hidden)
+    else:
+        raise ValueError(f"Unknown dp_arch: {arch}")
