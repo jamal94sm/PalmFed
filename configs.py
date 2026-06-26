@@ -1,5 +1,5 @@
 # ==============================================================
-#  configs.py — Configuration for Federated Palmprint + Domain Predictor
+#  configs.py — Federated Palmprint + Domain Predictor
 # ==============================================================
 
 XJTU_VARIATIONS = [
@@ -11,24 +11,30 @@ CASIA_SPECTRUMS = ["460", "630", "700", "850", "940", "WHT"]
 
 CONFIG = {
     # ── Dataset ──────────────────────────────────────────────
-    "dataset"          : "casiams",       # casiams | xjtu
+    "dataset"          : "casiams",
     "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",
     "base_results_dir" : "./rst_palmfed_{dataset}",
-    "splits_path"      : None,            # load existing splits (or None)
+    "splits_path"      : None,
 
     "n_ids"            : 200,
-    "k_test"           : 0.20,            # fraction of IDs → test set
-    "gallery_ratio"    : 0.20,            # fraction of test samples → gallery
+    "k_test"           : 0.20,
+    "gallery_ratio"    : 0.20,
     "img_side"         : 128,
 
+    # ── Evaluation Protocol ──────────────────────────────────
+    # open_set:   test IDs ≠ train IDs (disjoint)
+    # closed_set: test IDs = train IDs (held-out samples)
+    "eval_protocol"    : "open_set",    # open_set | closed_set
+    "closed_set_sample_ratio": 0.20,    # fraction of samples held out (closed-set)
+
     # ── Model (standard CompNet, no MoE) ─────────────────────
-    "model"            : "compnet",       # compnet | ccnet | dinov2
+    "model"            : "compnet",
     "embedding_dim"    : 512,
     "dropout"          : 0.25,
     "arcface_s"        : 30.0,
     "arcface_m"        : 0.50,
-    "use_moe"          : False,           # disabled — standard CompNet
+    "use_moe"          : False,
 
     # ── Federated Learning ───────────────────────────────────
     "n_rounds"         : 50,
@@ -41,32 +47,30 @@ CONFIG = {
     "beta"             : 0.15,            # FFT swap intensity
     "num_workers"      : 4,
 
+    # ── Personal Model Augmentation ──────────────────────────
+    # Personal model uses local-only FFT: swap amplitude among
+    # samples within the same client (no cross-client knowledge).
+    "personal_M"       : 2,              # local FFT aug multiplier
+    "personal_beta"    : 0.15,           # local FFT swap intensity
+
     # ── Domain Predictor ─────────────────────────────────────
     "dp_arch"          : "mlp",           # mlp | cnn | transformer
-    "dp_input"         : "style",         # style (low-freq only) | full (all FFT amp)
-    "dp_pool_size"     : 16,              # pool FFT amp to this spatial size
-    "dp_hidden"        : 128,             # hidden dimension
-    "dp_epochs"        : 100,             # training epochs
+    "dp_input"         : "style",         # style (low-freq) | full (all FFT amp)
+    "dp_pool_size"     : 16,
+    "dp_hidden"        : 128,
+    "dp_epochs"        : 100,
     "dp_lr"            : 1e-3,
     "dp_batch_size"    : 64,
 
     # ── Test Domain Toggle ───────────────────────────────────
-    # Controls what domain(s) each client sees at test time:
-    #   "same"  → test from same domain as training (intra-domain)
-    #   "cross" → test from all OTHER domains (cross-domain)
-    #   "all"   → test from ALL domains (combined)
-    "test_domain"      : "cross",
+    "test_domain"      : "cross",         # same | cross | all
 
     # ── Routing Mode ─────────────────────────────────────────
-    # Controls how personalized + generalized models are combined:
-    #   "soft"      → α·personal + (1-α)·general (domain predictor)
-    #   "personal"  → personal model only (baseline)
-    #   "general"   → general model only (baseline)
-    "routing_mode"     : "soft",
+    "routing_mode"     : "soft",          # soft | personal | general
+    "eval_baselines"   : True,            # always show P/G baselines
 
     # ── Evaluation ───────────────────────────────────────────
-    "eval_every"       : 5,               # evaluate every N rounds
-    "eval_baselines"   : True,            # always show personal/general baselines
+    "eval_every"       : 5,
 
     # ── Misc ─────────────────────────────────────────────────
     "random_seed"      : 42,
