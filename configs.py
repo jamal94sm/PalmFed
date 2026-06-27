@@ -23,12 +23,10 @@ CONFIG = {
     "img_side"         : 128,
 
     # ── Evaluation Protocol ──────────────────────────────────
-    # open_set:   test IDs ≠ train IDs (disjoint)
-    # closed_set: test IDs = train IDs (held-out samples)
     "eval_protocol"    : "open_set",    # open_set | closed_set
-    "closed_set_sample_ratio": 0.20,    # fraction of samples held out (closed-set)
+    "closed_set_sample_ratio": 0.20,
 
-    # ── Model (standard CompNet, no MoE) ─────────────────────
+    # ── Model ────────────────────────────────────────────────
     "model"            : "compnet",
     "embedding_dim"    : 512,
     "dropout"          : 0.25,
@@ -43,31 +41,27 @@ CONFIG = {
     "lr"               : 0.001,
     "lr_step"          : 30,
     "lr_gamma"         : 0.8,
-    "M"                : 2,               # FFT augmentation multiplier
-    "beta"             : 0.15,            # FFT swap intensity
+    "M"                : 2,
+    "beta"             : 0.15,
     "num_workers"      : 4,
 
-    # ── Personal Model Augmentation ──────────────────────────
-    # Personal model uses local-only FFT: swap amplitude among
-    # samples within the same client (no cross-client knowledge).
-    "personal_M"       : 2,              # local FFT aug multiplier
-    "personal_beta"    : 0.15,           # local FFT swap intensity
+    # ── Local Model Augmentation ─────────────────────────────
+    "local_M"          : 2,
+    "local_beta"       : 0.15,
 
     # ── Domain Predictor ─────────────────────────────────────
     "dp_arch"          : "mlp",           # mlp | cnn | transformer
-    "dp_input"         : "style",         # style (low-freq) | full (all FFT amp)
+    "dp_input"         : "style",         # style | full
     "dp_pool_size"     : 16,
     "dp_hidden"        : 128,
     "dp_epochs"        : 100,
     "dp_lr"            : 1e-3,
     "dp_batch_size"    : 64,
 
-    # ── Test Domain Toggle ───────────────────────────────────
-    "test_domain"      : "cross",         # same | cross | all
-
-    # ── Routing Mode ─────────────────────────────────────────
-    "routing_mode"     : "soft",          # soft | personal | general
-    "eval_baselines"   : True,            # always show P/G baselines
+    # ── Domain Prediction Mode ───────────────────────────────
+    # ideal:    oracle — uses true domain_id from test sample metadata
+    # predicted: uses trained domain predictor
+    "dp_mode"          : "ideal",         # ideal | predicted
 
     # ── Evaluation ───────────────────────────────────────────
     "eval_every"       : 5,
