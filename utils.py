@@ -790,3 +790,56 @@ def evaluate_all_modes(local_models, global_model, domain_predictor,
         }
 
     return results
+
+
+def evaluate_single_model(model, gallery_loader, probe_loader, device="cuda"):
+    """Evaluate a single model on gallery/probe. Returns dict with rank1, eer."""
+    model.eval()
+    
+    gal_feats, gal_labels = [], []
+    for batch in gallery_loader:
+        imgs, labels = batch[0], batch[1]
+        imgs = imgs.to(device)
+        with torch.no_grad():
+            emb = model.get_embedding(imgs)
+            emb = F.normalize(emb, p=2, dim=1)
+        gal_feats.append(emb.cpu()); gal_labels.append(labels)
+    gal_feats = torch.cat(gal_feats); gal_labels = torch.cat(gal_labels)
+
+    prb_feats, prb_labels = [], []
+    for batch in probe_loader:
+        imgs, labels = batch[0], batch[1]
+        imgs = imgs.to(device)
+        with torch.no_grad():
+            emb = model.get_embedding(imgs)
+            emb = F.normalize(emb, p=2, dim=1)
+        prb_feats.append(emb.cpu()); prb_labels.append(labels)
+    prb_feats = torch.cat(prb_feats); prb_labels = torch.cat(prb_labels)
+
+    sim = prb_feats @ gal_feats.T
+    top_idx = sim.argmax(dim=1)
+    predicted = gal_labels[top_idx]
+    rank1 = (predicted == prb_labels).float().mean().item() * 100
+
+    genuine, impostor = [], []
+    for i in range(len(prb_labels)):
+        pid = prb_labels[i].item()
+        sims = sim[i].numpy()
+        glabs = gal_labels.numpy()
+        gen_mask = glabs == pid
+        imp_mask = glabs != pid
+        if gen_mask.any():
+            genuine.extend(sims[gen_mask].tolist())
+        if imp_mask.any():
+            impostor.extend(sims[imp_mask].tolist())
+
+    genuine = np.array(genuine); impostor = np.array(impostor)
+    all_lab = np.concatenate([np.ones(len(genuine)), np.zeros(len(impostor))])
+    all_sc = np.concatenate([genuine, impostor])
+    fpr, tpr, _ = roc_curve(all_lab, all_sc)
+    fnr = 1 - tpr
+    idx = np.argmin(np.abs(fpr - fnr))
+    eer = float((fpr[idx] + fnr[idx]) / 2) * 100
+
+    return {"rank1": rank1, "eer": eer,
+            "n_gallery": len(gal_labels), "n_probe": len(prb_labels)}
