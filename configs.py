@@ -17,7 +17,7 @@ CONFIG = {
     "base_results_dir" : "./rst_palmfed_{dataset}",
     "splits_path"      : None,
 
-    "n_ids"            : 200,
+    "n_ids"            : 192,
     "k_test"           : 0.20,
     "gallery_ratio"    : 0.20,
     "img_side"         : 128,
