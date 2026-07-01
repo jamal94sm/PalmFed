@@ -591,11 +591,12 @@ def build_federated_splits_closed_set(data_root, n_ids, gallery_ratio,
 
         for ident, id_samples in by_id.items():
             rng.shuffle(id_samples)
-            n_hold = max(1, int(len(id_samples) * sample_holdout))
+            n_hold = max(2, int(len(id_samples) * sample_holdout))
+            n_hold = min(n_hold, len(id_samples) - 1)  # keep at least 1 for train
             held_out.extend(id_samples[:n_hold])
             train_samples.extend(id_samples[n_hold:])
 
-        # Local test: split held-out into gallery/probe per ID
+        # Local test: split held-out 50/50 gallery/probe per ID
         local_by_id = defaultdict(list)
         for p, local_label, ident in held_out:
             local_by_id[local_label].append((p, local_label))
@@ -603,7 +604,7 @@ def build_federated_splits_closed_set(data_root, n_ids, gallery_ratio,
         local_gal, local_prb = [], []
         for label, samples in local_by_id.items():
             rng.shuffle(samples)
-            n_gal = max(1, int(len(samples) * gallery_ratio))
+            n_gal = max(1, len(samples) // 2)
             local_gal.extend(samples[:n_gal])
             local_prb.extend(samples[n_gal:])
 
@@ -691,7 +692,8 @@ def build_federated_splits_closed_set_xjtu(data_root, n_ids, gallery_ratio,
 
         for ident, id_samples in by_id.items():
             rng.shuffle(id_samples)
-            n_hold = max(1, int(len(id_samples) * sample_holdout))
+            n_hold = max(2, int(len(id_samples) * sample_holdout))
+            n_hold = min(n_hold, len(id_samples) - 1)
             held_out.extend(id_samples[:n_hold])
             train_samples.extend(id_samples[n_hold:])
 
@@ -702,7 +704,7 @@ def build_federated_splits_closed_set_xjtu(data_root, n_ids, gallery_ratio,
         local_gal, local_prb = [], []
         for label, samples in local_by_id.items():
             rng.shuffle(samples)
-            n_gal = max(1, int(len(samples) * gallery_ratio))
+            n_gal = max(1, len(samples) // 2)
             local_gal.extend(samples[:n_gal])
             local_prb.extend(samples[n_gal:])
 
