@@ -111,6 +111,7 @@ def parse_overrides():
     p = argparse.ArgumentParser(description="Federated Palmprint")
     p.add_argument("--dataset", choices=["casiams", "xjtu"])
     p.add_argument("--eval_protocol", choices=["open_set", "closed_set"])
+    p.add_argument("--closed_set_mode", choices=["holdout", "cross_spectrum"])
     p.add_argument("--dp_mode", choices=["ideal", "predicted"])
     p.add_argument("--dp_arch", choices=["mlp", "cnn", "transformer"])
     p.add_argument("--dp_input", choices=["style", "full"])
@@ -146,7 +147,9 @@ def main():
 
     print(f"\n{'='*80}")
     print(f"  Federated Palmprint — Global / Local / MoE")
-    print(f"  Protocol: {protocol} | DP mode: {dp_mode}")
+    cs_mode = cfg.get("closed_set_mode", "holdout")
+    proto_str = f"{protocol}" + (f" ({cs_mode})" if protocol == "closed_set" else "")
+    print(f"  Protocol: {proto_str} | DP mode: {dp_mode}")
     print(f"{'='*80}\n")
 
     results_dir = cfg["base_results_dir"].replace("{dataset}", cfg["dataset"])
@@ -274,8 +277,8 @@ def main():
             # ────────────────────────────────────
             if is_closed and local_test_loaders:
                 print(f"\n    LOCAL TEST (per-client held-out)")
-                print(f"    {'Client':>8s} │ {'Local R1':>9s} {'EER':>7s} │ "
-                      f"{'MoE R1':>8s} {'EER':>7s}")
+                print(f"    {'Client':>8s} │ {'Local R1':>9s} {'EER':>8s} │ "
+                      f"{'MoE R1':>8s} {'EER':>8s}")
                 print(f"    {'─'*48}")
 
                 local_test_results = []
@@ -303,8 +306,8 @@ def main():
                     local_test_results.append({
                         "local": rl, "moe": {"rank1": mr1, "eer": meer}})
 
-                    print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>6.2f}% │ "
-                          f"{mr1:>7.2f}% {meer:>6.2f}%")
+                    print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>7.3f}% │ "
+                          f"{mr1:>7.2f}% {meer:>7.3f}%")
 
                 valid = [r for r in local_test_results if r is not None]
                 if valid:
@@ -313,8 +316,8 @@ def main():
                     amr = np.mean([r["moe"]["rank1"] for r in valid])
                     ame = np.mean([r["moe"]["eer"] for r in valid])
                     print(f"    {'─'*48}")
-                    print(f"    {'Avg':>8s} │ {alr:>8.2f}% {ale:>6.2f}% │ "
-                          f"{amr:>7.2f}% {ame:>6.2f}%")
+                    print(f"    {'Avg':>8s} │ {alr:>8.2f}% {ale:>7.3f}% │ "
+                          f"{amr:>7.2f}% {ame:>7.3f}%")
                     rnd_entry["local_test"] = {
                         "avg_local": {"rank1": alr, "eer": ale},
                         "avg_moe": {"rank1": amr, "eer": ame},
@@ -325,8 +328,8 @@ def main():
             #  GLOBAL TEST
             # ────────────────────────────────────
             print(f"\n    GLOBAL TEST")
-            print(f"    {'Client':>8s} │ {'Local R1':>9s} {'EER':>7s} │ "
-                  f"{'MoE R1':>8s} {'EER':>7s}")
+            print(f"    {'Client':>8s} │ {'Local R1':>9s} {'EER':>8s} │ "
+                  f"{'MoE R1':>8s} {'EER':>8s}")
             print(f"    {'─'*48}")
 
             # Per-client local model on global test
@@ -366,8 +369,8 @@ def main():
                 spec = client_data[ci]["spectrum"]
                 rl = client_global_results[ci]
                 rm = client_moe_results[ci]
-                print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>6.2f}% │ "
-                      f"{rm['rank1']:>7.2f}% {rm['eer']:>6.2f}%")
+                print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>7.3f}% │ "
+                      f"{rm['rank1']:>7.2f}% {rm['eer']:>7.3f}%")
 
             avg_lr1 = np.mean([r["rank1"] for r in client_global_results])
             avg_leer = np.mean([r["eer"] for r in client_global_results])
@@ -377,9 +380,9 @@ def main():
                 global_model, global_gal_loader, global_prb_loader, device)
 
             print(f"    {'─'*48}")
-            print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>6.2f}% │")
-            print(f"    {'MoE':>8s} │ {'':>18s} │ {moe_r1:>7.2f}% {moe_eer:>6.2f}%")
-            print(f"    {'Global':>8s} │ {rg['rank1']:>8.2f}% {rg['eer']:>6.2f}% │")
+            print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>7.3f}% │")
+            print(f"    {'MoE':>8s} │ {'':>18s} │ {moe_r1:>7.2f}% {moe_eer:>7.3f}%")
+            print(f"    {'Global':>8s} │ {rg['rank1']:>8.2f}% {rg['eer']:>7.3f}% │")
 
             rnd_entry["global_test"] = {
                 "global": rg,
@@ -412,8 +415,8 @@ def main():
     print(f"\n  GLOBAL TEST SUMMARY")
     print(f"  {'Rnd':>5} │ {'Global':>16s} │ {'Avg Local':>16s} │ "
           f"{'MoE':>16s}")
-    print(f"  {'':>5} │ {'R1':>7s} {'EER':>7s} │ "
-          f"{'R1':>7s} {'EER':>7s} │ {'R1':>7s} {'EER':>7s}")
+    print(f"  {'':>5} │ {'R1':>7s} {'EER':>8s} │ "
+          f"{'R1':>7s} {'EER':>8s} │ {'R1':>7s} {'EER':>8s}")
     print(f"  {'─'*58}")
 
     for h in history:
@@ -427,7 +430,7 @@ def main():
     if is_closed and any("local_test" in h for h in history):
         print(f"\n  LOCAL TEST SUMMARY")
         print(f"  {'Rnd':>5} │ {'Avg Local':>16s} │ {'Avg MoE':>16s}")
-        print(f"  {'':>5} │ {'R1':>7s} {'EER':>7s} │ {'R1':>7s} {'EER':>7s}")
+        print(f"  {'':>5} │ {'R1':>7s} {'EER':>8s} │ {'R1':>7s} {'EER':>8s}")
         print(f"  {'─'*42}")
         for h in history:
             lt = h.get("local_test", {})
@@ -445,7 +448,7 @@ def main():
                        key=lambda h: h["global_test"][key]["rank1"])
             r = best["global_test"][key]
             print(f"\n  Best {mode:>9s}: Rnd {best['round']}  "
-                  f"R1={r['rank1']:.2f}%  EER={r['eer']:.2f}%")
+                  f"R1={r['rank1']:.2f}%  EER={r['eer']:.3f}%")
 
     save_path = os.path.join(results_dir,
                               f"results_{protocol}_{dp_mode}.json")
