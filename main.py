@@ -105,8 +105,38 @@ def compute_eer_r1(prb_feats, prb_labels, gal_feats, gal_labels):
     return rank1, eer
 
 
+def parse_overrides():
+    """Parse command-line overrides for CONFIG dict."""
+    import argparse
+    p = argparse.ArgumentParser(description="Federated Palmprint")
+    p.add_argument("--dataset", choices=["casiams", "xjtu"])
+    p.add_argument("--eval_protocol", choices=["open_set", "closed_set"])
+    p.add_argument("--dp_mode", choices=["ideal", "predicted"])
+    p.add_argument("--dp_arch", choices=["mlp", "cnn", "transformer"])
+    p.add_argument("--dp_input", choices=["style", "full"])
+    p.add_argument("--n_rounds", type=int)
+    p.add_argument("--local_epochs", type=int)
+    p.add_argument("--n_ids", type=int)
+    p.add_argument("--k_test", type=float)
+    p.add_argument("--batch_size", type=int)
+    p.add_argument("--lr", type=float)
+    p.add_argument("--M", type=int)
+    p.add_argument("--beta", type=float)
+    p.add_argument("--eval_every", type=int)
+    p.add_argument("--random_seed", type=int)
+    p.add_argument("--data_root")
+    p.add_argument("--xjtu_data_root")
+    p.add_argument("--gallery_ratio", type=float)
+    p.add_argument("--closed_set_sample_ratio", type=float)
+    p.add_argument("--model", choices=["compnet", "ccnet"])
+    args, _ = p.parse_known_args()
+    overrides = {k: v for k, v in vars(args).items() if v is not None}
+    return overrides
+
+
 def main():
     cfg = CONFIG.copy()
+    cfg.update(parse_overrides())
     set_seed(cfg["random_seed"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
