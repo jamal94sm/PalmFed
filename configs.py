@@ -35,7 +35,7 @@ CONFIG = {
     "use_moe"          : False,
 
     # ── Federated Learning ───────────────────────────────────
-    "n_rounds"         : 100,
+    "n_rounds"         : 50,
     "local_epochs"     : 1,
     "batch_size"       : 64,
     "lr"               : 0.001,
