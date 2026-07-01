@@ -516,23 +516,25 @@ class EvalDatasetDINO(Dataset):
         return self.transform(Image.open(path).convert("RGB")), label
 
 
+
 # ══════════════════════════════════════════════════════════════
-#  CLOSED-SET SPLIT: same IDs in train and test (held-out samples)
+#  CLOSED-SET SPLITS
+#  All IDs are train IDs. Per client: hold out 20% of samples.
+#  Local test = held-out per client. Global test = union of all.
 # ══════════════════════════════════════════════════════════════
 
 def build_federated_splits_closed_set(data_root, n_ids, gallery_ratio,
                                        sample_holdout=0.20, seed=42):
     """
-    Closed-set, non-shared-ID, cross-domain split.
+    Closed-set, non-shared-ID, same-domain split for CASIA-MS.
 
-    All IDs are train IDs (no separate test IDs).
-    Train IDs are partitioned round-robin across clients (non-shared).
-    For each client, hold out sample_holdout of same-spectrum samples.
-
-    Test set = held-out same-spectrum samples + ALL cross-spectrum samples
-    for ALL client IDs.
-
-    Returns same 5-tuple as build_federated_splits for compatibility.
+    Returns 6-tuple:
+      client_data    : list[{spectrum, train_samples, local_test_gal,
+                             local_test_prb, label_map, num_classes}]
+      gallery_samples: global gallery (union of local held-out, split per ID)
+      probe_samples  : global probe
+      test_label_map : {identity: int}
+      spectra        : list of spectrum strings
     """
     rng  = random.Random(seed)
     data = parse_casia_ms(data_root)
@@ -552,97 +554,194 @@ def build_federated_splits_closed_set(data_root, n_ids, gallery_ratio,
     rng.shuffle(selected_ids)
 
     # ALL IDs are train IDs (closed-set)
-    train_ids      = selected_ids
+    # Global label map for test set
     test_label_map = {ident: i for i, ident in enumerate(sorted(selected_ids))}
 
-    print(f"  [Closed-set] All {len(train_ids)} IDs used for training + testing")
-
     # Round-robin partition (non-shared)
-    rng.shuffle(train_ids)
     client_id_splits = [[] for _ in range(n_clients)]
-    for i, ident in enumerate(train_ids):
+    for i, ident in enumerate(selected_ids):
         client_id_splits[i % n_clients].append(ident)
 
     min_ids = min(len(ids) for ids in client_id_splits)
     client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
-    n_dropped = len(train_ids) - min_ids * n_clients
-    print(f"  IDs per client : {min_ids}  (dropped {n_dropped} to equalise)")
 
-    # Build per-client train sets + held-out samples
-    all_train_ids_set = set()
-    for ids in client_id_splits:
-        all_train_ids_set.update(ids)
+    print(f"  [Closed-set] {n_ids} IDs, {min_ids} per client, "
+          f"holdout={sample_holdout:.0%}")
 
+    # Build per-client: train + local test (held-out samples)
     client_data = []
-    held_out_samples = []  # (path, label, spectrum_idx) — same-spectrum held out
+    all_held_out = []  # (path, global_label, spectrum_idx)
 
-    for i, sp in enumerate(spectra):
-        c_ids       = client_id_splits[i]
+    for ci, sp in enumerate(spectra):
+        c_ids = client_id_splits[ci]
         c_label_map = {ident: j for j, ident in enumerate(c_ids)}
 
-        # Split samples: train vs held-out
-        local_all = []
+        # Gather all samples for this client
+        all_samples = []
         for ident in c_ids:
             for p in data[sp][ident]:
-                local_all.append((p, c_label_map[ident], ident))
+                all_samples.append((p, c_label_map[ident], ident))
 
-        rng.shuffle(local_all)
-        n_holdout   = max(1, int(len(local_all) * sample_holdout))
-        local_held  = local_all[:n_holdout]
-        local_train = [(p, label) for p, label, _ in local_all[n_holdout:]]
+        # Hold out per identity (ensures each ID has gallery+probe)
+        train_samples = []
+        held_out = []
+        by_id = defaultdict(list)
+        for s in all_samples:
+            by_id[s[2]].append(s)
 
-        # Track held-out for test set
-        for p, _, ident in local_held:
-            held_out_samples.append((p, test_label_map[ident], i))
+        for ident, id_samples in by_id.items():
+            rng.shuffle(id_samples)
+            n_hold = max(1, int(len(id_samples) * sample_holdout))
+            held_out.extend(id_samples[:n_hold])
+            train_samples.extend(id_samples[n_hold:])
+
+        # Local test: split held-out into gallery/probe per ID
+        local_by_id = defaultdict(list)
+        for p, local_label, ident in held_out:
+            local_by_id[local_label].append((p, local_label))
+
+        local_gal, local_prb = [], []
+        for label, samples in local_by_id.items():
+            rng.shuffle(samples)
+            n_gal = max(1, int(len(samples) * gallery_ratio))
+            local_gal.extend(samples[:n_gal])
+            local_prb.extend(samples[n_gal:])
+
+        # Track held-out for global test set
+        for p, _, ident in held_out:
+            all_held_out.append((p, test_label_map[ident], ci))
 
         client_data.append({
-            "spectrum"      : sp,
-            "train_samples" : local_train,
-            "label_map"     : c_label_map,
-            "num_classes"   : min_ids,
+            "spectrum"       : sp,
+            "train_samples"  : [(p, l) for p, l, _ in train_samples],
+            "local_test_gal" : local_gal,
+            "local_test_prb" : local_prb,
+            "label_map"      : c_label_map,
+            "num_classes"    : min_ids,
         })
-        print(f"    Client {i} [{sp:>6}]  "
-              f"train={len(local_train)}  held_out={len(local_held)}")
+        print(f"    Client {ci} [{sp:>6}]  train={len(train_samples)}  "
+              f"held_out={len(held_out)}  "
+              f"local_gal={len(local_gal)}  local_prb={len(local_prb)}")
 
-    # Build global test set:
-    # 1. Held-out same-spectrum samples (from above)
-    # 2. ALL cross-spectrum samples for all client IDs
-    cross_spectrum_samples = []
-    for sp_idx, sp in enumerate(spectra):
-        client_ids_for_sp = set(client_id_splits[sp_idx])
-        for other_sp_idx, other_sp in enumerate(spectra):
-            if other_sp_idx == sp_idx:
-                continue  # skip same spectrum (already in held-out)
-            for ident in client_id_splits[sp_idx]:
-                for p in data[other_sp][ident]:
-                    cross_spectrum_samples.append(
-                        (p, test_label_map[ident], other_sp_idx))
-
-    all_test = held_out_samples + cross_spectrum_samples
-    print(f"  Test pool: {len(held_out_samples)} held-out + "
-          f"{len(cross_spectrum_samples)} cross-spectrum = {len(all_test)}")
-
-    # Split into gallery / probe
-    by_id = defaultdict(list)
-    for s in all_test:
-        by_id[s[1]].append(s)
+    # Global test: gallery/probe from all held-out samples
+    global_by_id = defaultdict(list)
+    for s in all_held_out:
+        global_by_id[s[1]].append(s)
 
     gallery_samples, probe_samples = [], []
-    for label, samples in by_id.items():
+    for label, samples in global_by_id.items():
         rng.shuffle(samples)
-        n_gal = max(1, round(len(samples) * gallery_ratio))
+        n_gal = max(1, int(len(samples) * gallery_ratio))
         gallery_samples.extend(samples[:n_gal])
         probe_samples.extend(samples[n_gal:])
 
-    print(f"  Gallery: {len(gallery_samples)}  |  Probe: {len(probe_samples)}")
+    print(f"  Global test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
     return (client_data, gallery_samples, probe_samples,
             test_label_map, spectra)
 
 
+def build_federated_splits_closed_set_xjtu(data_root, n_ids, gallery_ratio,
+                                            sample_holdout=0.20, seed=42):
+    """Closed-set split for XJTU dataset."""
+    rng  = random.Random(seed)
+    data = parse_xjtu_domains(data_root, seed=seed)
+
+    domains       = XJTU_VARIATIONS
+    n_clients     = len(domains)
+    domain_labels = [f"{d}/{c}" for d, c in domains]
+
+    common_ids = set(data[domains[0]].keys())
+    for dom in domains[1:]:
+        common_ids &= set(data[dom].keys())
+    common_ids = sorted(common_ids)
+
+    if len(common_ids) < n_ids:
+        raise ValueError(f"Requested {n_ids} IDs but only {len(common_ids)} common.")
+
+    selected_ids = sorted(rng.sample(common_ids, n_ids))
+    rng.shuffle(selected_ids)
+    test_label_map = {ident: i for i, ident in enumerate(sorted(selected_ids))}
+
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(selected_ids):
+        client_id_splits[i % n_clients].append(ident)
+
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+
+    print(f"  [Closed-set XJTU] {n_ids} IDs, {min_ids} per client")
+
+    client_data = []
+    all_held_out = []
+
+    for ci, dom in enumerate(domains):
+        c_ids = client_id_splits[ci]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+
+        all_samples = []
+        for ident in c_ids:
+            for p in data[dom][ident]:
+                all_samples.append((p, c_label_map[ident], ident))
+
+        train_samples = []
+        held_out = []
+        by_id = defaultdict(list)
+        for s in all_samples:
+            by_id[s[2]].append(s)
+
+        for ident, id_samples in by_id.items():
+            rng.shuffle(id_samples)
+            n_hold = max(1, int(len(id_samples) * sample_holdout))
+            held_out.extend(id_samples[:n_hold])
+            train_samples.extend(id_samples[n_hold:])
+
+        local_by_id = defaultdict(list)
+        for p, local_label, ident in held_out:
+            local_by_id[local_label].append((p, local_label))
+
+        local_gal, local_prb = [], []
+        for label, samples in local_by_id.items():
+            rng.shuffle(samples)
+            n_gal = max(1, int(len(samples) * gallery_ratio))
+            local_gal.extend(samples[:n_gal])
+            local_prb.extend(samples[n_gal:])
+
+        for p, _, ident in held_out:
+            all_held_out.append((p, test_label_map[ident], ci))
+
+        client_data.append({
+            "spectrum"       : domain_labels[ci],
+            "domain"         : dom,
+            "train_samples"  : [(p, l) for p, l, _ in train_samples],
+            "local_test_gal" : local_gal,
+            "local_test_prb" : local_prb,
+            "label_map"      : c_label_map,
+            "num_classes"    : min_ids,
+        })
+        print(f"    Client {ci} [{domain_labels[ci]:>14}]  "
+              f"train={len(train_samples)}  held={len(held_out)}")
+
+    global_by_id = defaultdict(list)
+    for s in all_held_out:
+        global_by_id[s[1]].append(s)
+
+    gallery_samples, probe_samples = [], []
+    for label, samples in global_by_id.items():
+        rng.shuffle(samples)
+        n_gal = max(1, int(len(samples) * gallery_ratio))
+        gallery_samples.extend(samples[:n_gal])
+        probe_samples.extend(samples[n_gal:])
+
+    print(f"  Global test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, domain_labels)
+
+
+# ══════════════════════════════════════════════════════════════
+#  UNIFIED DISPATCHER (replaces original get_federated_splits)
+# ══════════════════════════════════════════════════════════════
+
 def get_federated_splits(cfg, seed=42):
-    """
-    Dispatcher: calls correct split builder based on dataset + eval_protocol.
-    """
     dataset  = cfg["dataset"].strip().lower()
     protocol = cfg.get("eval_protocol", "open_set").strip().lower()
 
@@ -658,10 +757,13 @@ def get_federated_splits(cfg, seed=42):
 
     elif dataset == "xjtu":
         if protocol == "closed_set":
-            print("[WARN] Closed-set not implemented for XJTU, using open-set")
-        return build_federated_splits_xjtu(
-            cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
-            cfg["gallery_ratio"], seed=seed)
+            return build_federated_splits_closed_set_xjtu(
+                cfg["xjtu_data_root"], cfg["n_ids"], cfg["gallery_ratio"],
+                cfg.get("closed_set_sample_ratio", 0.20), seed=seed)
+        else:
+            return build_federated_splits_xjtu(
+                cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
+                cfg["gallery_ratio"], seed=seed)
 
     else:
         raise ValueError(f"Unknown dataset: '{dataset}'")
