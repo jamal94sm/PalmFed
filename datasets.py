@@ -641,6 +641,190 @@ def build_federated_splits_closed_set(data_root, n_ids, gallery_ratio,
             test_label_map, spectra)
 
 
+def build_federated_splits_cross_spectrum(data_root, n_ids, gallery_ratio,
+                                           seed=42):
+    """
+    Closed-set, non-shared-ID, CROSS-SPECTRUM split for CASIA-MS.
+
+    Each client trains on ALL its same-spectrum samples (no holdout).
+    Test set = ALL other-spectrum samples for same IDs.
+
+    Client WHT with IDs {1,...,33}:
+      Train: WHT × {1,...,33} (all samples)
+      Local test: 460×{1,...,33} + 630×{1,...,33} + ... (5 unseen spectrums)
+    Global test: union of all clients' cross-spectrum samples.
+    """
+    rng  = random.Random(seed)
+    data = parse_casia_ms(data_root)
+
+    spectra   = sorted(data.keys())
+    n_clients = len(spectra)
+
+    common_ids = set(data[spectra[0]].keys())
+    for sp in spectra[1:]:
+        common_ids &= set(data[sp].keys())
+    common_ids = sorted(common_ids)
+
+    if len(common_ids) < n_ids:
+        raise ValueError(f"Requested {n_ids} IDs but only {len(common_ids)} common.")
+
+    selected_ids = sorted(rng.sample(common_ids, n_ids))
+    rng.shuffle(selected_ids)
+    test_label_map = {ident: i for i, ident in enumerate(sorted(selected_ids))}
+
+    # Round-robin partition
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(selected_ids):
+        client_id_splits[i % n_clients].append(ident)
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+
+    print(f"  [Cross-spectrum] {n_ids} IDs, {min_ids} per client")
+
+    client_data = []
+    all_gallery = []
+    all_probe = []
+
+    for ci, sp in enumerate(spectra):
+        c_ids = client_id_splits[ci]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+
+        # Train: ALL same-spectrum samples (no holdout)
+        train_samples = []
+        for ident in c_ids:
+            for p in data[sp][ident]:
+                train_samples.append((p, c_label_map[ident]))
+
+        # Local test: all OTHER spectrums for this client's IDs
+        # Split gallery/probe per ID per unseen spectrum (20% gal, 80% prb)
+        local_gal, local_prb = [], []
+        for other_idx, other_sp in enumerate(spectra):
+            if other_idx == ci:
+                continue
+            for ident in c_ids:
+                paths = list(data[other_sp][ident])
+                rng.shuffle(paths)
+                n_gal = max(1, int(len(paths) * gallery_ratio))
+                for p in paths[:n_gal]:
+                    local_gal.append((p, c_label_map[ident]))
+                for p in paths[n_gal:]:
+                    local_prb.append((p, c_label_map[ident]))
+
+        client_data.append({
+            "spectrum"       : sp,
+            "train_samples"  : train_samples,
+            "local_test_gal" : local_gal,
+            "local_test_prb" : local_prb,
+            "label_map"      : c_label_map,
+            "num_classes"    : min_ids,
+        })
+        print(f"    Client {ci} [{sp:>6}]  train={len(train_samples)}  "
+              f"gal={len(local_gal)}  prb={len(local_prb)}")
+
+        # Collect for global test (with global labels + spectrum idx)
+        inv_label_map = {v: k for k, v in c_label_map.items()}
+        for p, local_label in local_gal:
+            ident = inv_label_map[local_label]
+            all_gallery.append((p, test_label_map[ident], ci))
+        for p, local_label in local_prb:
+            ident = inv_label_map[local_label]
+            all_probe.append((p, test_label_map[ident], ci))
+
+    # Global = union of local galleries/probes (preserves 20/80 ratio)
+    gallery_samples = all_gallery
+    probe_samples = all_probe
+
+    print(f"  Global test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, spectra)
+
+
+def build_federated_splits_cross_spectrum_xjtu(data_root, n_ids,
+                                                gallery_ratio, seed=42):
+    """Cross-spectrum split for XJTU dataset."""
+    rng  = random.Random(seed)
+    data = parse_xjtu_domains(data_root, seed=seed)
+
+    domains       = XJTU_VARIATIONS
+    n_clients     = len(domains)
+    domain_labels = [f"{d}/{c}" for d, c in domains]
+
+    common_ids = set(data[domains[0]].keys())
+    for dom in domains[1:]:
+        common_ids &= set(data[dom].keys())
+    common_ids = sorted(common_ids)
+
+    if len(common_ids) < n_ids:
+        raise ValueError(f"Requested {n_ids} IDs but only {len(common_ids)} common.")
+
+    selected_ids = sorted(rng.sample(common_ids, n_ids))
+    rng.shuffle(selected_ids)
+    test_label_map = {ident: i for i, ident in enumerate(sorted(selected_ids))}
+
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(selected_ids):
+        client_id_splits[i % n_clients].append(ident)
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+
+    print(f"  [Cross-spectrum XJTU] {n_ids} IDs, {min_ids} per client")
+
+    client_data = []
+    all_gallery = []
+    all_probe = []
+
+    for ci, dom in enumerate(domains):
+        c_ids = client_id_splits[ci]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+
+        train_samples = []
+        for ident in c_ids:
+            for p in data[dom][ident]:
+                train_samples.append((p, c_label_map[ident]))
+
+        # Per ID per unseen domain: 20% gallery, 80% probe
+        local_gal, local_prb = [], []
+        for other_idx, other_dom in enumerate(domains):
+            if other_idx == ci:
+                continue
+            for ident in c_ids:
+                paths = list(data[other_dom][ident])
+                rng.shuffle(paths)
+                n_gal = max(1, int(len(paths) * gallery_ratio))
+                for p in paths[:n_gal]:
+                    local_gal.append((p, c_label_map[ident]))
+                for p in paths[n_gal:]:
+                    local_prb.append((p, c_label_map[ident]))
+
+        client_data.append({
+            "spectrum"       : domain_labels[ci],
+            "domain"         : dom,
+            "train_samples"  : train_samples,
+            "local_test_gal" : local_gal,
+            "local_test_prb" : local_prb,
+            "label_map"      : c_label_map,
+            "num_classes"    : min_ids,
+        })
+        print(f"    Client {ci} [{domain_labels[ci]:>14}]  "
+              f"train={len(train_samples)}  "
+              f"gal={len(local_gal)}  prb={len(local_prb)}")
+
+        inv_label_map = {v: k for k, v in c_label_map.items()}
+        for p, local_label in local_gal:
+            ident = inv_label_map[local_label]
+            all_gallery.append((p, test_label_map[ident], ci))
+        for p, local_label in local_prb:
+            ident = inv_label_map[local_label]
+            all_probe.append((p, test_label_map[ident], ci))
+
+    gallery_samples = all_gallery
+    probe_samples = all_probe
+
+    print(f"  Global test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, domain_labels)
+
+
 def build_federated_splits_closed_set_xjtu(data_root, n_ids, gallery_ratio,
                                             sample_holdout=0.20, seed=42):
     """Closed-set split for XJTU dataset."""
@@ -746,12 +930,18 @@ def build_federated_splits_closed_set_xjtu(data_root, n_ids, gallery_ratio,
 def get_federated_splits(cfg, seed=42):
     dataset  = cfg["dataset"].strip().lower()
     protocol = cfg.get("eval_protocol", "open_set").strip().lower()
+    cs_mode  = cfg.get("closed_set_mode", "holdout").strip().lower()
 
     if dataset == "casiams":
         if protocol == "closed_set":
-            return build_federated_splits_closed_set(
-                cfg["data_root"], cfg["n_ids"], cfg["gallery_ratio"],
-                cfg.get("closed_set_sample_ratio", 0.20), seed=seed)
+            if cs_mode == "cross_spectrum":
+                return build_federated_splits_cross_spectrum(
+                    cfg["data_root"], cfg["n_ids"], cfg["gallery_ratio"],
+                    seed=seed)
+            else:
+                return build_federated_splits_closed_set(
+                    cfg["data_root"], cfg["n_ids"], cfg["gallery_ratio"],
+                    cfg.get("closed_set_sample_ratio", 0.20), seed=seed)
         else:
             return build_federated_splits(
                 cfg["data_root"], cfg["n_ids"], cfg["k_test"],
@@ -759,9 +949,15 @@ def get_federated_splits(cfg, seed=42):
 
     elif dataset == "xjtu":
         if protocol == "closed_set":
-            return build_federated_splits_closed_set_xjtu(
-                cfg["xjtu_data_root"], cfg["n_ids"], cfg["gallery_ratio"],
-                cfg.get("closed_set_sample_ratio", 0.20), seed=seed)
+            if cs_mode == "cross_spectrum":
+                return build_federated_splits_cross_spectrum_xjtu(
+                    cfg["xjtu_data_root"], cfg["n_ids"],
+                    cfg["gallery_ratio"], seed=seed)
+            else:
+                return build_federated_splits_closed_set_xjtu(
+                    cfg["xjtu_data_root"], cfg["n_ids"],
+                    cfg["gallery_ratio"],
+                    cfg.get("closed_set_sample_ratio", 0.20), seed=seed)
         else:
             return build_federated_splits_xjtu(
                 cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
