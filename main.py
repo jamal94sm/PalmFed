@@ -4,8 +4,12 @@ main.py — Federated Palmprint with MoE Routing.
 Per round:
   1. Server → clients: global_model weights
   2. Each client: local_model ← copy(global), fine-tune on local data + cross-client FFT
-  3. Evaluate + print per-client local & MoE, then averages + global
-  4. Upload local_models → server → FedAvg → new global_model
+  3. Evaluate on local test + global test
+  4. FedAvg local_models → new global_model
+
+Evaluation:
+  Local test (per client):  local model + MoE on that client's held-out samples
+  Global test:              local models + global model + MoE on full test set
 """
 
 import os, json, time, copy, random
@@ -13,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from collections import defaultdict
 from PIL import Image
 
 from configs import CONFIG
@@ -78,22 +83,18 @@ def fedavg(models, exclude_prefixes=("arc.",)):
 
 
 def compute_eer_r1(prb_feats, prb_labels, gal_feats, gal_labels):
-    """Compute R1 + EER from pre-extracted features."""
     from sklearn.metrics import roc_curve
     sim = prb_feats @ gal_feats.T
     top_idx = sim.argmax(dim=1)
     predicted = gal_labels[top_idx]
     rank1 = (predicted == prb_labels).float().mean().item() * 100
-
     genuine, impostor = [], []
     for i in range(len(prb_labels)):
         pid = prb_labels[i].item()
-        sims = sim[i].numpy()
-        glabs = gal_labels.numpy()
+        sims = sim[i].numpy(); glabs = gal_labels.numpy()
         gen_mask = glabs == pid; imp_mask = glabs != pid
         if gen_mask.any(): genuine.extend(sims[gen_mask].tolist())
         if imp_mask.any(): impostor.extend(sims[imp_mask].tolist())
-
     genuine = np.array(genuine); impostor = np.array(impostor)
     all_lab = np.concatenate([np.ones(len(genuine)), np.zeros(len(impostor))])
     all_sc = np.concatenate([genuine, impostor])
@@ -111,6 +112,8 @@ def main():
 
     protocol = cfg.get("eval_protocol", "open_set")
     dp_mode = cfg.get("dp_mode", "ideal")
+    is_closed = (protocol == "closed_set")
+
     print(f"\n{'='*80}")
     print(f"  Federated Palmprint — Global / Local / MoE")
     print(f"  Protocol: {protocol} | DP mode: {dp_mode}")
@@ -158,14 +161,35 @@ def main():
         print(f"    Client {ci} [{cd['spectrum']:>6}]  "
               f"IDs={cd['num_classes']}  aug={len(ds)}")
 
-    # Test loaders
+    # ── Global test loaders ──
     gal_ds = PalmDataset(gallery_samples, cfg["img_side"])
     prb_ds = PalmDataset(probe_samples, cfg["img_side"])
-    gallery_loader = DataLoader(gal_ds, batch_size=cfg["batch_size"],
-                                 num_workers=cfg["num_workers"])
-    probe_loader = DataLoader(prb_ds, batch_size=cfg["batch_size"],
-                               num_workers=cfg["num_workers"])
-    print(f"\n  Test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
+    global_gal_loader = DataLoader(gal_ds, batch_size=cfg["batch_size"],
+                                    num_workers=cfg["num_workers"])
+    global_prb_loader = DataLoader(prb_ds, batch_size=cfg["batch_size"],
+                                    num_workers=cfg["num_workers"])
+    print(f"\n  Global test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
+
+    # ── Local test loaders (closed-set only) ──
+    local_test_loaders = []
+    if is_closed:
+        for ci, cd in enumerate(client_data):
+            local_gal = cd.get("local_test_gal", [])
+            local_prb = cd.get("local_test_prb", [])
+            if local_gal and local_prb:
+                gds = PalmDataset(local_gal, cfg["img_side"])
+                pds = PalmDataset(local_prb, cfg["img_side"])
+                local_test_loaders.append({
+                    "gal_loader": DataLoader(gds, batch_size=cfg["batch_size"],
+                                             num_workers=cfg["num_workers"]),
+                    "prb_loader": DataLoader(pds, batch_size=cfg["batch_size"],
+                                             num_workers=cfg["num_workers"]),
+                    "n_gal": len(local_gal), "n_prb": len(local_prb),
+                })
+                print(f"    Local test [{cd['spectrum']:>6}]: "
+                      f"Gal={len(local_gal)} Prb={len(local_prb)}")
+            else:
+                local_test_loaders.append(None)
 
     # ══════════════════════════════════════════════════════════
     #  TRAINING
@@ -206,84 +230,135 @@ def main():
             print(f"  Rnd {rnd:3d}/{cfg['n_rounds']}  "
                   f"loss={avg_loss:.4f}  [{elapsed:.1f}s]")
 
-        # ── Evaluation (before FedAvg) ──
+        # ── Evaluation ──
         if rnd % cfg["eval_every"] == 0 or rnd == cfg["n_rounds"]:
             print(f"\n  ── Eval round {rnd} ──")
             global_model.eval()
             for m in local_models:
                 m.eval()
 
-            # Per-client: local model on full test set
-            print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s} │ "
-                  f"{'MoE R1':>8s} {'MoE EER':>9s}")
-            print(f"    {'─'*52}")
+            rnd_entry = {"round": rnd, "loss": avg_loss}
 
-            client_local_results = []
+            # ────────────────────────────────────
+            #  LOCAL TEST (closed-set only)
+            # ────────────────────────────────────
+            if is_closed and local_test_loaders:
+                print(f"\n    LOCAL TEST (per-client held-out)")
+                print(f"    {'Client':>8s} │ {'Local R1':>9s} {'EER':>7s} │ "
+                      f"{'MoE R1':>8s} {'EER':>7s}")
+                print(f"    {'─'*48}")
+
+                local_test_results = []
+                for ci in range(n_clients):
+                    lt = local_test_loaders[ci]
+                    spec = client_data[ci]["spectrum"]
+                    if lt is None:
+                        local_test_results.append(None)
+                        continue
+
+                    # Local model on its own test set
+                    rl = evaluate_single_model(
+                        local_models[ci], lt["gal_loader"],
+                        lt["prb_loader"], device)
+
+                    # MoE on local test set
+                    gf, gl = extract_embeddings_routed(
+                        local_models, global_model, lt["gal_loader"],
+                        domain_predictor, cfg, device, mode="moe")
+                    pf, pl = extract_embeddings_routed(
+                        local_models, global_model, lt["prb_loader"],
+                        domain_predictor, cfg, device, mode="moe")
+                    mr1, meer = compute_eer_r1(pf, pl, gf, gl)
+
+                    local_test_results.append({
+                        "local": rl, "moe": {"rank1": mr1, "eer": meer}})
+
+                    print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>6.2f}% │ "
+                          f"{mr1:>7.2f}% {meer:>6.2f}%")
+
+                valid = [r for r in local_test_results if r is not None]
+                if valid:
+                    alr = np.mean([r["local"]["rank1"] for r in valid])
+                    ale = np.mean([r["local"]["eer"] for r in valid])
+                    amr = np.mean([r["moe"]["rank1"] for r in valid])
+                    ame = np.mean([r["moe"]["eer"] for r in valid])
+                    print(f"    {'─'*48}")
+                    print(f"    {'Avg':>8s} │ {alr:>8.2f}% {ale:>6.2f}% │ "
+                          f"{amr:>7.2f}% {ame:>6.2f}%")
+                    rnd_entry["local_test"] = {
+                        "avg_local": {"rank1": alr, "eer": ale},
+                        "avg_moe": {"rank1": amr, "eer": ame},
+                        "per_client": local_test_results,
+                    }
+
+            # ────────────────────────────────────
+            #  GLOBAL TEST
+            # ────────────────────────────────────
+            print(f"\n    GLOBAL TEST")
+            print(f"    {'Client':>8s} │ {'Local R1':>9s} {'EER':>7s} │ "
+                  f"{'MoE R1':>8s} {'EER':>7s}")
+            print(f"    {'─'*48}")
+
+            # Per-client local model on global test
+            client_global_results = []
             for ci in range(n_clients):
                 spec = client_data[ci]["spectrum"]
                 rl = evaluate_single_model(
-                    local_models[ci], gallery_loader, probe_loader, device)
-                client_local_results.append(rl)
+                    local_models[ci], global_gal_loader,
+                    global_prb_loader, device)
+                client_global_results.append(rl)
 
-            # MoE: per-sample routing on full test set
-            gal_feats_moe, gal_labels_moe = extract_embeddings_routed(
-                local_models, global_model, gallery_loader,
+            # MoE on global test
+            gf_moe, gl_moe = extract_embeddings_routed(
+                local_models, global_model, global_gal_loader,
                 domain_predictor, cfg, device, mode="moe")
-            prb_feats_moe, prb_labels_moe = extract_embeddings_routed(
-                local_models, global_model, probe_loader,
+            pf_moe, pl_moe = extract_embeddings_routed(
+                local_models, global_model, global_prb_loader,
                 domain_predictor, cfg, device, mode="moe")
-            moe_r1, moe_eer = compute_eer_r1(
-                prb_feats_moe, prb_labels_moe,
-                gal_feats_moe, gal_labels_moe)
+            moe_r1, moe_eer = compute_eer_r1(pf_moe, pl_moe, gf_moe, gl_moe)
 
-            # Per-client MoE: filter test set by domain, show MoE on that subset
+            # Per-client MoE on domain-filtered global test
             client_moe_results = []
             for ci in range(n_clients):
-                # Filter gallery/probe to samples from this domain
                 gal_mask = torch.tensor(
                     [s[2] == ci for s in gallery_samples], dtype=torch.bool)
                 prb_mask = torch.tensor(
                     [s[2] == ci for s in probe_samples], dtype=torch.bool)
-
                 if gal_mask.any() and prb_mask.any():
-                    gf = gal_feats_moe[gal_mask]
-                    gl = gal_labels_moe[gal_mask]
-                    pf = prb_feats_moe[prb_mask]
-                    pl = prb_labels_moe[prb_mask]
-                    mr1, meer = compute_eer_r1(pf, pl, gf, gl)
+                    mr1, meer = compute_eer_r1(
+                        pf_moe[prb_mask], pl_moe[prb_mask],
+                        gf_moe[gal_mask], gl_moe[gal_mask])
                 else:
                     mr1, meer = 0.0, 50.0
                 client_moe_results.append({"rank1": mr1, "eer": meer})
 
-            # Print per-client
             for ci in range(n_clients):
                 spec = client_data[ci]["spectrum"]
-                rl = client_local_results[ci]
+                rl = client_global_results[ci]
                 rm = client_moe_results[ci]
-                print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>9.2f}% │ "
-                      f"{rm['rank1']:>7.2f}% {rm['eer']:>8.2f}%")
+                print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>6.2f}% │ "
+                      f"{rm['rank1']:>7.2f}% {rm['eer']:>6.2f}%")
 
-            # Averages
-            avg_lr1 = np.mean([r["rank1"] for r in client_local_results])
-            avg_leer = np.mean([r["eer"] for r in client_local_results])
+            avg_lr1 = np.mean([r["rank1"] for r in client_global_results])
+            avg_leer = np.mean([r["eer"] for r in client_global_results])
 
-            # Global model on full test set
+            # Global model on global test
             rg = evaluate_single_model(
-                global_model, gallery_loader, probe_loader, device)
+                global_model, global_gal_loader, global_prb_loader, device)
 
-            print(f"    {'─'*52}")
-            print(f"    {'Avg Local':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>9.2f}% │")
-            print(f"    {'MoE':>8s} │ {'':>20s} │ {moe_r1:>7.2f}% {moe_eer:>8.2f}%")
-            print(f"    {'Global':>8s} │ {rg['rank1']:>8.2f}% {rg['eer']:>9.2f}% │")
+            print(f"    {'─'*48}")
+            print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>6.2f}% │")
+            print(f"    {'MoE':>8s} │ {'':>18s} │ {moe_r1:>7.2f}% {moe_eer:>6.2f}%")
+            print(f"    {'Global':>8s} │ {rg['rank1']:>8.2f}% {rg['eer']:>6.2f}% │")
 
-            history.append({
-                "round": rnd, "loss": avg_loss,
+            rnd_entry["global_test"] = {
                 "global": rg,
                 "avg_local": {"rank1": avg_lr1, "eer": avg_leer},
                 "moe": {"rank1": moe_r1, "eer": moe_eer},
-                "per_client_local": client_local_results,
+                "per_client_local": client_global_results,
                 "per_client_moe": client_moe_results,
-            })
+            }
+            history.append(rnd_entry)
             print()
 
         # Step 3: FedAvg → new global
@@ -304,25 +379,43 @@ def main():
     print(f"  COMPLETE — {protocol}, dp_mode={dp_mode}")
     print(f"{'='*80}")
 
-    print(f"\n  {'Rnd':>5} │ {'Global':>16s} │ {'Avg Local':>16s} │ "
+    print(f"\n  GLOBAL TEST SUMMARY")
+    print(f"  {'Rnd':>5} │ {'Global':>16s} │ {'Avg Local':>16s} │ "
           f"{'MoE':>16s}")
     print(f"  {'':>5} │ {'R1':>7s} {'EER':>7s} │ "
           f"{'R1':>7s} {'EER':>7s} │ {'R1':>7s} {'EER':>7s}")
     print(f"  {'─'*58}")
 
     for h in history:
-        rg = h["global"]; rl = h["avg_local"]; rm = h["moe"]
+        gt = h["global_test"]
+        rg = gt["global"]; rl = gt["avg_local"]; rm = gt["moe"]
         print(f"  {h['round']:>5d} │ "
               f"{rg['rank1']:>6.1f}% {rg['eer']:>6.1f}% │ "
               f"{rl['rank1']:>6.1f}% {rl['eer']:>6.1f}% │ "
               f"{rm['rank1']:>6.1f}% {rm['eer']:>6.1f}%")
 
+    if is_closed and any("local_test" in h for h in history):
+        print(f"\n  LOCAL TEST SUMMARY")
+        print(f"  {'Rnd':>5} │ {'Avg Local':>16s} │ {'Avg MoE':>16s}")
+        print(f"  {'':>5} │ {'R1':>7s} {'EER':>7s} │ {'R1':>7s} {'EER':>7s}")
+        print(f"  {'─'*42}")
+        for h in history:
+            lt = h.get("local_test", {})
+            al = lt.get("avg_local", {}); am = lt.get("avg_moe", {})
+            if al and am:
+                print(f"  {h['round']:>5d} │ "
+                      f"{al['rank1']:>6.1f}% {al['eer']:>6.1f}% │ "
+                      f"{am['rank1']:>6.1f}% {am['eer']:>6.1f}%")
+
     if history:
+        gt = history[-1]["global_test"]
         for mode, key in [("Global", "global"), ("Avg Local", "avg_local"),
                           ("MoE", "moe")]:
-            best = max(history, key=lambda h: h[key]["rank1"])
+            best = max(history,
+                       key=lambda h: h["global_test"][key]["rank1"])
+            r = best["global_test"][key]
             print(f"\n  Best {mode:>9s}: Rnd {best['round']}  "
-                  f"R1={best[key]['rank1']:.2f}%  EER={best[key]['eer']:.2f}%")
+                  f"R1={r['rank1']:.2f}%  EER={r['eer']:.2f}%")
 
     save_path = os.path.join(results_dir,
                               f"results_{protocol}_{dp_mode}.json")
