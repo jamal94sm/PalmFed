@@ -17,7 +17,7 @@ CONFIG = {
     "base_results_dir" : "./rst_palmfed_{dataset}",
     "splits_path"      : None,
 
-    "n_ids"            : 192,
+    "n_ids"            : 200,
     "k_test"           : 0.20,
     "gallery_ratio"    : 0.20,
     "img_side"         : 128,
@@ -25,6 +25,10 @@ CONFIG = {
     # ── Evaluation Protocol ──────────────────────────────────
     "eval_protocol"    : "open_set",    # open_set | closed_set
     "closed_set_sample_ratio": 0.20,
+    # closed_set_mode:
+    #   holdout:        hold out 20% same-spectrum samples per client
+    #   cross_spectrum: test on ALL other spectrums for same IDs (no holdout)
+    "closed_set_mode"  : "cross_spectrum",  # holdout | cross_spectrum
 
     # ── Model ────────────────────────────────────────────────
     "model"            : "compnet",
@@ -35,7 +39,7 @@ CONFIG = {
     "use_moe"          : False,
 
     # ── Federated Learning ───────────────────────────────────
-    "n_rounds"         : 100,
+    "n_rounds"         : 50,
     "local_epochs"     : 1,
     "batch_size"       : 64,
     "lr"               : 0.001,
