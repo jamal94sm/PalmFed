@@ -352,17 +352,21 @@ def emb_global(server_model, x):
     return fe                          # already L2-normed in compnet_fedpalm
 
 
-def evaluate_local_avg(local_models, gallery_loader, probe_loader, device):
-    """Per-client independent evaluation, then average EER and Rank-1."""
-    eers, r1s = [], []
-    for m in local_models:
+def evaluate_local_avg(local_models, gallery_loader, probe_loader,
+                       device, client_names=None):
+    """Per-client evaluation + average."""
+    per_client = []
+    for i, m in enumerate(local_models):
         m.eval()
         eer, r1 = evaluate_split(
             lambda x, _m=m: _m(x, None, None)[1],
             gallery_loader, probe_loader, device)
-        eers.append(eer)
-        r1s.append(r1)
-    return sum(eers) / len(eers), sum(r1s) / len(r1s)
+        per_client.append((eer, r1))
+        name = client_names[i] if client_names else f"Client {i}"
+        print(f"    {name:>8s}  EER={eer*100:.3f}%  Rank-1={r1:.2f}%")
+    avg_eer = sum(e for e, _ in per_client) / len(per_client)
+    avg_r1 = sum(r for _, r in per_client) / len(per_client)
+    return avg_eer, avg_r1, per_client
 
 
 # ══════════════════════════════════════════════════════════════
@@ -564,6 +568,12 @@ def main():
         print(f"  Short group  EER={sh_eer*100:.4f}%  Rank-1={sh_r1:.2f}%")
         print(f"  Long  group  EER={lo_eer*100:.4f}%  Rank-1={lo_r1:.2f}%")
         print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
+
+        # Local avg (per-client models)
+        la_eer, la_r1, _ = evaluate_local_avg(
+            local_models, gallery_loader, probe_loader, device,
+            client_names=[cd["spectrum"] for cd in client_data])
+        print(f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
 
         with open(results_path, "a") as f:
             f.write(f"{rnd:>6}\t"
