@@ -526,11 +526,23 @@ def main():
             schedulers[i].step()
             round_losses.append(loss)
 
+        elapsed = time.time() - t0
+
         # Step 2a: sub-group aggregation
         if short_ids:
             fedavg(visib_net, [local_models[i] for i in short_ids])
         if long_ids:
             fedavg(invis_net, [local_models[i] for i in long_ids])
+
+        # ── Evaluate BEFORE global fedavg+broadcast ──
+        eval_every = cfg.get("eval_every", 10)
+        do_eval = (rnd % eval_every == 0 or rnd == cfg["n_rounds"])
+
+        if do_eval:
+            # Per-client local evaluation (locals still have fine-tuned weights)
+            la_eer, la_r1, _ = evaluate_local_avg(
+                local_models, gallery_loader, probe_loader, device,
+                client_names=[cd["spectrum"] for cd in client_data])
 
         # Step 2b: global aggregation
         fedavg(server_model, local_models)
@@ -538,48 +550,46 @@ def main():
         # Step 2c: broadcast global model to all local models
         broadcast(server_model, local_models)
 
-        elapsed = time.time() - t0
+        if do_eval:
+            # Short group model
+            sh_eer, sh_r1 = evaluate_split(
+                lambda x: emb_global(visib_net, x),
+                gallery_loader, probe_loader, device)
 
-        # Step 3: evaluation — 3 pairs
-        # (1) Short group model (visib_net)
-        sh_eer, sh_r1 = evaluate_split(
-            lambda x: emb_global(visib_net, x),
-            gallery_loader, probe_loader, device)
+            # Long group model
+            lo_eer, lo_r1 = evaluate_split(
+                lambda x: emb_global(invis_net, x),
+                gallery_loader, probe_loader, device)
 
-        # (2) Long group model (invis_net)
-        lo_eer, lo_r1 = evaluate_split(
-            lambda x: emb_global(invis_net, x),
-            gallery_loader, probe_loader, device)
+            # Global model (after FedAvg)
+            g_eer, g_r1 = evaluate_split(
+                lambda x: emb_global(server_model, x),
+                gallery_loader, probe_loader, device)
 
-        # (3) Global model (FedAvg of all clients)
-        g_eer, g_r1 = evaluate_split(
-            lambda x: emb_global(server_model, x),
-            gallery_loader, probe_loader, device)
-
-        recent.append((g_eer, g_r1))
-        if len(recent) > cfg["avg_last_rounds"]:
-            recent.pop(0)
+            recent.append((g_eer, g_r1))
+            if len(recent) > cfg["avg_last_rounds"]:
+                recent.pop(0)
 
         avg_loss = sum(round_losses) / len(round_losses)
         ts       = time.strftime("%H:%M:%S")
 
-        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
-              f"loss={avg_loss:.4f}  ({elapsed:.1f}s)")
-        print(f"  Short group  EER={sh_eer*100:.4f}%  Rank-1={sh_r1:.2f}%")
-        print(f"  Long  group  EER={lo_eer*100:.4f}%  Rank-1={lo_r1:.2f}%")
-        print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
+        if do_eval:
+            print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
+                  f"loss={avg_loss:.4f}  ({elapsed:.1f}s)")
+            print(f"  Short group  EER={sh_eer*100:.4f}%  Rank-1={sh_r1:.2f}%")
+            print(f"  Long  group  EER={lo_eer*100:.4f}%  Rank-1={lo_r1:.2f}%")
+            print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
+            print(f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
 
-        # Local avg (per-client models)
-        la_eer, la_r1, _ = evaluate_local_avg(
-            local_models, gallery_loader, probe_loader, device,
-            client_names=[cd["spectrum"] for cd in client_data])
-        print(f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
-
-        with open(results_path, "a") as f:
-            f.write(f"{rnd:>6}\t"
-                    f"{sh_eer*100:.4f}\t{sh_r1:.2f}\t"
-                    f"{lo_eer*100:.4f}\t{lo_r1:.2f}\t"
-                    f"{g_eer*100:.4f}\t{g_r1:.2f}\n")
+            with open(results_path, "a") as f:
+                f.write(f"{rnd:>6}\t"
+                        f"{sh_eer*100:.4f}\t{sh_r1:.2f}\t"
+                        f"{lo_eer*100:.4f}\t{lo_r1:.2f}\t"
+                        f"{g_eer*100:.4f}\t{g_r1:.2f}\t"
+                        f"{la_eer*100:.4f}\t{la_r1:.2f}\n")
+        elif rnd % 5 == 0:
+            print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
+                  f"loss={avg_loss:.4f}  ({elapsed:.1f}s)")
 
     # ── 8. Final summary ──────────────────────────────────────
     n_avg   = len(recent)
