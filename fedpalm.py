@@ -591,68 +591,70 @@ def main():
                                                       anchor_models)
         elapsed = time.time() - t0
 
-        # Step 3: Evaluation — three modes
+        eval_every = cfg.get("eval_every", 10)
+        do_eval = (rnd % eval_every == 0 or rnd == cfg["n_rounds"])
+
+        # Step 3: Evaluation
         g_eer = g_r1 = la_eer = la_r1 = fp_eer = fp_r1 = 0.0
 
-        if cfg["eval_global"]:
-            g_eer, g_r1 = evaluate_split(
-                lambda x: emb_global(server_model, x),
-                gallery_loader, probe_loader, device)
+        if do_eval:
+            if cfg["eval_global"]:
+                g_eer, g_r1 = evaluate_split(
+                    lambda x: emb_global(server_model, x),
+                    gallery_loader, probe_loader, device)
 
-        if cfg["eval_local_avg"]:
-            la_eer, la_r1, _ = evaluate_local_avg(
-                local_models, gallery_loader, probe_loader, device,
-                client_names=[cd["spectrum"] for cd in client_data])
+            if cfg["eval_local_avg"]:
+                la_eer, la_r1, _ = evaluate_local_avg(
+                    local_models, gallery_loader, probe_loader, device,
+                    client_names=[cd["spectrum"] for cd in client_data])
 
-        if cfg["eval_full"]:
-            fp_eer, fp_r1 = evaluate_split(
-                lambda x: emb_full(server_model, local_models, x),
-                gallery_loader, probe_loader, device)
+            if cfg["eval_full"]:
+                fp_eer, fp_r1 = evaluate_split(
+                    lambda x: emb_full(server_model, local_models, x),
+                    gallery_loader, probe_loader, device)
+
+            recent_global.append((g_eer, g_r1))
+            if len(recent_global) > cfg["avg_last_rounds"]:
+                recent_global.pop(0)
 
         # restore train mode for next round
         server_model.train()
         for m in local_models + anchor_models:
             m.train()
 
-        recent_global.append((g_eer, g_r1))
-        if len(recent_global) > cfg["avg_last_rounds"]:
-            recent_global.pop(0)
-
         # ── Diagnostics ───────────────────────────────────────
         avg_loss = sum(round_losses) / len(round_losses)
         avg_acc  = sum(round_accs)  / len(round_accs)
         ts = time.strftime("%H:%M:%S")
 
-        # per-client training accuracy — rising fast = memorising local IDs
-        acc_str = "  ".join(f"c{i}:{round_accs[i]:.0f}%"
-                             for i in range(n_clients))
+        if do_eval:
+            acc_str = "  ".join(f"c{i}:{round_accs[i]:.0f}%"
+                                 for i in range(n_clients))
+            gm, gs, im, is_ = score_statistics(
+                lambda x: emb_global(server_model, x),
+                gallery_loader, probe_loader, device)
+            fc_norms = "  ".join(
+                f"c{i}:{backbone_weight_norm(local_models[i]):.3f}"
+                for i in range(n_clients))
 
-        # genuine/impostor separation — drop = backbone diverging
-        gm, gs, im, is_ = score_statistics(
-            lambda x: emb_global(server_model, x),
-            gallery_loader, probe_loader, device)
+            print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
+                  f"loss={avg_loss:.4f}  acc={avg_acc:.1f}%  ({elapsed:.1f}s)")
+            print(f"  Per-client acc     : {acc_str}")
+            print(f"  Score sep (gen-imp): {gm-im:.4f}  "
+                  f"gen={gm:.4f}\u00b1{gs:.4f}  imp={im:.4f}\u00b1{is_:.4f}")
+            print(f"  fc_brand norms     : {fc_norms}")
+            print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
+            print(f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
+            print(f"  Full FedPalm EER={fp_eer*100:.4f}%  Rank-1={fp_r1:.2f}%")
 
-        # ArcFace divergence across clients — diagnoses ID-space conflict
-
-        # backbone projection norms
-        fc_norms = "  ".join(f"c{i}:{backbone_weight_norm(local_models[i]):.3f}"
-                              for i in range(n_clients))
-
-        print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
-              f"loss={avg_loss:.4f}  acc={avg_acc:.1f}%  ({elapsed:.1f}s)")
-        print(f"  Per-client acc     : {acc_str}")
-        print(f"  Score sep (gen-imp): {gm-im:.4f}  "
-              f"gen={gm:.4f}\u00b1{gs:.4f}  imp={im:.4f}\u00b1{is_:.4f}")
-        print(f"  fc_brand norms     : {fc_norms}")
-        print(f"  Global       EER={g_eer*100:.4f}%  Rank-1={g_r1:.2f}%")
-        print(f"  Local avg    EER={la_eer*100:.4f}%  Rank-1={la_r1:.2f}%")
-        print(f"  Full FedPalm EER={fp_eer*100:.4f}%  Rank-1={fp_r1:.2f}%")
-
-        with open(results_path, "a") as f:
-            f.write(f"{rnd:>6}\t"
-                    f"{g_eer*100:.4f}\t{g_r1:.2f}\t"
-                    f"{la_eer*100:.4f}\t{la_r1:.2f}\t"
-                    f"{fp_eer*100:.4f}\t{fp_r1:.2f}\n")
+            with open(results_path, "a") as f:
+                f.write(f"{rnd:>6}\t"
+                        f"{g_eer*100:.4f}\t{g_r1:.2f}\t"
+                        f"{la_eer*100:.4f}\t{la_r1:.2f}\t"
+                        f"{fp_eer*100:.4f}\t{fp_r1:.2f}\n")
+        elif rnd % 5 == 0:
+            print(f"[{ts}] Round {rnd:04d}/{cfg['n_rounds']}  "
+                  f"loss={avg_loss:.4f}  acc={avg_acc:.1f}%  ({elapsed:.1f}s)")
 
     # ── 6. Final summary ─────────────────────────────────────
     n_avg   = len(recent_global)
