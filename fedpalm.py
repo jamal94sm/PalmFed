@@ -61,10 +61,11 @@ from torchvision import transforms as T
 from PIL import Image
 
 # ── Config ────────────────────────────────────────────────────
-from configs_fedpalm import CONFIG_FEDPALM as cfg
+from configs import CONFIG_FEDPALM as cfg
 
 # ── Our framework ─────────────────────────────────────────────
 from datasets import (build_federated_splits, build_federated_splits_xjtu,
+                      get_federated_splits,
                       PalmDataset, NormSingleROI)
 from utils import compute_eer
 
@@ -449,15 +450,9 @@ def main():
             client_data, gallery_samples, probe_samples, _, spectra = \
                 pickle.load(f)
     else:
-        print(f"\nBuilding {dataset.upper()} splits …")
-        if dataset == "casiams":
-            result = build_federated_splits(
-                data_root, cfg["n_ids"], cfg["k_test"],
-                cfg["gallery_ratio"], seed=cfg["random_seed"])
-        else:
-            result = build_federated_splits_xjtu(
-                data_root, cfg["n_ids"], cfg["k_test"],
-                cfg["gallery_ratio"], seed=cfg["random_seed"])
+        print(f"\nBuilding {dataset.upper()} splits "
+              f"({cfg.get('eval_protocol', 'open_set')}) …")
+        result = get_federated_splits(cfg, seed=cfg["random_seed"])
         client_data, gallery_samples, probe_samples, _, spectra = result
         os.makedirs(os.path.dirname(splits_path), exist_ok=True)
         with open(splits_path, "wb") as f:
@@ -679,4 +674,18 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    _p = argparse.ArgumentParser()
+    _p.add_argument("--dataset", choices=["casiams", "xjtu"])
+    _p.add_argument("--eval_protocol", choices=["open_set", "closed_set"])
+    _p.add_argument("--closed_set_mode", choices=["holdout", "cross_spectrum"])
+    _p.add_argument("--n_rounds", type=int)
+    _p.add_argument("--random_seed", type=int)
+    _p.add_argument("--splits_path")
+    _p.add_argument("--n_ids", type=int)
+    _p.add_argument("--eval_every", type=int)
+    _args, _ = _p.parse_known_args()
+    for _k, _v in vars(_args).items():
+        if _v is not None:
+            cfg[_k] = _v
     main()
