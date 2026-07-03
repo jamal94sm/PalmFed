@@ -377,24 +377,24 @@ def emb_global(server_model, x):
     return fe   # already L2-normed in compnet_fedpalm
 
 
-def evaluate_local_avg(local_models, gallery_loader, probe_loader, device):
+def evaluate_local_avg(local_models, gallery_loader, probe_loader,
+                       device, client_names=None):
     """
-    Evaluate each local model independently, then average EER and Rank-1.
-    This is the correct "average performance of local models" metric:
-      avg_EER   = mean(EER_0, EER_1, ..., EER_N)
-      avg_Rank1 = mean(Rank1_0, Rank1_1, ..., Rank1_N)
-
-    Distinct from embedding-level ensemble (averaging embeddings before scoring).
+    Evaluate each local model independently.
+    Returns: avg_eer, avg_r1, per_client list of (eer, r1)
     """
-    eers, r1s = [], []
-    for m in local_models:
+    per_client = []
+    for i, m in enumerate(local_models):
         m.eval()
         eer, r1 = evaluate_split(
             lambda x, _m=m: _m(x, None, None)[1],
             gallery_loader, probe_loader, device)
-        eers.append(eer)
-        r1s.append(r1)
-    return sum(eers) / len(eers), sum(r1s) / len(r1s)
+        per_client.append((eer, r1))
+        name = client_names[i] if client_names else f"Client {i}"
+        print(f"    {name:>8s}  EER={eer*100:.3f}%  Rank-1={r1:.2f}%")
+    avg_eer = sum(e for e, _ in per_client) / len(per_client)
+    avg_r1 = sum(r for _, r in per_client) / len(per_client)
+    return avg_eer, avg_r1, per_client
 
 
 def emb_full(server_model, local_models, x):
@@ -600,8 +600,9 @@ def main():
                 gallery_loader, probe_loader, device)
 
         if cfg["eval_local_avg"]:
-            la_eer, la_r1 = evaluate_local_avg(
-                local_models, gallery_loader, probe_loader, device)
+            la_eer, la_r1, _ = evaluate_local_avg(
+                local_models, gallery_loader, probe_loader, device,
+                client_names=[cd["spectrum"] for cd in client_data])
 
         if cfg["eval_full"]:
             fp_eer, fp_r1 = evaluate_split(
