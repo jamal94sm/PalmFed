@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from collections import defaultdict
 from PIL import Image
 
-from configs import CONFIG
+from configs import get_config, CASIA_SPECTRUMS
 from models import build_model, build_domain_predictor
 from datasets import (PalmDataset, FFTAugmentedDataset,
                        get_federated_splits)
@@ -109,6 +109,8 @@ def parse_overrides():
     """Parse command-line overrides for CONFIG dict."""
     import argparse
     p = argparse.ArgumentParser(description="Federated Palmprint")
+    p.add_argument("--method", default="proposed",
+                   choices=["proposed", "fedpalm", "psfed"])
     p.add_argument("--dataset", choices=["casiams", "xjtu"])
     p.add_argument("--eval_protocol", choices=["open_set", "closed_set"])
     p.add_argument("--closed_set_mode", choices=["holdout", "cross_spectrum"])
@@ -131,13 +133,16 @@ def parse_overrides():
     p.add_argument("--closed_set_sample_ratio", type=float)
     p.add_argument("--model", choices=["compnet", "ccnet"])
     args, _ = p.parse_known_args()
-    overrides = {k: v for k, v in vars(args).items() if v is not None}
-    return overrides
+    method = args.method
+    overrides = {k: v for k, v in vars(args).items()
+                 if v is not None and k != "method"}
+    return method, overrides
 
 
 def main():
-    cfg = CONFIG.copy()
-    cfg.update(parse_overrides())
+    method, overrides = parse_overrides()
+    cfg = get_config(method)
+    cfg.update(overrides)
     set_seed(cfg["random_seed"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -146,7 +151,7 @@ def main():
     is_closed = (protocol == "closed_set")
 
     print(f"\n{'='*80}")
-    print(f"  Federated Palmprint — Global / Local / MoE")
+    print(f"  Federated Palmprint — {method.upper()}")
     cs_mode = cfg.get("closed_set_mode", "holdout")
     proto_str = f"{protocol}" + (f" ({cs_mode})" if protocol == "closed_set" else "")
     print(f"  Protocol: {proto_str} | DP mode: {dp_mode}")
