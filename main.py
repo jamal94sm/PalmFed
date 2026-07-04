@@ -154,7 +154,8 @@ def main():
     print(f"  Protocol: {proto_str} | DP mode: {dp_mode}")
     print(f"{'='*80}\n")
 
-    results_dir = cfg["base_results_dir"].replace("{dataset}", cfg["dataset"])
+    results_dir = cfg["base_results_dir"].format(
+        dataset=cfg["dataset"], eval_protocol=protocol)
     os.makedirs(results_dir, exist_ok=True)
 
     # ── Data ──
