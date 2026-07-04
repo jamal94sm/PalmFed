@@ -109,7 +109,8 @@ def parse_overrides():
                    choices=["proposed", "fedpalm", "psfed"])
     p.add_argument("--dataset", choices=["casiams", "xjtu"])
     p.add_argument("--eval_protocol", choices=["open_set", "closed_set"])
-    p.add_argument("--closed_set_mode", choices=["holdout", "cross_spectrum"])
+    p.add_argument("--closed_set_mode", choices=["cross_spectrum"])
+    p.add_argument("--local_eval_scope", choices=["client", "global"])
     p.add_argument("--dp_mode", choices=["ideal", "predicted"])
     p.add_argument("--dp_arch", choices=["mlp", "cnn", "transformer"])
     p.add_argument("--dp_input", choices=["style", "full"])
@@ -214,9 +215,10 @@ def main():
                                     num_workers=cfg["num_workers"])
     print(f"\n  Global test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
 
-    # ── Local test loaders (closed-set only) ──
+    # ── Per-client test loaders (closed-set, client scope) ──
     local_test_loaders = []
-    if is_closed:
+    local_eval_scope = cfg.get("local_eval_scope", "client")
+    if is_closed and local_eval_scope == "client":
         for ci, cd in enumerate(client_data):
             local_gal = cd.get("local_test_gal", [])
             local_prb = cd.get("local_test_prb", [])
@@ -230,7 +232,7 @@ def main():
                                              num_workers=cfg["num_workers"]),
                     "n_gal": len(local_gal), "n_prb": len(local_prb),
                 })
-                print(f"    Local test [{cd['spectrum']:>6}]: "
+                print(f"    Client test [{cd['spectrum']}]: "
                       f"Gal={len(local_gal)} Prb={len(local_prb)}")
             else:
                 local_test_loaders.append(None)
@@ -274,7 +276,6 @@ def main():
             print(f"  Rnd {rnd:3d}/{cfg['n_rounds']}  "
                   f"loss={avg_loss:.4f}  [{elapsed:.1f}s]")
 
-
         # ── Evaluation ──
         if rnd % cfg["eval_every"] == 0 or rnd == cfg["n_rounds"]:
             print(f"\n  ── Eval round {rnd} ──")
@@ -285,70 +286,68 @@ def main():
             rnd_entry = {"round": rnd, "loss": avg_loss}
 
             # ────────────────────────────────────
-            #  LOCAL EVALUATION (holdout mode only)
+            #  LOCAL MODEL EVALUATION
             # ────────────────────────────────────
-            if is_closed and cfg.get("closed_set_mode") == "holdout" and local_test_loaders:
-                cs_mode = cfg.get("closed_set_mode", "cross_spectrum")
-                cs_label = ("cross-spectrum" if cs_mode == "cross_spectrum"
-                            else "held-out samples")
-                print(f"\n    LOCAL EVALUATION ({cs_label})")
+            if is_closed and local_eval_scope == "client" and local_test_loaders:
+                # Each local model on its own client's cross-spectrum data
+                scope_label = "cross-spectrum, per-client scope"
+                print(f"\n    LOCAL EVAL ({scope_label})")
                 print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s}")
                 print(f"    {'─'*32}")
 
-                local_test_results = []
+                client_local_results = []
                 for ci in range(n_clients):
                     lt = local_test_loaders[ci]
                     spec = client_data[ci]["spectrum"]
                     if lt is None:
-                        local_test_results.append(None)
+                        client_local_results.append(None)
                         continue
                     rl = evaluate_single_model(
                         local_models[ci], lt["gal_loader"],
                         lt["prb_loader"], device)
-                    local_test_results.append(rl)
+                    client_local_results.append(rl)
                     print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>9.3f}%")
 
-                valid = [r for r in local_test_results if r is not None]
-                if valid:
-                    alr = np.mean([r["rank1"] for r in valid])
-                    ale = np.mean([r["eer"] for r in valid])
-                    print(f"    {'─'*32}")
-                    print(f"    {'Avg':>8s} │ {alr:>8.2f}% {ale:>9.3f}%")
-                    rnd_entry["local_test"] = {
-                        "avg_local": {"rank1": alr, "eer": ale},
-                        "per_client": local_test_results,
-                    }
+                valid = [r for r in client_local_results if r is not None]
+                avg_lr1 = np.mean([r["rank1"] for r in valid])
+                avg_leer = np.mean([r["eer"] for r in valid])
+                print(f"    {'─'*32}")
+                print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>9.3f}%")
+
+            else:
+                # Each local model on FULL global test set
+                # (open-set, or closed-set with global scope)
+                scope_label = "global scope"
+                print(f"\n    LOCAL EVAL ({scope_label})")
+                print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s}")
+                print(f"    {'─'*32}")
+
+                client_local_results = []
+                for ci in range(n_clients):
+                    spec = client_data[ci]["spectrum"]
+                    rl = evaluate_single_model(
+                        local_models[ci], global_gal_loader,
+                        global_prb_loader, device)
+                    client_local_results.append(rl)
+                    print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>9.3f}%")
+
+                avg_lr1 = np.mean([r["rank1"] for r in client_local_results])
+                avg_leer = np.mean([r["eer"] for r in client_local_results])
+                print(f"    {'─'*32}")
+                print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>9.3f}%")
 
             # ────────────────────────────────────
-            #  EVALUATION
+            #  GLOBAL MODEL EVALUATION (always on full test set)
             # ────────────────────────────────────
-            print(f"\n    EVALUATION")
-            print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s}")
-            print(f"    {'─'*32}")
-
-            client_global_results = []
-            for ci in range(n_clients):
-                spec = client_data[ci]["spectrum"]
-                rl = evaluate_single_model(
-                    local_models[ci], global_gal_loader,
-                    global_prb_loader, device)
-                client_global_results.append(rl)
-                print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>9.3f}%")
-
-            avg_lr1 = np.mean([r["rank1"] for r in client_global_results])
-            avg_leer = np.mean([r["eer"] for r in client_global_results])
-
             rg = evaluate_single_model(
                 global_model, global_gal_loader, global_prb_loader, device)
-
-            print(f"    {'─'*32}")
-            print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>9.3f}%")
             print(f"    {'Global':>8s} │ {rg['rank1']:>8.2f}% {rg['eer']:>9.3f}%")
 
-            rnd_entry["global_test"] = {
+            rnd_entry["eval"] = {
                 "global": rg,
                 "avg_local": {"rank1": avg_lr1, "eer": avg_leer},
-                "per_client_local": client_global_results,
+                "per_client_local": client_local_results,
+                "scope": local_eval_scope if is_closed else "global",
             }
             history.append(rnd_entry)
             print()
@@ -371,35 +370,23 @@ def main():
     print(f"  COMPLETE — {protocol}")
     print(f"{'='*80}")
 
-    print(f"\n  EVALUATION SUMMARY")
+    print(f"\n  SUMMARY")
     print(f"  {'Rnd':>5} │ {'Global':>18s} │ {'Avg Local':>18s}")
     print(f"  {'':>5} │ {'R1':>8s} {'EER':>9s} │ {'R1':>8s} {'EER':>9s}")
     print(f"  {'─'*46}")
 
     for h in history:
-        gt = h["global_test"]
-        rg = gt["global"]; rl = gt["avg_local"]
+        ev = h["eval"]
+        rg = ev["global"]; rl = ev["avg_local"]
         print(f"  {h['round']:>5d} │ "
               f"{rg['rank1']:>7.2f}% {rg['eer']:>8.3f}% │ "
               f"{rl['rank1']:>7.2f}% {rl['eer']:>8.3f}%")
 
-    if is_closed and cfg.get("closed_set_mode") == "holdout" and any("local_test" in h for h in history):
-        print(f"\n  LOCAL EVALUATION SUMMARY")
-        print(f"  {'Rnd':>5} │ {'Avg Local':>18s}")
-        print(f"  {'':>5} │ {'R1':>8s} {'EER':>9s}")
-        print(f"  {'─'*28}")
-        for h in history:
-            lt = h.get("local_test", {})
-            al = lt.get("avg_local", {})
-            if al:
-                print(f"  {h['round']:>5d} │ "
-                      f"{al['rank1']:>7.2f}% {al['eer']:>8.3f}%")
-
     if history:
         for mode, key in [("Global", "global"), ("Avg Local", "avg_local")]:
             best = max(history,
-                       key=lambda h: h["global_test"][key]["rank1"])
-            r = best["global_test"][key]
+                       key=lambda h: h["eval"][key]["rank1"])
+            r = best["eval"][key]
             print(f"\n  Best {mode:>9s}: Rnd {best['round']}  "
                   f"R1={r['rank1']:.2f}%  EER={r['eer']:.3f}%")
 
