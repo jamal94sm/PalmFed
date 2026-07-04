@@ -285,9 +285,9 @@ def main():
             rnd_entry = {"round": rnd, "loss": avg_loss}
 
             # ────────────────────────────────────
-            #  LOCAL EVALUATION (closed-set only)
+            #  LOCAL EVALUATION (holdout mode only)
             # ────────────────────────────────────
-            if is_closed and local_test_loaders:
+            if is_closed and cfg.get("closed_set_mode") == "holdout" and local_test_loaders:
                 cs_mode = cfg.get("closed_set_mode", "cross_spectrum")
                 cs_label = ("cross-spectrum" if cs_mode == "cross_spectrum"
                             else "held-out samples")
@@ -383,7 +383,7 @@ def main():
               f"{rg['rank1']:>7.2f}% {rg['eer']:>8.3f}% │ "
               f"{rl['rank1']:>7.2f}% {rl['eer']:>8.3f}%")
 
-    if is_closed and any("local_test" in h for h in history):
+    if is_closed and cfg.get("closed_set_mode") == "holdout" and any("local_test" in h for h in history):
         print(f"\n  LOCAL EVALUATION SUMMARY")
         print(f"  {'Rnd':>5} │ {'Avg Local':>18s}")
         print(f"  {'':>5} │ {'R1':>8s} {'EER':>9s}")
