@@ -793,7 +793,8 @@ def evaluate_all_modes(local_models, global_model, domain_predictor,
 
 
 def evaluate_single_model(model, gallery_loader, probe_loader, device="cuda"):
-    """Evaluate a single model on gallery/probe. Returns dict with rank1, eer."""
+    """Evaluate a single model on gallery/probe. Returns dict with rank1, eer.
+    Uses the same compute_eer (brentq) as fedpalm/psfed for consistency."""
     model.eval()
     
     gal_feats, gal_labels = [], []
@@ -817,29 +818,23 @@ def evaluate_single_model(model, gallery_loader, probe_loader, device="cuda"):
     prb_feats = torch.cat(prb_feats); prb_labels = torch.cat(prb_labels)
 
     sim = prb_feats @ gal_feats.T
+
+    # Rank-1
     top_idx = sim.argmax(dim=1)
     predicted = gal_labels[top_idx]
     rank1 = (predicted == prb_labels).float().mean().item() * 100
 
-    genuine, impostor = [], []
-    for i in range(len(prb_labels)):
-        pid = prb_labels[i].item()
-        sims = sim[i].numpy()
-        glabs = gal_labels.numpy()
-        gen_mask = glabs == pid
-        imp_mask = glabs != pid
-        if gen_mask.any():
-            genuine.extend(sims[gen_mask].tolist())
-        if imp_mask.any():
-            impostor.extend(sims[imp_mask].tolist())
+    # EER — same as fedpalm/psfed: brentq interpolation
+    scores, lbls = [], []
+    sim_np = sim.numpy()
+    gal_np = gal_labels.numpy()
+    prb_np = prb_labels.numpy()
+    for i in range(len(prb_np)):
+        for j in range(len(gal_np)):
+            scores.append(float(sim_np[i, j]))
+            lbls.append(1 if prb_np[i] == gal_np[j] else -1)
 
-    genuine = np.array(genuine); impostor = np.array(impostor)
-    all_lab = np.concatenate([np.ones(len(genuine)), np.zeros(len(impostor))])
-    all_sc = np.concatenate([genuine, impostor])
-    fpr, tpr, _ = roc_curve(all_lab, all_sc)
-    fnr = 1 - tpr
-    idx = np.argmin(np.abs(fpr - fnr))
-    eer = float((fpr[idx] + fnr[idx]) / 2) * 100
+    eer = compute_eer(np.column_stack([scores, lbls])) * 100
 
     return {"rank1": rank1, "eer": eer,
             "n_gallery": len(gal_labels), "n_probe": len(prb_labels)}
