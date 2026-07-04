@@ -115,35 +115,6 @@ def parse_proposed_log(log_file):
     rounds = []
     lines = open(log_file).readlines()
 
-    # Try JSON first
-    cfg = get_config("proposed")
-    results_dir = cfg["base_results_dir"].replace("{dataset}",
-                                                   cfg.get("dataset", "casiams"))
-    import glob
-    for jf in glob.glob(os.path.join(results_dir, "results_*.json")):
-        with open(jf) as f:
-            data = json.load(f)
-        for h in data.get("history", []):
-            gt = h.get("global_test", {})
-            entry = {
-                "round": h["round"],
-                "global_r1": gt.get("global", {}).get("rank1", -1),
-                "global_eer": gt.get("global", {}).get("eer", -1),
-                "local_r1": gt.get("avg_local", {}).get("rank1", -1),
-                "local_eer": gt.get("avg_local", {}).get("eer", -1),
-                "per_client": [],
-            }
-            for pc in gt.get("per_client_local", []):
-                if pc:
-                    entry["per_client"].append({
-                        "r1": pc.get("rank1", -1),
-                        "eer": pc.get("eer", -1),
-                    })
-            rounds.append(entry)
-        if rounds:
-            return rounds
-
-    # Fallback: parse log lines
     i = 0
     while i < len(lines):
         line = lines[i].strip()
@@ -154,21 +125,24 @@ def parse_proposed_log(log_file):
             rnd = int(m.group(1))
             entry = {"round": rnd, "per_client": []}
 
-            for k in range(i+1, min(i+50, len(lines))):
+            # Scan ahead for EVALUATION section (not LOCAL EVALUATION)
+            in_eval = False
+            for k in range(i+1, min(i+60, len(lines))):
                 l = lines[k].strip()
-                if "Global" in l and "│" in l and "%" in l:
-                    nums = re.findall(r'([\d.]+)%', l)
-                    if len(nums) >= 2:
-                        entry["global_r1"] = float(nums[0])
-                        entry["global_eer"] = float(nums[1])
-                elif "Avg Loc" in l and "%" in l:
-                    nums = re.findall(r'([\d.]+)%', l)
-                    if len(nums) >= 2:
-                        entry["local_r1"] = float(nums[0])
-                        entry["local_eer"] = float(nums[1])
-                elif "│" in l and "%" in l and not any(
+
+                # Start of main EVALUATION block
+                if l == "EVALUATION":
+                    in_eval = True
+                    continue
+
+                if not in_eval:
+                    continue
+
+                # Per-client line: "iPhone/Flash │   99.54%     1.624%"
+                if "│" in l and "%" in l and not any(
                         x in l for x in ["Client", "─", "Global",
-                                          "Avg", "MoE", "Rnd"]):
+                                          "Avg", "MoE", "Rnd",
+                                          "LOCAL"]):
                     nums = re.findall(r'([\d.]+)%', l)
                     name = l.split("│")[0].strip()
                     if len(nums) >= 2 and name:
@@ -176,6 +150,21 @@ def parse_proposed_log(log_file):
                             "name": name, "r1": float(nums[0]),
                             "eer": float(nums[1]),
                         })
+
+                # Avg Loc line
+                if "Avg Loc" in l and "%" in l:
+                    nums = re.findall(r'([\d.]+)%', l)
+                    if len(nums) >= 2:
+                        entry["local_r1"] = float(nums[0])
+                        entry["local_eer"] = float(nums[1])
+
+                # Global line
+                if "Global" in l and "│" in l and "%" in l:
+                    nums = re.findall(r'([\d.]+)%', l)
+                    if len(nums) >= 2:
+                        entry["global_r1"] = float(nums[0])
+                        entry["global_eer"] = float(nums[1])
+                    break  # Global is last, stop scanning
 
             if "global_r1" in entry:
                 rounds.append(entry)
