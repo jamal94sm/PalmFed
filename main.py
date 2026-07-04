@@ -287,6 +287,10 @@ def main():
             #  LOCAL EVALUATION (closed-set only)
             # ────────────────────────────────────
             if is_closed and local_test_loaders:
+                cs_mode = cfg.get("closed_set_mode", "cross_spectrum")
+                cs_label = ("cross-spectrum" if cs_mode == "cross_spectrum"
+                            else "held-out samples")
+                print(f"\n    LOCAL EVALUATION ({cs_label})")
                 print(f"\n    LOCAL EVALUATION (per-client held-out)")
                 print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s}")
                 print(f"    {'─'*32}")
