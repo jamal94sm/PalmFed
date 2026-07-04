@@ -291,7 +291,6 @@ def main():
                 cs_label = ("cross-spectrum" if cs_mode == "cross_spectrum"
                             else "held-out samples")
                 print(f"\n    LOCAL EVALUATION ({cs_label})")
-                print(f"\n    LOCAL EVALUATION (per-client held-out)")
                 print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s}")
                 print(f"    {'─'*32}")
 
