@@ -434,30 +434,36 @@ def main():
 
     # ── resolve paths ────────────────────────────────────────
     dataset    = cfg["dataset"]
-    out_dir    = cfg["base_results_dir"].format(dataset=dataset)
-    splits_path = cfg["splits_path"].format(dataset=dataset)
+    protocol   = cfg.get("eval_protocol", "open_set")
+    out_dir    = cfg["base_results_dir"].format(dataset=dataset,
+                                                 eval_protocol=protocol)
     os.makedirs(out_dir, exist_ok=True)
-    results_path = os.path.join(out_dir, "results.txt")
+    results_path = os.path.join(out_dir, f"results_{protocol}.txt")
 
     data_root  = (cfg["data_root"] if dataset == "casiams"
                   else cfg["xjtu_data_root"])
 
     # ── 1. Build / load splits ───────────────────────────────
     import pickle
-    if os.path.exists(splits_path):
-        print(f"\nLoading existing splits from {splits_path}")
+    splits_path = cfg.get("splits_path")
+    if splits_path and os.path.exists(splits_path):
+        print(f"\nLoading shared splits from {splits_path}")
         with open(splits_path, "rb") as f:
             client_data, gallery_samples, probe_samples, _, spectra = \
                 pickle.load(f)
+        n_test_ids = len(set(s[1] for s in gallery_samples + probe_samples))
+        print(f"  Verified: {len(client_data)} clients, "
+              f"gallery={len(gallery_samples)}, probe={len(probe_samples)}, "
+              f"test_IDs={n_test_ids}")
     else:
-        print(f"\nBuilding {dataset.upper()} splits "
-              f"({cfg.get('eval_protocol', 'open_set')}) …")
+        print(f"\nBuilding {dataset.upper()} splits ({protocol}) …")
         result = get_federated_splits(cfg, seed=cfg["random_seed"])
         client_data, gallery_samples, probe_samples, _, spectra = result
-        os.makedirs(os.path.dirname(splits_path), exist_ok=True)
-        with open(splits_path, "wb") as f:
+        # Save for reproducibility
+        save_splits = os.path.join(out_dir, f"splits_{protocol}.pkl")
+        with open(save_splits, "wb") as f:
             pickle.dump(result, f)
-        print(f"  Splits saved to {splits_path}")
+        print(f"  Splits saved to {save_splits}")
 
     n_clients = len(client_data)
     img_side  = cfg["img_side"]
