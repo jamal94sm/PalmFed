@@ -28,6 +28,11 @@ _BASE = {
     "eval_protocol"    : "open_set",
     "closed_set_mode"  : "cross_spectrum",
     "closed_set_sample_ratio": 0.20,
+    # local_eval_scope (closed-set only):
+    #   "client": each local model on its own client's cross-spectrum data
+    #   "global": each local model on the full global test set
+    # open-set always uses global test set for both local and global eval
+    "local_eval_scope" : "client",     # client | global
 
     "model"            : "compnet",
     "embedding_dim"    : 512,
