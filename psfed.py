@@ -386,26 +386,33 @@ def main():
     set_seed(cfg["random_seed"])
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = cfg["dataset"]
+    protocol = cfg.get("eval_protocol", "open_set")
 
-    out_dir     = cfg["base_results_dir"].format(dataset=dataset)
-    splits_path = cfg["splits_path"].format(dataset=dataset)
+    out_dir = cfg["base_results_dir"].format(dataset=dataset,
+                                              eval_protocol=protocol)
     os.makedirs(out_dir, exist_ok=True)
-    results_path = os.path.join(out_dir, "results.txt")
+    results_path = os.path.join(out_dir, f"results_{protocol}.txt")
 
     # ── 1. Load / build splits ────────────────────────────────
-    if os.path.exists(splits_path):
-        print(f"\nLoading existing splits from {splits_path}")
+    import pickle
+    splits_path = cfg.get("splits_path")
+    if splits_path and os.path.exists(splits_path):
+        print(f"\nLoading shared splits from {splits_path}")
         with open(splits_path, "rb") as f:
             client_data, gallery_samples, probe_samples, _, spectra = \
                 pickle.load(f)
+        n_test_ids = len(set(s[1] for s in gallery_samples + probe_samples))
+        print(f"  Verified: {len(client_data)} clients, "
+              f"gallery={len(gallery_samples)}, probe={len(probe_samples)}, "
+              f"test_IDs={n_test_ids}")
     else:
-        print(f"\nBuilding {dataset.upper()} splits "
-              f"({cfg.get('eval_protocol', 'open_set')}) …")
+        print(f"\nBuilding {dataset.upper()} splits ({protocol}) …")
         result = get_federated_splits(cfg, seed=cfg["random_seed"])
         client_data, gallery_samples, probe_samples, _, spectra = result
-        os.makedirs(os.path.dirname(splits_path), exist_ok=True)
-        with open(splits_path, "wb") as f:
+        save_splits = os.path.join(out_dir, f"splits_{protocol}.pkl")
+        with open(save_splits, "wb") as f:
             pickle.dump(result, f)
+        print(f"  Splits saved to {save_splits}")
 
     n_clients = len(client_data)
 
