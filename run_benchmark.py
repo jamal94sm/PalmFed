@@ -26,7 +26,7 @@ def parse_args():
     p.add_argument("--eval_protocol", default="open_set",
                    choices=["open_set", "closed_set"])
     p.add_argument("--closed_set_mode", default="cross_spectrum",
-                   choices=["holdout", "cross_spectrum"])
+                   choices=["cross_spectrum"])
     p.add_argument("--n_rounds", type=int, default=100)
     p.add_argument("--n_ids", type=int, default=200)
     p.add_argument("--random_seed", type=int, default=42)
