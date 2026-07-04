@@ -51,7 +51,10 @@ def generate_shared_splits(args):
 
     splits = get_federated_splits(cfg, seed=args.random_seed)
     os.makedirs(args.output_dir, exist_ok=True)
-    splits_path = os.path.join(args.output_dir, "shared_splits.pkl")
+    cs_mode = f"_{args.closed_set_mode}" if args.eval_protocol == "closed_set" else ""
+    splits_path = os.path.join(
+        args.output_dir,
+        f"splits_{args.dataset}_{args.eval_protocol}{cs_mode}_seed{args.random_seed}.pkl")
     with open(splits_path, "wb") as f:
         pickle.dump(splits, f)
 
