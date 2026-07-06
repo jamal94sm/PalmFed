@@ -32,7 +32,7 @@ _BASE = {
     #   "client": each local model on its own client's cross-spectrum data
     #   "global": each local model on the full global test set
     # open-set always uses global test set for both local and global eval
-    "local_eval_scope" : "client",     # client | global
+    "local_eval_scope" : "global",     # client | global
 
     "model"            : "compnet",
     "embedding_dim"    : 512,
