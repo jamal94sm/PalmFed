@@ -792,6 +792,7 @@ def evaluate_all_modes(local_models, global_model, domain_predictor,
     return results
 
 
+@torch.no_grad()
 def extract(embedding_fn, loader, device):
     """Extract embeddings using any callable embedding_fn(x) → [B, D]."""
     feats, labels = [], []
