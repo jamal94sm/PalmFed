@@ -315,7 +315,7 @@ def main():
                     m = local_models[ci]
                     m.eval()
                     eer, r1 = evaluate_split(
-                        lambda x, _m=m: emb_global(_m, x),
+                        lambda x, _m=m: _m(x, None, None)[1],
                         lt["gal_loader"], lt["prb_loader"], device)
                     client_results.append({"rank1": r1, "eer": eer * 100})
                     print(f"    {spec:>8s} │ {r1:>8.2f}% {eer*100:>9.3f}%")
