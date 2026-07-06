@@ -66,6 +66,12 @@ CONFIG = {
     "base_results_dir" : "./rst_proposed_{dataset}_{eval_protocol}",
     "use_moe"          : False,
 
+    # Loss: w1 × CE + w2 × SupCon (same as PSFed for fair comparison)
+    "w1"               : 0.8,
+    "w2"               : 0.2,
+    "temperature"      : 0.07,
+
+    # FFT augmentation (unique to proposed)
     "beta"             : 0.15,
     "local_M"          : 2,
     "local_beta"       : 0.15,
