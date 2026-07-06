@@ -91,6 +91,14 @@ def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
     return total_loss / n, total_ce / n, total_con / n, acc
 
 
+@torch.no_grad()
+def emb_global(model, x):
+    """Global model embedding — same as fedpalm/psfed."""
+    model.eval()
+    _, fe, _ = model(x, None, None)
+    return fe
+
+
 def fedavg(models, exclude_prefixes=("arc",)):
     avg_state = {}
     n = len(models)
@@ -307,7 +315,7 @@ def main():
                     m = local_models[ci]
                     m.eval()
                     eer, r1 = evaluate_split(
-                        lambda x, _m=m: _m(x, None, None)[1],
+                        lambda x, _m=m: emb_global(_m, x),
                         lt["gal_loader"], lt["prb_loader"], device)
                     client_results.append({"rank1": r1, "eer": eer * 100})
                     print(f"    {spec:>8s} │ {r1:>8.2f}% {eer*100:>9.3f}%")
@@ -331,10 +339,9 @@ def main():
                 print(f"    {'─'*32}")
                 print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>9.3f}%")
 
-            # Global eval (always full test set, same path as baselines)
-            global_model.eval()
+            # Global eval (always full test set, same as baselines)
             g_eer, g_r1 = evaluate_split(
-                lambda x: global_model(x, None, None)[1],
+                lambda x: emb_global(global_model, x),
                 global_gal_loader, global_prb_loader, device)
             rg = {"rank1": g_r1, "eer": g_eer * 100}
             print(f"    {'Global':>8s} │ {g_r1:>8.2f}% {g_eer*100:>9.3f}%")
