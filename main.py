@@ -28,8 +28,8 @@ from datasets import (PalmDataset, FFTAugmentedDataset,
                        get_federated_splits)
 from loss_fedpalm import SupConLoss
 from utils import (extract_style_template, build_dp_dataset,
-                    train_domain_predictor, evaluate_single_model,
-                    compute_eer)
+                    train_domain_predictor, evaluate_split,
+                    evaluate_local_avg, compute_eer)
 
 
 def set_seed(seed):
@@ -291,6 +291,8 @@ def main():
 
             rnd_entry = {"round": rnd, "loss": avg_loss}
 
+            emb_fn = lambda x, _m=None: None  # placeholder
+
             # Local eval
             if is_closed and local_eval_scope == "client" and local_test_loaders:
                 print(f"\n    LOCAL EVAL (cross-spectrum, per-client scope)")
@@ -302,37 +304,40 @@ def main():
                     spec = client_data[ci]["spectrum"]
                     if lt is None:
                         client_results.append(None); continue
-                    rl = evaluate_single_model(
-                        local_models[ci], lt["gal_loader"],
-                        lt["prb_loader"], device)
-                    client_results.append(rl)
-                    print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>9.3f}%")
+                    m = local_models[ci]
+                    m.eval()
+                    eer, r1 = evaluate_split(
+                        lambda x, _m=m: _m(x, None, None)[1],
+                        lt["gal_loader"], lt["prb_loader"], device)
+                    client_results.append({"rank1": r1, "eer": eer * 100})
+                    print(f"    {spec:>8s} │ {r1:>8.2f}% {eer*100:>9.3f}%")
                 valid = [r for r in client_results if r]
                 avg_lr1 = np.mean([r["rank1"] for r in valid])
                 avg_leer = np.mean([r["eer"] for r in valid])
                 print(f"    {'─'*32}")
                 print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>9.3f}%")
             else:
+                # Same evaluate_local_avg as fedpalm/psfed
                 print(f"\n    LOCAL EVAL (global scope)")
                 print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s}")
                 print(f"    {'─'*32}")
-                client_results = []
-                for ci in range(n_clients):
-                    spec = client_data[ci]["spectrum"]
-                    rl = evaluate_single_model(
-                        local_models[ci], global_gal_loader,
-                        global_prb_loader, device)
-                    client_results.append(rl)
-                    print(f"    {spec:>8s} │ {rl['rank1']:>8.2f}% {rl['eer']:>9.3f}%")
-                avg_lr1 = np.mean([r["rank1"] for r in client_results])
-                avg_leer = np.mean([r["eer"] for r in client_results])
+                avg_eer, avg_r1, per_client = evaluate_local_avg(
+                    local_models, global_gal_loader, global_prb_loader,
+                    device, client_names=[cd["spectrum"] for cd in client_data])
+                avg_lr1 = avg_r1
+                avg_leer = avg_eer * 100
+                client_results = [{"rank1": r, "eer": e * 100}
+                                  for e, r in per_client]
                 print(f"    {'─'*32}")
                 print(f"    {'Avg Loc':>8s} │ {avg_lr1:>8.2f}% {avg_leer:>9.3f}%")
 
-            # Global eval (always full test set)
-            rg = evaluate_single_model(
-                global_model, global_gal_loader, global_prb_loader, device)
-            print(f"    {'Global':>8s} │ {rg['rank1']:>8.2f}% {rg['eer']:>9.3f}%")
+            # Global eval (always full test set, same path as baselines)
+            global_model.eval()
+            g_eer, g_r1 = evaluate_split(
+                lambda x: global_model(x, None, None)[1],
+                global_gal_loader, global_prb_loader, device)
+            rg = {"rank1": g_r1, "eer": g_eer * 100}
+            print(f"    {'Global':>8s} │ {g_r1:>8.2f}% {g_eer*100:>9.3f}%")
 
             rnd_entry["eval"] = {
                 "global": rg,
