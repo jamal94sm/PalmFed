@@ -792,49 +792,47 @@ def evaluate_all_modes(local_models, global_model, domain_predictor,
     return results
 
 
-def evaluate_single_model(model, gallery_loader, probe_loader, device="cuda"):
-    """Evaluate a single model on gallery/probe. Returns dict with rank1, eer.
-    Uses the same compute_eer (brentq) as fedpalm/psfed for consistency."""
-    model.eval()
-    
-    gal_feats, gal_labels = [], []
-    for batch in gallery_loader:
-        imgs, labels = batch[0], batch[1]
-        imgs = imgs.to(device)
-        with torch.no_grad():
-            emb = model.get_embedding(imgs)
-            emb = F.normalize(emb, p=2, dim=1)
-        gal_feats.append(emb.cpu()); gal_labels.append(labels)
-    gal_feats = torch.cat(gal_feats); gal_labels = torch.cat(gal_labels)
+def extract(embedding_fn, loader, device):
+    """Extract embeddings using any callable embedding_fn(x) → [B, D]."""
+    feats, labels = [], []
+    for imgs, labs in loader:
+        feats.append(embedding_fn(imgs.to(device)).cpu().numpy())
+        labels.append(labs.numpy())
+    return np.concatenate(feats), np.concatenate(labels)
 
-    prb_feats, prb_labels = [], []
-    for batch in probe_loader:
-        imgs, labels = batch[0], batch[1]
-        imgs = imgs.to(device)
-        with torch.no_grad():
-            emb = model.get_embedding(imgs)
-            emb = F.normalize(emb, p=2, dim=1)
-        prb_feats.append(emb.cpu()); prb_labels.append(labels)
-    prb_feats = torch.cat(prb_feats); prb_labels = torch.cat(prb_labels)
 
-    sim = prb_feats @ gal_feats.T
+def evaluate_split(embedding_fn, gallery_loader, probe_loader, device):
+    """EER + Rank-1 using compute_eer (brentq). Same as fedpalm/psfed."""
+    gal_f, gal_l = extract(embedding_fn, gallery_loader, device)
+    prb_f, prb_l = extract(embedding_fn, probe_loader,   device)
+    sim = np.nan_to_num(prb_f @ gal_f.T, nan=0.0)
 
-    # Rank-1
-    top_idx = sim.argmax(dim=1)
-    predicted = gal_labels[top_idx]
-    rank1 = (predicted == prb_labels).float().mean().item() * 100
-
-    # EER — same as fedpalm/psfed: brentq interpolation
     scores, lbls = [], []
-    sim_np = sim.numpy()
-    gal_np = gal_labels.numpy()
-    prb_np = prb_labels.numpy()
-    for i in range(len(prb_np)):
-        for j in range(len(gal_np)):
-            scores.append(float(sim_np[i, j]))
-            lbls.append(1 if prb_np[i] == gal_np[j] else -1)
+    for i in range(len(prb_f)):
+        for j in range(len(gal_f)):
+            scores.append(float(sim[i, j]))
+            lbls.append(1 if prb_l[i] == gal_l[j] else -1)
 
-    eer = compute_eer(np.column_stack([scores, lbls])) * 100
+    eer  = compute_eer(np.column_stack([scores, lbls]))
+    nn_i = np.argmax(sim, axis=1)
+    r1   = 100.0 * sum(prb_l[i] == gal_l[nn_i[i]]
+                       for i in range(len(prb_f))) / max(len(prb_f), 1)
+    return eer, r1
 
-    return {"rank1": rank1, "eer": eer,
-            "n_gallery": len(gal_labels), "n_probe": len(prb_labels)}
+
+@torch.no_grad()
+def evaluate_local_avg(local_models, gallery_loader, probe_loader,
+                       device, client_names=None):
+    """Per-client evaluation + average. Same path as fedpalm/psfed."""
+    per_client = []
+    for i, m in enumerate(local_models):
+        m.eval()
+        eer, r1 = evaluate_split(
+            lambda x, _m=m: _m(x, None, None)[1],
+            gallery_loader, probe_loader, device)
+        per_client.append((eer, r1))
+        name = client_names[i] if client_names else f"Client {i}"
+        print(f"    {name:>8s} │ {r1:>8.2f}% {eer*100:>9.3f}%")
+    avg_eer = sum(e for e, _ in per_client) / len(per_client)
+    avg_r1 = sum(r for _, r in per_client) / len(per_client)
+    return avg_eer, avg_r1, per_client
