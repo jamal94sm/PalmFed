@@ -51,11 +51,18 @@ def build_style_bank(client_data, img_side):
 
 
 def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
-                    device, w1=0.4, w2=0.4, w3=0.2):
-    """One epoch: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon."""
+                    device, w1=0.4, w2=0.4, w3=0.2, w4=0.1,
+                    anchor_model=None, anchor_align="mse"):
+    """
+    One epoch: w1×CE(orig) + w2×CE(aug) + w3×SupCon + w4×anchor_align.
+    anchor_model: frozen global model (start-of-round snapshot).
+    """
     model.train()
-    total_loss = 0; total_ce1 = 0; total_ce2 = 0; total_con = 0
+    total_loss = 0; total_ce1 = 0; total_ce2 = 0
+    total_con = 0; total_anc = 0
     correct = 0; total = 0
+
+    mse_criterion = nn.MSELoss()
 
     for batch in loader:
         imgs_pair, labels, domain_ids = batch
@@ -64,7 +71,7 @@ def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
 
         optimizer.zero_grad()
 
-        # Forward both views
+        # Forward both views through local model
         output1, fe1, _ = model(img1, labels)
         output2, fe2, _ = model(img2, labels)
 
@@ -79,6 +86,31 @@ def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
         supcon = con_criterion(fe, labels)
 
         loss = w1 * ce1 + w2 * ce2 + w3 * supcon
+
+        # Anchor alignment: pull local features toward frozen global
+        if anchor_model is not None and w4 > 0:
+            with torch.no_grad():
+                anchor_model.eval()
+                _, anchor_fe1, _ = anchor_model(img1, None, None)
+                _, anchor_fe2, _ = anchor_model(img2, None, None)
+
+            if anchor_align == "mse":
+                anc_loss = (mse_criterion(fe1, anchor_fe1.detach())
+                          + mse_criterion(fe2, anchor_fe2.detach())) / 2
+            elif anchor_align == "supcon":
+                # SupCon: local views + anchor views (4 views total)
+                fe_anc = torch.cat([
+                    fe1.unsqueeze(1),
+                    fe2.unsqueeze(1),
+                    anchor_fe1.detach().unsqueeze(1),
+                    anchor_fe2.detach().unsqueeze(1),
+                ], dim=1)  # [B, 4, D]
+                anc_loss = con_criterion(fe_anc, labels)
+            else:
+                anc_loss = torch.tensor(0.0, device=device)
+
+            loss = loss + w4 * anc_loss
+            total_anc += anc_loss.item()
 
         loss.backward()
         optimizer.step()
@@ -158,14 +190,17 @@ def main():
     w1 = cfg.get("w1", 0.4)
     w2 = cfg.get("w2", 0.4)
     w3 = cfg.get("w3", 0.2)
+    w4 = cfg.get("w4", 0.1)
+    anchor_align = cfg.get("anchor_align", "mse")
     temperature = cfg.get("temperature", 0.07)
 
     print(f"\n{'='*80}")
-    print(f"  Proposed Method — FedAvg + FFT + SupCon")
+    print(f"  Proposed Method — FedAvg + FFT + SupCon + Anchor")
     cs_mode = cfg.get("closed_set_mode", "cross_spectrum")
     proto_str = f"{protocol}" + (f" ({cs_mode})" if is_closed else "")
     print(f"  Protocol: {proto_str}")
-    print(f"  Loss: {w1}×CE(orig) + {w2}×CE(aug) + {w3}×SupCon")
+    print(f"  Loss: {w1}×CE(orig) + {w2}×CE(aug) + {w3}×SupCon + {w4}×{anchor_align.upper()}")
+    print(f"  Anchor: frozen global model (feature alignment)")
     print(f"  Model: compnet_fedpalm (grayscale)")
     print(f"{'='*80}\n")
 
@@ -268,6 +303,7 @@ def main():
         t0 = time.time()
 
         # Step 1: copy global → local (skip arc layer)
+        # Global model IS the anchor (frozen snapshot before fine-tuning)
         global_state = global_model.state_dict()
         for ci in range(n_clients):
             local_state = local_models[ci].state_dict()
@@ -278,13 +314,18 @@ def main():
                     local_state[key] = val.clone()
             local_models[ci].load_state_dict(local_state)
 
+        # Anchor = frozen global model (no gradient, eval mode)
+        anchor = global_model  # same weights, used with torch.no_grad()
+
         # Step 2: fine-tune local (persistent optimizer + scheduler)
         losses = []
         for ci in range(n_clients):
             for _ in range(cfg["local_epochs"]):
                 loss, _, _, _ = train_one_epoch(
                     local_models[ci], loaders[ci], optimizers[ci],
-                    ce_criterion, con_criterion, device, w1, w2, w3)
+                    ce_criterion, con_criterion, device,
+                    w1, w2, w3, w4,
+                    anchor_model=anchor, anchor_align=anchor_align)
             losses.append(loss)
             schedulers[ci].step()
 
