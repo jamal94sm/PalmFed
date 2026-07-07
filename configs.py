@@ -67,10 +67,10 @@ CONFIG = {
     "use_moe"          : False,
 
     # Loss: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon + w4×anchor_align
-    "w1"               : 0.4,       # CE on original
-    "w2"               : 0.4,       # CE on FFT-augmented
+    "w1"               : 0.8,       # CE on original
+    "w2"               : 0.8,       # CE on FFT-augmented
     "w3"               : 0.2,       # SupCon on both views
-    "w4"               : 0.1,       # anchor alignment
+    "w4"               : 0.2,       # anchor alignment
     "anchor_align"     : "mse",     # mse | supcon
     "temperature"      : 0.07,
 
