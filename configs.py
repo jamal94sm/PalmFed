@@ -70,7 +70,7 @@ CONFIG = {
     "w1"               : 0.4,       # CE on original
     "w2"               : 0.4,       # CE on FFT-augmented
     "w3"               : 0.0,       # SupCon on both views
-    "w4"               : 0.2,       # anchor alignment
+    "w4"               : 0.0,       # anchor alignment
     "anchor_align"     : "mse",     # mse | supcon
     # anchor_level:
     #   feature: anchor = frozen global (resets each round)
