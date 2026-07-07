@@ -45,7 +45,7 @@ _BASE = {
     "batch_size"       : 64,
     "lr"               : 0.001,
     "lr_step"          : 20,
-    "lr_gamma"         : 0.5,
+    "lr_gamma"         : 1, #0.5
     "M"                : 2,
     "num_workers"      : 4,
 
