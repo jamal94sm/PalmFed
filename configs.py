@@ -32,7 +32,7 @@ _BASE = {
     #   "client": each local model on its own client's cross-spectrum data
     #   "global": each local model on the full global test set
     # open-set always uses global test set for both local and global eval
-    "local_eval_scope" : "global",     # client | global
+    "local_eval_scope" : "client",     # client | global
 
     "model"            : "compnet",
     "embedding_dim"    : 512,
@@ -66,9 +66,10 @@ CONFIG = {
     "base_results_dir" : "./rst_proposed_{dataset}_{eval_protocol}",
     "use_moe"          : False,
 
-    # Loss: w1 × CE + w2 × SupCon (same as PSFed for fair comparison)
-    "w1"               : 0.8,
-    "w2"               : 0.2,
+    # Loss: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon
+    "w1"               : 0.4,       # CE on original
+    "w2"               : 0.4,       # CE on FFT-augmented
+    "w3"               : 0.2,       # SupCon on both views
     "temperature"      : 0.07,
 
     # FFT augmentation (unique to proposed)
