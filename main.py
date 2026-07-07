@@ -192,6 +192,8 @@ def main():
     w3 = cfg.get("w3", 0.2)
     w4 = cfg.get("w4", 0.1)
     anchor_align = cfg.get("anchor_align", "mse")
+    anchor_level = cfg.get("anchor_level", "feature")
+    ema_beta = cfg.get("ema_beta", 0.996)
     temperature = cfg.get("temperature", 0.07)
 
     print(f"\n{'='*80}")
@@ -200,7 +202,10 @@ def main():
     proto_str = f"{protocol}" + (f" ({cs_mode})" if is_closed else "")
     print(f"  Protocol: {proto_str}")
     print(f"  Loss: {w1}×CE(orig) + {w2}×CE(aug) + {w3}×SupCon + {w4}×{anchor_align.upper()}")
-    print(f"  Anchor: frozen global model (feature alignment)")
+    if anchor_level == "model":
+        print(f"  Anchor: EMA of global (β={ema_beta}, model-level)")
+    else:
+        print(f"  Anchor: frozen global (feature-level)")
     print(f"  Model: compnet_fedpalm (grayscale)")
     print(f"{'='*80}\n")
 
@@ -257,6 +262,17 @@ def main():
     global_model = compnet_fedpalm(
         num_classes=client_data[0]["num_classes"]).to(device)
 
+    # EMA anchor model (model-level alignment)
+    ema_model = None
+    if anchor_level == "model":
+        ema_model = compnet_fedpalm(
+            num_classes=client_data[0]["num_classes"]).to(device)
+        # Initialize EMA with same weights as global
+        ema_model.load_state_dict(global_model.state_dict())
+        for p in ema_model.parameters():
+            p.requires_grad = False
+        print(f"  EMA anchor model initialized (β={ema_beta})")
+
     # Loss
     ce_criterion = nn.CrossEntropyLoss()
     con_criterion = SupConLoss(temperature=temperature)
@@ -303,7 +319,6 @@ def main():
         t0 = time.time()
 
         # Step 1: copy global → local (skip arc layer)
-        # Global model IS the anchor (frozen snapshot before fine-tuning)
         global_state = global_model.state_dict()
         for ci in range(n_clients):
             local_state = local_models[ci].state_dict()
@@ -314,8 +329,11 @@ def main():
                     local_state[key] = val.clone()
             local_models[ci].load_state_dict(local_state)
 
-        # Anchor = frozen global model (no gradient, eval mode)
-        anchor = global_model  # same weights, used with torch.no_grad()
+        # Select anchor based on anchor_level
+        if anchor_level == "model" and ema_model is not None:
+            anchor = ema_model      # EMA anchor (accumulates across rounds)
+        else:
+            anchor = global_model   # frozen global (resets every round)
 
         # Step 2: fine-tune local (persistent optimizer + scheduler)
         losses = []
@@ -411,6 +429,13 @@ def main():
             if key in src and new_state[key].shape == src[key].shape:
                 new_state[key] = src[key].clone()
         global_model.load_state_dict(new_state)
+
+        # Step 4: Update EMA anchor (model-level only)
+        if anchor_level == "model" and ema_model is not None:
+            with torch.no_grad():
+                for ema_p, glob_p in zip(ema_model.parameters(),
+                                          global_model.parameters()):
+                    ema_p.data.mul_(ema_beta).add_(glob_p.data, alpha=1 - ema_beta)
 
     # ══════════════════════════════════════════════════════════
     #  SUMMARY
