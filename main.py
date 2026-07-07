@@ -51,10 +51,10 @@ def build_style_bank(client_data, img_side):
 
 
 def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
-                    device, w1=0.8, w2=0.2):
-    """One epoch: w1×CE + w2×SupCon on FFT-augmented paired views."""
+                    device, w1=0.4, w2=0.4, w3=0.2):
+    """One epoch: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon."""
     model.train()
-    total_loss = 0; total_ce = 0; total_con = 0
+    total_loss = 0; total_ce1 = 0; total_ce2 = 0; total_con = 0
     correct = 0; total = 0
 
     for batch in loader:
@@ -66,29 +66,33 @@ def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
 
         # Forward both views
         output1, fe1, _ = model(img1, labels)
-        _,       fe2, _ = model(img2, labels)
+        output2, fe2, _ = model(img2, labels)
 
-        # CE on first view
-        ce = ce_criterion(output1, labels)
+        # CE on original view
+        ce1 = ce_criterion(output1, labels)
+
+        # CE on FFT-augmented view
+        ce2 = ce_criterion(output2, labels)
 
         # SupCon on paired features
         fe = torch.cat([fe1.unsqueeze(1), fe2.unsqueeze(1)], dim=1)
         supcon = con_criterion(fe, labels)
 
-        loss = w1 * ce + w2 * supcon
+        loss = w1 * ce1 + w2 * ce2 + w3 * supcon
 
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-        total_ce += ce.item()
+        total_ce1 += ce1.item()
+        total_ce2 += ce2.item()
         total_con += supcon.item()
         correct += (output1.argmax(1) == labels).sum().item()
         total += labels.size(0)
 
     n = max(1, len(loader))
     acc = 100.0 * correct / max(total, 1)
-    return total_loss / n, total_ce / n, total_con / n, acc
+    return total_loss / n, total_ce1 / n, total_ce2 / n, acc
 
 
 @torch.no_grad()
@@ -151,15 +155,17 @@ def main():
     dp_mode = cfg.get("dp_mode", "ideal")
     is_closed = (protocol == "closed_set")
     local_eval_scope = cfg.get("local_eval_scope", "client")
-    w1 = cfg.get("w1", 0.8)
-    w2 = cfg.get("w2", 0.2)
+    w1 = cfg.get("w1", 0.4)
+    w2 = cfg.get("w2", 0.4)
+    w3 = cfg.get("w3", 0.2)
     temperature = cfg.get("temperature", 0.07)
 
     print(f"\n{'='*80}")
     print(f"  Proposed Method — FedAvg + FFT + SupCon")
     cs_mode = cfg.get("closed_set_mode", "cross_spectrum")
     proto_str = f"{protocol}" + (f" ({cs_mode})" if is_closed else "")
-    print(f"  Protocol: {proto_str} | Loss: {w1}×CE + {w2}×SupCon")
+    print(f"  Protocol: {proto_str}")
+    print(f"  Loss: {w1}×CE(orig) + {w2}×CE(aug) + {w3}×SupCon")
     print(f"  Model: compnet_fedpalm (grayscale)")
     print(f"{'='*80}\n")
 
@@ -278,7 +284,7 @@ def main():
             for _ in range(cfg["local_epochs"]):
                 loss, _, _, _ = train_one_epoch(
                     local_models[ci], loaders[ci], optimizers[ci],
-                    ce_criterion, con_criterion, device, w1, w2)
+                    ce_criterion, con_criterion, device, w1, w2, w3)
             losses.append(loss)
             schedulers[ci].step()
 
