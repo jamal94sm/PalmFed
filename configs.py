@@ -76,10 +76,10 @@ CONFIG = {
     "use_moe"          : False,
 
     # Loss: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon + w4×anchor_align
-    "w1"               : 0.4,       # CE on original
-    "w2"               : 0.4,       # CE on FFT-augmented
-    "w3"               : 0.2,       # SupCon on both views
-    "w4"               : 0.1,       # anchor alignment
+    "w1"               : 0.5,       # CE on original
+    "w2"               : 0.5,       # CE on FFT-augmented
+    "w3"               : 0.0,       # SupCon on both views
+    "w4"               : 0.0,       # anchor alignment
     "anchor_align"     : "mse",     # mse | supcon
     # anchor_level:
     #   feature: anchor = frozen global (resets each round)
