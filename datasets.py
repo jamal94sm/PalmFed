@@ -927,10 +927,295 @@ def build_federated_splits_closed_set_xjtu(data_root, n_ids, gallery_ratio,
 #  UNIFIED DISPATCHER (replaces original get_federated_splits)
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+#  X-PALM DATA LOADING & PARTITIONING
+# ══════════════════════════════════════════════════════════════
+
+from configs import XPALM_CLIENTS, XPALM_CLIENT_NAMES
+
+def parse_xpalm(data_root):
+    """
+    Scan X-Palm dataset (scanner_roi + smartphone_roi).
+
+    Scanner:     {id}/{id}_{Left/Right}_{spectrum}_{1-3}.jpg
+    Smartphone:  {id}/{id}_{left/right}_{variation}.jpg
+
+    Returns
+    -------
+    data : dict  domain_name → identity → [path, ...]
+           domain_name = spectrum name (green, ir, ...) or variation (bf, close, ...)
+    scanner_ids : set of subject IDs with scanner data
+    phone_ids   : set of subject IDs with smartphone data
+    """
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+    data = defaultdict(lambda: defaultdict(list))
+    scanner_ids = set()
+    phone_ids = set()
+
+    # Scanner
+    scanner_dir = os.path.join(data_root, "scanner_roi")
+    if os.path.isdir(scanner_dir):
+        for subj_folder in sorted(os.listdir(scanner_dir)):
+            subj_dir = os.path.join(scanner_dir, subj_folder)
+            if not os.path.isdir(subj_dir):
+                continue
+            subj_id = subj_folder
+            for fname in sorted(os.listdir(subj_dir)):
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+                    continue
+                parts = os.path.splitext(fname)[0].split("_")
+                if len(parts) < 4:
+                    continue
+                # {id}_{Left/Right}_{spectrum}_{iter}
+                hand = parts[1].lower()      # left/right
+                spectrum = parts[2].lower()   # green, ir, etc
+                identity = f"{subj_id}_{hand}"
+                data[spectrum][identity].append(
+                    os.path.join(subj_dir, fname))
+                scanner_ids.add(subj_id)
+
+    # Smartphone
+    phone_dir = os.path.join(data_root, "smartphone_roi")
+    if os.path.isdir(phone_dir):
+        for subj_folder in sorted(os.listdir(phone_dir)):
+            subj_dir = os.path.join(phone_dir, subj_folder)
+            if not os.path.isdir(subj_dir):
+                continue
+            subj_id = subj_folder
+            for fname in sorted(os.listdir(subj_dir)):
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+                    continue
+                parts = os.path.splitext(fname)[0].split("_")
+                if len(parts) < 3:
+                    continue
+                # {id}_{left/right}_{variation}.jpg
+                hand = parts[1].lower()
+                variation = "_".join(parts[2:]).lower()  # handles rnd_1, etc
+                identity = f"{subj_id}_{hand}"
+                data[variation][identity].append(
+                    os.path.join(subj_dir, fname))
+                phone_ids.add(subj_id)
+
+    # Print summary
+    all_domains = sorted(data.keys())
+    print(f"  [X-Palm] Domains found: {len(all_domains)}")
+    for dom in all_domains:
+        n_ids = len(data[dom])
+        n_imgs = sum(len(v) for v in data[dom].values())
+        source = "scanner" if dom in [d for cl in XPALM_CLIENTS[:2] for d in cl] else "phone"
+        print(f"    {dom:>12s} ({source:>7s})  IDs={n_ids:>4d}  images={n_imgs}")
+
+    common = scanner_ids & phone_ids
+    scanner_only = scanner_ids - phone_ids
+    phone_only = phone_ids - scanner_ids
+    print(f"  [X-Palm] Subjects: common={len(common)}  "
+          f"scanner-only={len(scanner_only)}  phone-only={len(phone_only)}")
+
+    return data, scanner_ids, phone_ids
+
+
+def _get_xpalm_client_domains():
+    """Return list of (client_name, [domain_names]) from config."""
+    return list(zip(XPALM_CLIENT_NAMES, XPALM_CLIENTS))
+
+
+def _all_xpalm_domains():
+    """All domain names across all clients."""
+    return [d for cl in XPALM_CLIENTS for d in cl]
+
+
+def build_federated_splits_xpalm(data_root, k_test, gallery_ratio, seed=42):
+    """
+    Open-set split for X-Palm.
+
+    - Common subjects: k_test fraction → test, rest → train
+    - Scanner-only and phone-only subjects → added to test set
+    - Train IDs round-robin across 4 clients
+    """
+    rng = random.Random(seed)
+    data, scanner_ids, phone_ids = parse_xpalm(data_root)
+
+    common_subjs = sorted(scanner_ids & phone_ids)
+    scanner_only_subjs = sorted(scanner_ids - phone_ids)
+    phone_only_subjs = sorted(phone_ids - scanner_ids)
+
+    # Common IDs (both hands)
+    common_ids = []
+    for s in common_subjs:
+        common_ids.extend([f"{s}_left", f"{s}_right"])
+
+    rng.shuffle(common_ids)
+    n_test = max(2, int(len(common_ids) * k_test))
+    test_ids_common = sorted(common_ids[:n_test])
+    train_ids = sorted(common_ids[n_test:])
+
+    # Extra test IDs
+    extra_test = []
+    for s in scanner_only_subjs:
+        extra_test.extend([f"{s}_left", f"{s}_right"])
+    for s in phone_only_subjs:
+        extra_test.extend([f"{s}_left", f"{s}_right"])
+
+    all_test_ids = sorted(set(test_ids_common + extra_test))
+    test_label_map = {ident: i for i, ident in enumerate(all_test_ids)}
+
+    print(f"  Train IDs: {len(train_ids)} | Test IDs: {len(all_test_ids)} "
+          f"(common={len(test_ids_common)} + extra={len(extra_test)})")
+
+    # Client domain assignments
+    client_defs = _get_xpalm_client_domains()
+    n_clients = len(client_defs)
+
+    # Round-robin partition
+    rng.shuffle(train_ids)
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(train_ids):
+        client_id_splits[i % n_clients].append(ident)
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+    print(f"  IDs per client: {min_ids}")
+
+    # Build per-client train sets
+    client_data = []
+    for ci, (cname, domains) in enumerate(client_defs):
+        c_ids = client_id_splits[ci]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+        local_train = []
+        for dom in domains:
+            for ident in c_ids:
+                for p in data[dom].get(ident, []):
+                    local_train.append((p, c_label_map[ident]))
+        client_data.append({
+            "spectrum"      : cname,
+            "domains"       : domains,
+            "train_samples" : local_train,
+            "label_map"     : c_label_map,
+            "num_classes"   : min_ids,
+        })
+        print(f"    Client {ci} [{cname:>16s}]  IDs={min_ids}  "
+              f"samples={len(local_train)}")
+
+    # Test set: all test IDs × all domains where they have data
+    gallery_samples, probe_samples = [], []
+    all_domains = _all_xpalm_domains()
+    for ident in all_test_ids:
+        label = test_label_map[ident]
+        all_paths = []
+        for dom_idx, dom in enumerate(all_domains):
+            for p in data[dom].get(ident, []):
+                all_paths.append((p, label, dom_idx))
+        rng.shuffle(all_paths)
+        n_gal = max(1, int(len(all_paths) * gallery_ratio))
+        gallery_samples.extend(all_paths[:n_gal])
+        probe_samples.extend(all_paths[n_gal:])
+
+    print(f"  Gallery: {len(gallery_samples)} | Probe: {len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, XPALM_CLIENT_NAMES)
+
+
+def build_federated_splits_cross_spectrum_xpalm(data_root, gallery_ratio,
+                                                  seed=42):
+    """
+    Closed-set cross-spectrum split for X-Palm.
+
+    Only common subjects (have both scanner + smartphone).
+    All IDs partitioned across 4 clients.
+    Each client trains on their domains.
+    Local test = same IDs × ALL OTHER domains.
+    """
+    rng = random.Random(seed)
+    data, scanner_ids, phone_ids = parse_xpalm(data_root)
+
+    common_subjs = sorted(scanner_ids & phone_ids)
+    common_ids = []
+    for s in common_subjs:
+        common_ids.extend([f"{s}_left", f"{s}_right"])
+
+    n_ids = len(common_ids)
+    test_label_map = {ident: i for i, ident in enumerate(sorted(common_ids))}
+
+    client_defs = _get_xpalm_client_domains()
+    n_clients = len(client_defs)
+    all_domains = _all_xpalm_domains()
+
+    # Round-robin partition
+    rng.shuffle(common_ids)
+    client_id_splits = [[] for _ in range(n_clients)]
+    for i, ident in enumerate(common_ids):
+        client_id_splits[i % n_clients].append(ident)
+    min_ids = min(len(ids) for ids in client_id_splits)
+    client_id_splits = [sorted(ids[:min_ids]) for ids in client_id_splits]
+
+    print(f"  [Cross-spectrum X-Palm] {n_ids} IDs, {min_ids} per client")
+
+    client_data = []
+    all_gallery = []
+    all_probe = []
+
+    for ci, (cname, train_domains) in enumerate(client_defs):
+        c_ids = client_id_splits[ci]
+        c_label_map = {ident: j for j, ident in enumerate(c_ids)}
+
+        # Train: all samples from client's own domains
+        train_samples = []
+        for dom in train_domains:
+            for ident in c_ids:
+                for p in data[dom].get(ident, []):
+                    train_samples.append((p, c_label_map[ident]))
+
+        # Local test: ALL other domains for same IDs
+        unseen_domains = [d for d in all_domains if d not in train_domains]
+        local_gal, local_prb = [], []
+        for dom in unseen_domains:
+            for ident in c_ids:
+                paths = list(data[dom].get(ident, []))
+                if not paths:
+                    continue
+                rng.shuffle(paths)
+                n_gal = max(1, int(len(paths) * gallery_ratio))
+                for p in paths[:n_gal]:
+                    local_gal.append((p, c_label_map[ident]))
+                for p in paths[n_gal:]:
+                    local_prb.append((p, c_label_map[ident]))
+
+        client_data.append({
+            "spectrum"       : cname,
+            "domains"        : train_domains,
+            "train_samples"  : train_samples,
+            "local_test_gal" : local_gal,
+            "local_test_prb" : local_prb,
+            "label_map"      : c_label_map,
+            "num_classes"    : min_ids,
+        })
+        print(f"    Client {ci} [{cname:>16s}]  train={len(train_samples)}  "
+              f"gal={len(local_gal)}  prb={len(local_prb)}")
+
+        # Collect for global test
+        inv_map = {v: k for k, v in c_label_map.items()}
+        for p, local_label in local_gal:
+            ident = inv_map[local_label]
+            all_gallery.append((p, test_label_map[ident], ci))
+        for p, local_label in local_prb:
+            ident = inv_map[local_label]
+            all_probe.append((p, test_label_map[ident], ci))
+
+    gallery_samples = all_gallery
+    probe_samples = all_probe
+
+    print(f"  Global test: Gal={len(gallery_samples)} Prb={len(probe_samples)}")
+    return (client_data, gallery_samples, probe_samples,
+            test_label_map, XPALM_CLIENT_NAMES)
+
+
+# ══════════════════════════════════════════════════════════════
+#  UNIFIED DISPATCHER
+# ══════════════════════════════════════════════════════════════
+
 def get_federated_splits(cfg, seed=42):
     dataset  = cfg["dataset"].strip().lower()
     protocol = cfg.get("eval_protocol", "open_set").strip().lower()
-    cs_mode  = cfg.get("closed_set_mode", "holdout").strip().lower()
+    cs_mode  = cfg.get("closed_set_mode", "cross_spectrum").strip().lower()
 
     if dataset == "casiams":
         if protocol == "closed_set":
@@ -961,6 +1246,15 @@ def get_federated_splits(cfg, seed=42):
         else:
             return build_federated_splits_xjtu(
                 cfg["xjtu_data_root"], cfg["n_ids"], cfg["k_test"],
+                cfg["gallery_ratio"], seed=seed)
+
+    elif dataset == "xpalm":
+        if protocol == "closed_set":
+            return build_federated_splits_cross_spectrum_xpalm(
+                cfg["xpalm_data_root"], cfg["gallery_ratio"], seed=seed)
+        else:
+            return build_federated_splits_xpalm(
+                cfg["xpalm_data_root"], cfg["k_test"],
                 cfg["gallery_ratio"], seed=seed)
 
     else:
