@@ -22,7 +22,7 @@ from datasets import get_federated_splits
 def parse_args():
     p = argparse.ArgumentParser(description="Benchmark all methods")
     p.add_argument("--dataset", default="casiams",
-                   choices=["casiams", "xjtu"])
+                   choices=["casiams", "xjtu", "xpalm"])
     p.add_argument("--eval_protocol", default="open_set",
                    choices=["open_set", "closed_set"])
     p.add_argument("--closed_set_mode", default="cross_spectrum",
