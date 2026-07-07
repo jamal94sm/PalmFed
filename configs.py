@@ -44,8 +44,8 @@ _BASE = {
     "local_epochs"     : 1,
     "batch_size"       : 64,
     "lr"               : 0.001,
-    "lr_step"          : 20,
-    "lr_gamma"         : 1, #0.5
+    "lr_step"          : 30,
+    "lr_gamma"         : 0.8,
     "M"                : 2,
     "num_workers"      : 4,
 
@@ -67,11 +67,16 @@ CONFIG = {
     "use_moe"          : False,
 
     # Loss: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon + w4×anchor_align
-    "w1"               : 0.8,       # CE on original
-    "w2"               : 0.8,       # CE on FFT-augmented
+    "w1"               : 0.4,       # CE on original
+    "w2"               : 0.4,       # CE on FFT-augmented
     "w3"               : 0.2,       # SupCon on both views
-    "w4"               : 0.2,       # anchor alignment
+    "w4"               : 0.1,       # anchor alignment
     "anchor_align"     : "mse",     # mse | supcon
+    # anchor_level:
+    #   feature: anchor = frozen global (resets each round)
+    #   model:   anchor = EMA of global (momentum across rounds)
+    "anchor_level"     : "feature", # feature | model
+    "ema_beta"         : 0.996,     # EMA momentum (only if anchor_level=model)
     "temperature"      : 0.07,
 
     # FFT augmentation (unique to proposed)
