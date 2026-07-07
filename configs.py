@@ -53,7 +53,7 @@ _BASE = {
     "local_epochs"     : 1,
     "batch_size"       : 64,
     "lr"               : 0.001,
-    "lr_step"          : 30,
+    "lr_step"          : 20,
     "lr_gamma"         : 0.8,
     "M"                : 2,
     "num_workers"      : 4,
