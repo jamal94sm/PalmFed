@@ -13,6 +13,14 @@ CASIAMS_LONG_SPECTRA  = ["850", "940"]
 XJTU_SHORT_SPECTRA    = ["iPhone/Flash", "huawei/Flash"]
 XJTU_LONG_SPECTRA     = ["iPhone/Nature", "huawei/Nature"]
 
+# X-Palm client domain assignments
+XPALM_C1 = ["red", "orange", "pink", "magenta", "ir"]                    # scanner group A
+XPALM_C2 = ["green", "blue", "white", "yellow"]                          # scanner group B
+XPALM_C3 = ["bf", "jf", "sf", "rnd_1", "rnd_2", "rnd_3", "rnd_4", "rnd_5"]  # phone gestures
+XPALM_C4 = ["close", "far", "wet", "text", "fl", "pitch", "roll"]        # phone conditions
+XPALM_CLIENTS = [XPALM_C1, XPALM_C2, XPALM_C3, XPALM_C4]
+XPALM_CLIENT_NAMES = ["scanner-A", "scanner-B", "phone-gesture", "phone-condition"]
+
 # ══════════════════════════════════════════════════════════════
 #  SHARED BASE
 # ══════════════════════════════════════════════════════════════
@@ -20,6 +28,7 @@ _BASE = {
     "dataset"          : "casiams",
     "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",
+    "xpalm_data_root"  : "/home/pai-ng/Jamal/xpalm",
     "n_ids"            : 200,
     "k_test"           : 0.20,
     "gallery_ratio"    : 0.20,
@@ -45,7 +54,7 @@ _BASE = {
     "batch_size"       : 64,
     "lr"               : 0.001,
     "lr_step"          : 30,
-    "lr_gamma"         : 1,
+    "lr_gamma"         : 0.8,
     "M"                : 2,
     "num_workers"      : 4,
 
@@ -67,10 +76,10 @@ CONFIG = {
     "use_moe"          : False,
 
     # Loss: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon + w4×anchor_align
-    "w1"               : 0.8,       # CE on original
-    "w2"               : 0.0,       # CE on FFT-augmented
+    "w1"               : 0.4,       # CE on original
+    "w2"               : 0.4,       # CE on FFT-augmented
     "w3"               : 0.2,       # SupCon on both views
-    "w4"               : 0.0,       # anchor alignment
+    "w4"               : 0.1,       # anchor alignment
     "anchor_align"     : "mse",     # mse | supcon
     # anchor_level:
     #   feature: anchor = frozen global (resets each round)
