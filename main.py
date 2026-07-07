@@ -153,7 +153,7 @@ def parse_overrides():
     import argparse
     p = argparse.ArgumentParser(description="Proposed Method")
     p.add_argument("--method", default="proposed")
-    p.add_argument("--dataset", choices=["casiams", "xjtu"])
+    p.add_argument("--dataset", choices=["casiams", "xjtu", "xpalm"])
     p.add_argument("--eval_protocol", choices=["open_set", "closed_set"])
     p.add_argument("--closed_set_mode", choices=["cross_spectrum"])
     p.add_argument("--local_eval_scope", choices=["client", "global"])
