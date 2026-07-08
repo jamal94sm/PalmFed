@@ -69,7 +69,7 @@ def generate_shared_splits(args):
 def run_method(method, args, splits_path, log_dir):
     import subprocess
     script = {"proposed": "main.py", "fedpalm": "fedpalm.py",
-              "psfed": "psfed.py", "fedavg": "fedavg_baseline.py",
+              "psfed": "psfed.py", "fedavg": "fedavg.py",
               "local": "local_only.py", "centralized": "centralized.py"}[method]
     log_file = os.path.join(log_dir, f"{method}.log")
 
