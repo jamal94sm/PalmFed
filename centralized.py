@@ -128,10 +128,25 @@ def main():
                 imgs, labels, _ = batch
             else:
                 imgs, labels = batch
+            '''
             #imgs, labels = imgs.to(device), labels.to(device)
             #imgs = torch.tensor(imgs).to(device)
             imgs = torch.stack(imgs).to(device)
             labels = torch.tensor(labels).to(device)
+            '''
+            # If AugmentedDataset returns a list of tensors (e.g., 2 augmented views)
+            if isinstance(imgs, list):
+                num_views = len(imgs) # This is likely 2
+                # Concatenate along the batch dimension -> [128, 1, 128, 128]
+                imgs = torch.cat(imgs, dim=0).to(device)
+                
+                # labels is already a tensor [64], we just repeat it to match the new batch size -> [128]
+                labels = labels.repeat(num_views).to(device) 
+            else:
+                # Standard single-image fallback
+                imgs = imgs.to(device)
+                labels = labels.to(device)
+              
             optimizer.zero_grad()
             output, _, _ = model(imgs, labels)
             loss = ce_criterion(output, labels)
