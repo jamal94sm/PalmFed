@@ -128,13 +128,13 @@ def parse_proposed_log(log_file):
             rnd = int(m.group(1))
             entry = {"round": rnd, "per_client": []}
 
-            # Scan ahead for EVALUATION section (not LOCAL EVALUATION)
+            # Scan ahead for eval section
             in_eval = False
             for k in range(i+1, min(i+60, len(lines))):
                 l = lines[k].strip()
 
-                # Start of main EVALUATION block
-                if l == "EVALUATION":
+                # Start of eval block (matches both old and new format)
+                if l.startswith("LOCAL EVAL") or l == "EVALUATION":
                     in_eval = True
                     continue
 
