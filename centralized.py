@@ -128,7 +128,9 @@ def main():
                 imgs, labels, _ = batch
             else:
                 imgs, labels = batch
-            imgs, labels = imgs.to(device), labels.to(device)
+            #imgs, labels = imgs.to(device), labels.to(device)
+            imgs = torch.tensor(imgs).to(device)
+            labels = torch.tensor(labels).to(device)
             optimizer.zero_grad()
             output, _, _ = model(imgs, labels)
             loss = ce_criterion(output, labels)
