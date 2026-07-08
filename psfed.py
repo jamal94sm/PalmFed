@@ -72,7 +72,8 @@ from collections import defaultdict
 # ── Config ────────────────────────────────────────────────────
 from configs import (CONFIG_PSFED as cfg,
                      CASIAMS_SHORT_SPECTRA, CASIAMS_LONG_SPECTRA,
-                     XJTU_SHORT_SPECTRA,    XJTU_LONG_SPECTRA)
+                     XJTU_SHORT_SPECTRA,    XJTU_LONG_SPECTRA,
+                     XPALM_SHORT_SPECTRA,   XPALM_LONG_SPECTRA)
 
 # ── Our framework ─────────────────────────────────────────────
 from datasets import (build_federated_splits, build_federated_splits_xjtu,
@@ -173,6 +174,9 @@ def build_spectrum_groups(client_data, dataset):
     if dataset == "casiams":
         short_set = set(CASIAMS_SHORT_SPECTRA)
         long_set  = set(CASIAMS_LONG_SPECTRA)
+    elif dataset == "xpalm":
+        short_set = set(XPALM_SHORT_SPECTRA)
+        long_set  = set(XPALM_LONG_SPECTRA)
     else:
         short_set = set(XJTU_SHORT_SPECTRA)
         long_set  = set(XJTU_LONG_SPECTRA)
