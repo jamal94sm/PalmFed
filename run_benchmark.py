@@ -32,7 +32,8 @@ def parse_args():
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--eval_every", type=int, default=10)
     p.add_argument("--methods", nargs="*",
-                   default=["proposed", "fedpalm", "psfed"])
+                   default=["proposed", "fedpalm", "psfed",
+                            "fedavg", "local", "centralized"])
     p.add_argument("--output_dir", default="./benchmark_results")
     p.add_argument("--dp_mode", default="ideal",
                    choices=["ideal", "predicted"])
@@ -68,7 +69,8 @@ def generate_shared_splits(args):
 def run_method(method, args, splits_path, log_dir):
     import subprocess
     script = {"proposed": "main.py", "fedpalm": "fedpalm.py",
-              "psfed": "psfed.py"}[method]
+              "psfed": "psfed.py", "fedavg": "fedavg_baseline.py",
+              "local": "local_only.py", "centralized": "centralized.py"}[method]
     log_file = os.path.join(log_dir, f"{method}.log")
 
     cmd = [sys.executable, script,
@@ -216,10 +218,82 @@ def parse_baseline_log(log_file, method):
 
 
 def parse_results(log_file, method):
-    if method == "proposed":
+    if method in ("proposed", "fedavg"):
         return parse_proposed_log(log_file)
+    elif method == "local":
+        return parse_local_log(log_file)
+    elif method == "centralized":
+        return parse_centralized_log(log_file)
     else:
         return parse_baseline_log(log_file, method)
+
+
+def parse_local_log(log_file):
+    """Parse local baseline — no global model, only per-client local."""
+    rounds = []
+    lines = open(log_file).readlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "Eval round" in line:
+            m = re.search(r'Eval round (\d+)', line)
+            if not m:
+                i += 1; continue
+            rnd = int(m.group(1))
+            entry = {"round": rnd, "per_client": []}
+
+            for k in range(i+1, min(i+40, len(lines))):
+                l = lines[k].strip()
+                if "│" in l and "%" in l and not any(
+                        x in l for x in ["Client", "─", "Global",
+                                          "Avg", "LOCAL"]):
+                    nums = re.findall(r'([\d.]+)%', l)
+                    name = l.split("│")[0].strip()
+                    if len(nums) >= 2 and name:
+                        entry["per_client"].append({
+                            "name": name, "r1": float(nums[0]),
+                            "eer": float(nums[1]),
+                        })
+                if "Avg Loc" in l and "%" in l:
+                    nums = re.findall(r'([\d.]+)%', l)
+                    if len(nums) >= 2:
+                        entry["local_r1"] = float(nums[0])
+                        entry["local_eer"] = float(nums[1])
+                    break
+
+            if "local_r1" in entry:
+                rounds.append(entry)
+        i += 1
+    return rounds
+
+
+def parse_centralized_log(log_file):
+    """Parse centralized baseline — only global model."""
+    rounds = []
+    lines = open(log_file).readlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "Eval epoch" in line:
+            m = re.search(r'Eval epoch (\d+)', line)
+            if not m:
+                i += 1; continue
+            rnd = int(m.group(1))
+            entry = {"round": rnd, "per_client": []}
+
+            for k in range(i+1, min(i+10, len(lines))):
+                l = lines[k].strip()
+                if "Global" in l and "│" in l and "%" in l:
+                    nums = re.findall(r'([\d.]+)%', l)
+                    if len(nums) >= 2:
+                        entry["global_r1"] = float(nums[0])
+                        entry["global_eer"] = float(nums[1])
+                    break
+
+            if "global_r1" in entry:
+                rounds.append(entry)
+        i += 1
+    return rounds
 
 
 # ══════════════════════════════════════════════════════════════
@@ -314,7 +388,7 @@ def print_comparison(args, all_results, client_names, out):
         f"{'Avg Loc R1':>11} {'Avg Loc EER':>12}")
     out(f"  {'─'*64}")
 
-    for method in ["proposed", "fedpalm", "psfed"]:
+    for method in ["proposed", "fedpalm", "psfed", "fedavg", "local", "centralized"]:
         if method not in method_avgs:
             out(f"  {method.upper():>15} │ {'FAILED':>10} {'':>11} │ "
                 f"{'':>11} {'':>12}")
@@ -334,7 +408,7 @@ def print_comparison(args, all_results, client_names, out):
     out(hdr)
     out(f"  {'─'*len(hdr)}")
 
-    for method in ["proposed", "fedpalm", "psfed"]:
+    for method in ["proposed", "fedpalm", "psfed", "fedavg", "local", "centralized"]:
         if method not in method_avgs:
             continue
         a = method_avgs[method]
@@ -356,7 +430,7 @@ def print_comparison(args, all_results, client_names, out):
     out(hdr)
     out(f"  {'─'*len(hdr)}")
 
-    for method in ["proposed", "fedpalm", "psfed"]:
+    for method in ["proposed", "fedpalm", "psfed", "fedavg", "local", "centralized"]:
         if method not in method_avgs:
             continue
         a = method_avgs[method]
