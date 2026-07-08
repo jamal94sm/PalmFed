@@ -1165,19 +1165,22 @@ def build_federated_splits_cross_spectrum_xpalm(data_root, gallery_ratio,
                     train_samples.append((p, c_label_map[ident]))
 
         # Local test: ALL other domains for same IDs
+        # Split gallery/probe per ID across ALL unseen domains combined
         unseen_domains = [d for d in all_domains if d not in train_domains]
         local_gal, local_prb = [], []
-        for dom in unseen_domains:
-            for ident in c_ids:
-                paths = list(data[dom].get(ident, []))
-                if not paths:
-                    continue
-                rng.shuffle(paths)
-                n_gal = max(1, int(len(paths) * gallery_ratio))
-                for p in paths[:n_gal]:
-                    local_gal.append((p, c_label_map[ident]))
-                for p in paths[n_gal:]:
-                    local_prb.append((p, c_label_map[ident]))
+        for ident in c_ids:
+            all_paths = []
+            for dom in unseen_domains:
+                for p in data[dom].get(ident, []):
+                    all_paths.append(p)
+            if not all_paths:
+                continue
+            rng.shuffle(all_paths)
+            n_gal = max(1, int(len(all_paths) * gallery_ratio))
+            for p in all_paths[:n_gal]:
+                local_gal.append((p, c_label_map[ident]))
+            for p in all_paths[n_gal:]:
+                local_prb.append((p, c_label_map[ident]))
 
         client_data.append({
             "spectrum"       : cname,
