@@ -31,9 +31,15 @@ def parse_args():
     p.add_argument("--n_ids", type=int, default=200)
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--eval_every", type=int, default=10)
+
+  
+    #p.add_argument("--methods", nargs="*",
+     #              default=["proposed", "fedpalm", "psfed",
+      #                      "fedavg", "local", "centralized"])
+    
     p.add_argument("--methods", nargs="*",
-                   default=["proposed", "fedpalm", "psfed",
-                            "fedavg", "local", "centralized"])
+                   default=["fedavg", "centralized"])
+  
     p.add_argument("--output_dir", default="./benchmark_results")
     p.add_argument("--dp_mode", default="ideal",
                    choices=["ideal", "predicted"])
