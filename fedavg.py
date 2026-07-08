@@ -35,12 +35,22 @@ def train_one_epoch(model, loader, optimizer, ce_criterion, device,
     total_loss = 0; correct = 0; total = 0
     for batch in loader:
         imgs_pair, labels, _ = batch
+        '''
         img1, img2 = imgs_pair[0].to(device), imgs_pair[1].to(device)
         labels = labels.to(device)
         optimizer.zero_grad()
         output1, _, _ = model(img1, labels)
         output2, _, _ = model(img2, labels)
         loss = w1 * ce_criterion(output1, labels) + w2 * ce_criterion(output2, labels)
+        '''
+        img1, img2 = imgs_pair[0].to(device), imgs_pair[1].to(device)
+        labels = labels.to(device)
+        optimizer.zero_grad()
+        imgs_all = torch.cat([img1, img2], dim=0)           # [2B, C, H, W]
+        labels_all = torch.cat([labels, labels], dim=0)     # [2B]
+        output, _, _ = model(imgs_all, labels_all)
+        loss = ce_criterion(output, labels_all)             # single CE on 2× batch
+      
         loss.backward(); optimizer.step()
         total_loss += loss.item()
         correct += (output1.argmax(1) == labels).sum().item()
