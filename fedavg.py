@@ -185,6 +185,7 @@ def main():
                 m.eval()
             global_model.eval()
 
+            print(f"\n    LOCAL EVAL (global scope)")
             print(f"    {'Client':>8s} │ {'Local R1':>9s} {'Local EER':>10s}")
             print(f"    {'─'*32}")
             avg_eer, avg_r1, per_client = evaluate_local_avg(
