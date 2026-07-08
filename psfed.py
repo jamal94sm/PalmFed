@@ -621,9 +621,9 @@ def main():
 if __name__ == "__main__":
     import argparse
     _p = argparse.ArgumentParser()
-    _p.add_argument("--dataset", choices=["casiams", "xjtu"])
+    _p.add_argument("--dataset", choices=["casiams", "xjtu", "xpalm"])
     _p.add_argument("--eval_protocol", choices=["open_set", "closed_set"])
-    _p.add_argument("--closed_set_mode", choices=["holdout", "cross_spectrum"])
+    _p.add_argument("--closed_set_mode", choices=["cross_spectrum"])
     _p.add_argument("--n_rounds", type=int)
     _p.add_argument("--random_seed", type=int)
     _p.add_argument("--splits_path")
