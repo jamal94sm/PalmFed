@@ -51,11 +51,12 @@ def build_style_bank(client_data, img_side):
 
 
 def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
-                    device, w1=0.4, w2=0.4, w3=0.2, w4=0.1,
-                    anchor_model=None, anchor_align="mse"):
+                    device, w1=0.5, w2=0.5, w3=0.0, w4=0.0, w5=100.0, mu=0.01,
+                    anchor_model=None, anchor_align="mse",
+                    group_anchor=None, server_model=None):
     """
-    One epoch: w1×CE(orig) + w2×CE(aug) + w3×SupCon + w4×anchor_align.
-    anchor_model: frozen global model (start-of-round snapshot).
+    One epoch: w1×CE(orig) + w2×CE(aug) + w3×SupCon + w4×global_anchor
+             + w5×MSE(group_anchor) + mu/2×FedProx(server) + mu/2×FedProx(group).
     """
     model.train()
     total_loss = 0; total_ce1 = 0; total_ce2 = 0
@@ -111,7 +112,29 @@ def train_one_epoch(model, loader, optimizer, ce_criterion, con_criterion,
 
             loss = loss + w4 * anc_loss
             total_anc += anc_loss.item()
+          
+        # MSE feature alignment to group anchor
+        if group_anchor is not None and w5 > 0:
+            with torch.no_grad():
+                group_anchor.eval()
+                _, ganc_fe, _ = group_anchor(img1, None, None)
+            loss = loss + w5 * mse_criterion(fe1, ganc_fe.detach())
 
+        # FedProx to global server
+        if server_model is not None and mu > 0:
+            prox_server = torch.tensor(0., device=device)
+            for w, w_t in zip(server_model.parameters(), model.parameters()):
+                prox_server += torch.pow(torch.norm(w - w_t), 2)
+            loss = loss + mu / 2. * prox_server
+
+        # FedProx to group anchor
+        if group_anchor is not None and mu > 0:
+            prox_anchor = torch.tensor(0., device=device)
+            for w, w_t in zip(group_anchor.parameters(), model.parameters()):
+                prox_anchor += torch.pow(torch.norm(w - w_t), 2)
+            loss = loss + mu / 2. * prox_anchor
+
+      
         loss.backward()
         optimizer.step()
 
@@ -147,6 +170,17 @@ def fedavg(models, exclude_prefixes=("arc",)):
         for key, val in avg_state.items():
             state[key] = val.to(state[key].dtype)
         m.load_state_dict(state)
+
+def fedavg_into(target_model, source_models):
+    """Average source_models → target_model. Sources unchanged."""
+    n = len(source_models)
+    if n == 0:
+        return
+    for key in target_model.state_dict().keys():
+        agg = torch.zeros_like(target_model.state_dict()[key], dtype=torch.float32)
+        for m in source_models:
+            agg += (1.0 / n) * m.state_dict()[key].float()
+        target_model.state_dict()[key].data.copy_(agg)
 
 
 def parse_overrides():
@@ -195,6 +229,10 @@ def main():
     anchor_level = cfg.get("anchor_level", "feature")
     ema_beta = cfg.get("ema_beta", 0.996)
     temperature = cfg.get("temperature", 0.07)
+    anchor_align = cfg.get("anchor_align", "mse")
+    anchor_level = cfg.get("anchor_level", "feature")
+    ema_beta = cfg.get("ema_beta", 0.996)
+    temperature = cfg.get("temperature", 0.07)
 
     print(f"\n{'='*80}")
     print(f"  Proposed Method — FedAvg + FFT + SupCon + Anchor")
@@ -202,6 +240,7 @@ def main():
     proto_str = f"{protocol}" + (f" ({cs_mode})" if is_closed else "")
     print(f"  Protocol: {proto_str}")
     print(f"  Loss: {w1}×CE(orig) + {w2}×CE(aug) + {w3}×SupCon + {w4}×{anchor_align.upper()}")
+    print(f"        + {w5}×MSE(group) + {mu}×FedProx")
     if anchor_level == "model":
         print(f"  Anchor: EMA of global (β={ema_beta}, model-level)")
     else:
@@ -272,7 +311,39 @@ def main():
         for p in ema_model.parameters():
             p.requires_grad = False
         print(f"  EMA anchor model initialized (β={ema_beta})")
+    
+  
+    # Group anchors (cross-group alignment like PSFed)
+    from configs import (CASIAMS_SHORT_SPECTRA, CASIAMS_LONG_SPECTRA,
+                         XJTU_SHORT_SPECTRA, XJTU_LONG_SPECTRA,
+                         XPALM_SHORT_SPECTRA, XPALM_LONG_SPECTRA)
 
+    dataset = cfg["dataset"]
+    if dataset == "casiams":
+        short_set, long_set = set(CASIAMS_SHORT_SPECTRA), set(CASIAMS_LONG_SPECTRA)
+    elif dataset == "xpalm":
+        short_set, long_set = set(XPALM_SHORT_SPECTRA), set(XPALM_LONG_SPECTRA)
+    else:
+        short_set, long_set = set(XJTU_SHORT_SPECTRA), set(XJTU_LONG_SPECTRA)
+
+    short_ids, long_ids = [], []
+    for ci, cd in enumerate(client_data):
+        if cd["spectrum"] in short_set:
+            short_ids.append(ci)
+        else:
+            long_ids.append(ci)
+    print(f"  Groups: SHORT={[client_data[i]['spectrum'] for i in short_ids]}")
+    print(f"          LONG ={[client_data[i]['spectrum'] for i in long_ids]}")
+
+    visib_net = compnet_fedpalm(num_classes=client_data[0]["num_classes"]).to(device)
+    invis_net = compnet_fedpalm(num_classes=client_data[0]["num_classes"]).to(device)
+    visib_net.load_state_dict(global_model.state_dict())
+    invis_net.load_state_dict(global_model.state_dict())
+
+    def get_group_anchor(ci):
+        """Cross-group: SHORT clients align to LONG anchor, vice versa."""
+        return invis_net if ci in short_ids else visib_net
+      
     # Loss
     ce_criterion = nn.CrossEntropyLoss()
     con_criterion = SupConLoss(temperature=temperature)
@@ -342,8 +413,10 @@ def main():
                 loss, _, _, _ = train_one_epoch(
                     local_models[ci], loaders[ci], optimizers[ci],
                     ce_criterion, con_criterion, device,
-                    w1, w2, w3, w4,
-                    anchor_model=anchor, anchor_align=anchor_align)
+                    w1, w2, w3, w4, w5, mu,
+                    anchor_model=anchor, anchor_align=anchor_align,
+                    group_anchor=get_group_anchor(ci),
+                    server_model=global_model)
             losses.append(loss)
             schedulers[ci].step()
 
@@ -419,7 +492,7 @@ def main():
             history.append(rnd_entry)
             print()
 
-        # Step 3: FedAvg → new global
+        # Step 3a: FedAvg → new global
         fedavg(local_models, exclude_prefixes=("arc",))
         new_state = global_model.state_dict()
         for key in new_state:
@@ -429,7 +502,13 @@ def main():
             if key in src and new_state[key].shape == src[key].shape:
                 new_state[key] = src[key].clone()
         global_model.load_state_dict(new_state)
-
+      
+        # Step 3b: Group-level aggregation
+        if short_ids:
+            fedavg_into(visib_net, [local_models[i] for i in short_ids])
+        if long_ids:
+            fedavg_into(invis_net, [local_models[i] for i in long_ids])
+          
         # Step 4: Update EMA anchor (model-level only)
         if anchor_level == "model" and ema_model is not None:
             with torch.no_grad():
