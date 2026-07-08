@@ -77,19 +77,26 @@ CONFIG = {
     "base_results_dir" : "./rst_proposed_{dataset}_{eval_protocol}",
     "use_moe"          : False,
 
-    # Loss: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon + w4×anchor_align
+    # loss = w1 × CE(orig)                              # 0.5 (existing)
+    # + w2 × CE(aug)                               # 0.5 (existing)
+    # + w3 × SupCon([fe1, fe2])                     # 0.0 (existing, kept)
+    # + w4 × anchor_align(fe, global/EMA)           # 0.0 (existing, kept)
+    # + w5 × MSE(fe1, group_anchor_fe.detach())     # NEW: group feature alignment
+    # + mu/2 × ||θ_local − θ_server||²             # NEW: FedProx to global
+    # + mu/2 × ||θ_local − θ_group_anchor||²       # NEW: FedProx to group
+    
     "w1"               : 0.5,       # CE on original
     "w2"               : 0.5,       # CE on FFT-augmented
     "w3"               : 0.0,       # SupCon on both views
-    "w4"               : 0.0,       # anchor alignment
-    "anchor_align"     : "mse",     # mse | supcon
-    # anchor_level:
-    #   feature: anchor = frozen global (resets each round)
-    #   model:   anchor = EMA of global (momentum across rounds)
-    "anchor_level"     : "feature", # feature | model
-    "ema_beta"         : 0.996,     # EMA momentum (only if anchor_level=model)
+    "w4"               : 0.0,       # anchor alignment (global/EMA)
+    "w5"               : 100.0,     # MSE feature alignment to GROUP anchor
+    "mu"               : 0.01,      # FedProx (mu/2 to server + mu/2 to group)
+    "anchor_align"     : "mse",     # (for w4) mse | supcon
+    "anchor_level"     : "feature", # (for w4) feature | model
+    "ema_beta"         : 0.996,     # (for w4) EMA momentum
     "temperature"      : 0.07,
 
+    
     # FFT augmentation (unique to proposed)
     "beta"             : 0.15,
     "local_M"          : 2,
