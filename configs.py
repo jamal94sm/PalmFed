@@ -14,12 +14,14 @@ XJTU_SHORT_SPECTRA    = ["iPhone/Flash", "huawei/Flash"]
 XJTU_LONG_SPECTRA     = ["iPhone/Nature", "huawei/Nature"]
 
 # X-Palm client domain assignments
-XPALM_C1 = ["orange", "pink", "ir"]                    # scanner group A : ["red", "orange", "pink", "magenta", "ir"]
-XPALM_C2 = ["green", "white", "yellow"]                          # scanner group B : ["green", "blue", "white", "yellow"]   
+XPALM_C1 = ["red", "orange", "pink", "magenta", "ir"]                    # scanner group A
+XPALM_C2 = ["green", "blue", "white", "yellow"]                          # scanner group B
 XPALM_C3 = ["bf", "jf", "sf", "rnd_1", "rnd_2", "rnd_3", "rnd_4", "rnd_5"]  # phone gestures
 XPALM_C4 = ["close", "far", "wet", "text", "fl", "pitch", "roll"]        # phone conditions
 XPALM_CLIENTS = [XPALM_C1, XPALM_C2, XPALM_C3, XPALM_C4]
 XPALM_CLIENT_NAMES = ["scanner-A", "scanner-B", "phone-gesture", "phone-condition"]
+XPALM_SHORT_SPECTRA = ["scanner-A", "scanner-B"]
+XPALM_LONG_SPECTRA  = ["phone-gesture", "phone-condition"]
 
 # ══════════════════════════════════════════════════════════════
 #  SHARED BASE
@@ -53,7 +55,7 @@ _BASE = {
     "local_epochs"     : 1,
     "batch_size"       : 64,
     "lr"               : 0.001,
-    "lr_step"          : 20,
+    "lr_step"          : 30,
     "lr_gamma"         : 0.8,
     "M"                : 2,
     "num_workers"      : 4,
@@ -76,10 +78,10 @@ CONFIG = {
     "use_moe"          : False,
 
     # Loss: w1×CE(orig) + w2×CE(FFT-aug) + w3×SupCon + w4×anchor_align
-    "w1"               : 0.5,       # CE on original
-    "w2"               : 0.5,       # CE on FFT-augmented
-    "w3"               : 0.0,       # SupCon on both views
-    "w4"               : 0.0,       # anchor alignment
+    "w1"               : 0.4,       # CE on original
+    "w2"               : 0.4,       # CE on FFT-augmented
+    "w3"               : 0.2,       # SupCon on both views
+    "w4"               : 0.1,       # anchor alignment
     "anchor_align"     : "mse",     # mse | supcon
     # anchor_level:
     #   feature: anchor = frozen global (resets each round)
