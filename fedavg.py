@@ -53,7 +53,7 @@ def train_one_epoch(model, loader, optimizer, ce_criterion, device,
       
         loss.backward(); optimizer.step()
         total_loss += loss.item()
-        correct += (output1.argmax(1) == labels).sum().item()
+        correct += (output[:len(labels)].argmax(1) == labels).sum().item()
         total += labels.size(0)
     return total_loss / max(1, len(loader)), 100.0 * correct / max(total, 1)
 
