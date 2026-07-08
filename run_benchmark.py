@@ -33,12 +33,11 @@ def parse_args():
     p.add_argument("--eval_every", type=int, default=10)
 
   
-    #p.add_argument("--methods", nargs="*",
-     #              default=["proposed", "fedpalm", "psfed",
-      #                      "fedavg", "local", "centralized"])
-    
     p.add_argument("--methods", nargs="*",
-                   default=["fedavg", "centralized"])
+                   default=["proposed", "fedpalm", "psfed",
+                            "fedavg", "local", "centralized"])
+    
+
   
     p.add_argument("--output_dir", default="./benchmark_results")
     p.add_argument("--dp_mode", default="ideal",
