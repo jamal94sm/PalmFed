@@ -13,6 +13,17 @@ from scipy.interpolate import interp1d
 from models import SupConLoss, GRL
 
 
+
+
+@torch.no_grad()
+def emb_global(model, x):
+    """Global model embedding — same as fedpalm/psfed."""
+    model.eval()
+    _, fe, _ = model(x, None, None)
+    return fe
+
+
+
 # ══════════════════════════════════════════════════════════════
 #  FFT STYLE AUGMENTATION HELPERS
 # ══════════════════════════════════════════════════════════════
