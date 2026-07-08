@@ -152,6 +152,35 @@ CONFIG_PSFED = {
 
 
 # ══════════════════════════════════════════════════════════════
+#  FEDAVG BASELINE
+# ══════════════════════════════════════════════════════════════
+CONFIG_FEDAVG = {
+    **_BASE,
+    "base_results_dir" : "./rst_fedavg_{dataset}_{eval_protocol}",
+    "w1"               : 0.5,       # CE on original
+    "w2"               : 0.5,       # CE on augmented
+}
+
+# ══════════════════════════════════════════════════════════════
+#  LOCAL BASELINE (no aggregation)
+# ══════════════════════════════════════════════════════════════
+CONFIG_LOCAL = {
+    **_BASE,
+    "base_results_dir" : "./rst_local_{dataset}_{eval_protocol}",
+    "w1"               : 0.5,
+    "w2"               : 0.5,
+}
+
+# ══════════════════════════════════════════════════════════════
+#  CENTRALIZED BASELINE (single model, all data)
+# ══════════════════════════════════════════════════════════════
+CONFIG_CENTRAL = {
+    **_BASE,
+    "base_results_dir" : "./rst_central_{dataset}_{eval_protocol}",
+}
+
+
+# ══════════════════════════════════════════════════════════════
 #  METHOD SELECTOR
 # ══════════════════════════════════════════════════════════════
 
@@ -162,5 +191,11 @@ def get_config(method="proposed"):
         return CONFIG_FEDPALM.copy()
     elif method == "psfed":
         return CONFIG_PSFED.copy()
+    elif method == "fedavg":
+        return CONFIG_FEDAVG.copy()
+    elif method == "local":
+        return CONFIG_LOCAL.copy()
+    elif method == "centralized":
+        return CONFIG_CENTRAL.copy()
     else:
         raise ValueError(f"Unknown method: '{method}'")
