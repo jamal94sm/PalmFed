@@ -129,7 +129,8 @@ def main():
             else:
                 imgs, labels = batch
             #imgs, labels = imgs.to(device), labels.to(device)
-            imgs = torch.tensor(imgs).to(device)
+            #imgs = torch.tensor(imgs).to(device)
+            imgs = torch.stack(imgs).to(device)
             labels = torch.tensor(labels).to(device)
             optimizer.zero_grad()
             output, _, _ = model(imgs, labels)
