@@ -225,6 +225,8 @@ def main():
     w2 = cfg.get("w2", 0.4)
     w3 = cfg.get("w3", 0.2)
     w4 = cfg.get("w4", 0.1)
+    w5 = cfg.get("w5", 100.0)
+    mu = cfg.get("mu", 0.01)
     anchor_align = cfg.get("anchor_align", "mse")
     anchor_level = cfg.get("anchor_level", "feature")
     ema_beta = cfg.get("ema_beta", 0.996)
