@@ -1,22 +1,19 @@
-palmfl: closed-set, shared-ID, cross-domain. 
-Train and test IDs are the same.
-IDs are shared among clients
-each client holds one domain (spectrum)
-k = 20% (adjustable) of samples in each IDs of each client are allocated to test set
-samples in test set are split into gallery and probe sets by a 50% split
+
+######### results for X-Palm dataset 
+python run_benchmark.py --dataset xpalm --eval_protocol open_set 
+
+python run_benchmark.py --dataset xpalm --eval_protocol closed_set 
 
 
-palmfl_v2: open-set, shared-ID, cross-domain.
-Train and test IDs are different.
-train IDs are shared among clients
-each client holds one domain (spectrum)
-k = 20% of IDs are allocated to test set
-samples of test IDs in test set are split into gallery and probe sets by a m = 20%  split
+######### results for CASIA-MS dataset 
+python run_benchmark.py --dataset casiams --eval_protocol open_set
 
-palmfl_v3: open-set, non-shared-ID, cross-domain.
-Train and test IDs are different.
-train IDs are different among clients.
-train IDs are uniformly splited among clients (no overlapping). 
-each client holds one domain (spectrum).
-k = 20% (adjustable) of IDs are allocated to test set.
-samples of test IDs in test set are split into gallery and probe sets by a m = 20% (adjustable) split.
+python run_benchmark.py --dataset casiams --eval_protocol closed_set
+
+
+######### results for XJTU-UP dataset 
+python run_benchmark.py --dataset xjtu --eval_protocol open_set --n_ids 192 
+
+python run_benchmark.py --dataset xjtu --eval_protocol closed_set --n_ids 192 
+
+
