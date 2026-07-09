@@ -1,0 +1,269 @@
+
+#########################
+### Federated Learning 
+#########################
+
+[Wiley 2020] Towards privacy palmprint recognition via federated hash learning
+
+[TIFS 2023] Privacy Preserving Palmprint Recognition via Federated Metric Learning [FedML]
+
+[CCBR 2024] A Federated Learning Framework Using FedProx Algorithm for Private Palmprint Recognition 
+
+[TIP 2025] Dynamic Personalized Federated Learning for Cross-Spectral Palmprint Recognition [DPFedPalm]
+
+[IJCAI 2025] AdaptPFL: Unlocking Cross-Device Palmprint Recognition via Adaptive Personalized Federated Learning
+
+[BR 2026] A Domain-Adapted and Federated Approach to Palmprint Recognition
+
+
+
+[IJCV 2024] Physics-Driven Spectrum-Consistent Federated Learning for Palmprint Verification [PSFed]
+https://github.com/Zi-YuanYang/PSFed-Palm
+
+[TIFS 2026] FedPalm – Federated learning for closed‑ and open‑set palmprint verification [FedPalm]
+https://github.com/Zi-YuanYang/FedPalm/tree/main
+
+
+
+A Fourier based framework for domain generalization [CVPR 2021]
+ 
+FedDG: Federated Domain Generalization on Medical Image Segmentation via Episodic Learning in Continuous Frequency Space [CVPR 2021]
+
+
+
+
+
+
+
+##############################
+########### Ziyuan Yang
+##############################
+
+Deep Learning in Palmprint Recognition: A Comprehensive Survey
+
+[TIFS 2026] Identity and Style Feature Decoupling Network for Cross-Domain Palmprint Recognition [ISFDNet]
+
+PalmBridge: A Plug-and-Play Feature Alignment Framework for Open-Set Palmprint Verification
+
+Physics-Driven Spectrum-Consistent Federated Learning for Palmprint Verification
+
+FedPalm – Federated learning for closed‑ and open‑set palmprint verification
+
+CO3Net: Coordinate-Aware Contrastive Competitive Neural Network for Palmprint Recognition
+
+SF2Net: Sequence feature fusion network for palmprint verification
+
+
+Beyond Static Features: A Novel Dynamic Palmprint Verification Framework Empowered by Generative Models
+
+Palmprint De-Identification Using Diffusion Model for High-Quality and Diverse Synthesis
+
+Scale-aware competition network for palmprint recognition
+
+Enhanced multitask learning for hash code generation of palmprint biometrics
+
+Comprehensive competition mechanism in palmprint recognition
+
+Downsampling in uniformly-spaced windows for coding-based Palmprint recognition
+
+Multi-task pre-training with soft biometrics for transfer-learning palmprint recognition
+
+Cross-database attack of different coding-based palmprint templates
+
+Two novel style-transfer palmprint reconstruction attacks
+
+Channel group-wise drop network with global and fine-grained-aware representation learning for palm recognition
+
+Bridging the Divide Between Left and Right Palmprints for Cross-Chirality Verification
+
+Multi-order extension codes for palmprint recognition
+
+A Dual-Level Cancelable Framework for Palmprint Verification and Hack-Proof Data Storage
+
+
+
+
+###############################
+######## Top papers
+###############################
+
+### GAN for generating synthetic palmprints
+
+[ECCV 2022] BezierPalm: A free lunch for palmprint recognition
+
+[ICCV 2023] RPG-Palm: Realistic pseudo-data generation for palmprint recognition
+
+[AAAI 2024] PCE-Palm: Palm crease energy based two-stage realistic pseudo-palmprint generation
+
+[Cybersecurity/Privacy 2024] Advancements in Synthetic Generation of Contactless Palmprint Biometrics Using StyleGAN Models
+
+[Access 2025] Generalization Assessment of Palmprint Verification Models Trained on Synthetic Data Across Diverse Datasets
+
+[AAAI 2025] PVTree: Realistic and Controllable Palm Vein Generation for Recognition Tasks
+
+[IEEE TIFS 2025] Hierarchical Cross-Modal Image Generation for Multimodal Biometrics
+
+
+### Diffusion Models for synthetic palmprint generation
+
+[IJCB 2024] GenPalm: Contactless Palmprint Generation with Diffusion Models
+
+[IEEE TOIP 2025] PalmDiff: When Palmprint Generation Meets Controllable Diffusion Model
+
+[CVPR 2025] Diff-Palm: Realistic Palmprint Generation with Polynomial Creases and Intra-Class Variation Controllable Diffusion Models
+
+GLIDE: Towards photorealistic image generation and editing with text-guided diffusion models
+
+
+
+
+
+### Domain Shift/Generalization/Adaptation
+
+[ICCV 2025] Unified Adversarial Augmentation for Improving Palmprint Recognition
+
+[IJCAI 2025] AdaptPFL: Unlocking Cross-Device Palmprint Recognition via Adaptive Personalized Federated Learning
+
+[Pattern Recognition 2025] Single Source Domain Generalization for Palm Biometrics (PalmRSS)
+
+[Pattern Recognition 2025] Learning Domain-Adaptive Palmprint Anti-Spoofing Feature in Cross-Domain Scenarios
+
+
+
+[IEEE TIP 2024] Generating Stylized Features for Single-Source Cross-Dataset Palmprint Recognition with Unseen Target Dataset
+
+[IEEE TIFS 2024] Learning to Generalize Unseen Dataset for Cross-Dataset Palmprint Recognition
+
+[IEEE TIFS 2024] Lsfm: Light style and feature matching for efficient cross-domain palmprint recognition
+
+
+[IEEE TIM 2023] Multi-Target Cross-Dataset Palmprint Recognition via Distilling From Multi-Teacher
+
+
+[Pattern Recognition 2022] Towards Open-Set Touchless Palmprint Recognition via Weight-Based Meta Metric Learning
+
+[IEEE TNNLS 2022] Jointly Heterogeneous Palmprint Discriminant Feature Learning
+
+[Electronics 2022] Palmprint translation network for cross-spectral palmprint recognition
+
+
+[Neurocomputing 2021] One-shot Cross-Dataset Palmprint Recognition via Adversarial Domain Adaptation
+
+[IEEE TIP 2021] Towards Cross-Dataset Palmprint Recognition Via Joint Pixel and Feature Alignment 
+
+[IEEE TIFS 2021] Learning With Partners to Improve the Multi-Source Cross-Dataset Palmprint Recognition
+
+
+[EEE T-CSVT 2020] Cross-Domain Palmprint Recognition via Regularized Adversarial Domain Adaptive Hashing
+
+[MTA 2020] Cross-spectral palmprint recognition with low-rank canonical correlation analysis
+
+[ICIP 2019] Cross-Domain Palmprint Recognition based on Transfer Convolutional Autoencoder
+
+[ICME 2019] PalmGAN for cross-domain palmprint recognition
+
+
+
+
+#################
+### GitHub repo
+#################
+
+https://github.com/Multimodal-MobileBio/Palmprint-dataset
+
+https://github.com/ViShean/palmprint-authenticator/tree/a855e8afaaa9de72ce3b15ac77aa965058092104
+
+https://github.com/ViShean/palmprint_prototype
+
+
+
+
+
+
+###################
+####### SURVEYs
+###################
+
+[2025] https://arxiv.org/pdf/2501.01166
+
+[2023] https://www.mdpi.com/2076-3417/14/1/153
+
+[2023] https://www.mdpi.com/2227-7390/11/5/1261
+
+[2022] https://ieeexplore.ieee.org/abstract/document/9837921/
+
+
+
+####
+
+
+[2019] [multispectral] https://www.worldscientific.com/doi/abs/10.1142/S021812661950107X
+
+[2017] [multispectral] https://ieeexplore.ieee.org/abstract/document/8076097/
+
+
+[2021] https://ieeexplore.ieee.org/abstract/document/9673303/
+
+[2021] https://www.sciencedirect.com/science/article/pii/S2214785320366256
+
+[2020] [3D] https://ieeexplore.ieee.org/abstract/document/8950040/
+
+[2020] https://ieeexplore.ieee.org/abstract/document/9085344/
+
+[2020] https://ietresearch.onlinelibrary.wiley.com/doi/abs/10.1049/iet-bmt.2019.0103
+
+[2019] https://www.sciencedirect.com/science/article/pii/S0925231218309597
+
+[2019] [feature] https://www.sciencedirect.com/science/article/pii/S0957417419302489
+
+[2018] https://ieeexplore.ieee.org/abstract/document/8283612/
+
+[2018] https://www.academia.edu/download/83974601/ijaerv13n10_37.pdf
+
+
+
+
+##################
+######## Scholars
+##################
+
+https://scholar.google.com/citations?hl=en&user=2vZsJskAAAAJ&sortby=pubdate&view_op=list_works&citft=1&email_for_op=jamal73sm%40gmail.com&gmla=AIqSsVvvlmlstNcQ2OVlhqfTynVepxMi5dEr6yMFfSg3GqsXeQXLTpGQjSicOtnHD_Zz1yBSo9zwojm6h0dMeJuyAxAVet91hI6xGPXOSlhRpo704FMJx2qDu8aKg8M5Ox3_zyuEhCn54hDbyeM8cClZkXHQwWcNvR-8IIinvsy_S7f3224Pwtqn_0NYVVcgyeQQQkzXAuMUhmhNk8FaoW9XA2DVxJHD5EAoMr2WTS3rYw
+
+https://scholar.google.com/citations?hl=en&user=N7IWh4EAAAAJ&view_op=list_works&sortby=pubdate
+
+https://scholar.google.com/citations?hl=en&user=IOagLnEAAAAJ&view_op=list_works&sortby=pubdate
+
+
+
+
+
+
+
+##############################
+################## Paper links
+##############################
+https://github.com/tim-learn/awesome-test-time-adaptation?tab=readme-ov-file
+file:///C:/Users/A104157/Desktop/Palm-Auth/Papers/000%20TTA%20Springer%202025.pdf
+https://link.springer.com/content/pdf/10.1007/s11263-024-02213-5.pdf
+
+https://openaccess.thecvf.com/content_CVPR_2020/papers/Yang_FDA_Fourier_Domain_Adaptation_for_Semantic_Segmentation_CVPR_2020_paper.pdf
+https://arxiv.org/pdf/2109.04877
+https://dl.acm.org/doi/pdf/10.1145/3580305.3599313
+https://arxiv.org/pdf/1907.04275
+https://arxiv.org/pdf/2205.06427
+
+https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=10019304
+https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=9387467
+https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=9600889
+
+https://www.sciencedirect.com/science/article/pii/S1361841520302711
+https://dl.acm.org/doi/pdf/10.1145/2939672.2939716
+https://proceedings.mlr.press/v119/sun20b/sun20b.pdf
+https://openaccess.thecvf.com/content/CVPR2021/papers/Dubey_Adaptive_Methods_for_Real-World_Domain_Generalization_CVPR_2021_paper.pdf
+https://proceedings.mlr.press/v162/kim22e/kim22e.pdf
+
+
+
+
+
+
