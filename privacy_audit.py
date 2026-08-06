@@ -24,6 +24,18 @@
 # clustering.py (crop_lowfreq), model_fedpalm.py (compnet_fedpalm, for
 # the full-image reference baseline only).
 # ==============================================================
+
+'''
+# Single alpha, all three datasets
+python privacy_audit.py --datasets casiams xjtu xpalm --alpha 0.15
+
+# Sweep alpha to see the leakage/utility trade-off (recommended)
+python privacy_audit.py --datasets casiams --alpha_sweep 0.05 0.10 0.15 0.25 0.40
+
+# With a real trained verifier for a meaningful Exp 2 number
+python privacy_audit.py --datasets casiams --alpha 0.15 --verifier_ckpt ./checkpoints/global_model.pt
+'''
+
 import os
 import json
 import argparse
