@@ -319,25 +319,35 @@ def main():
         print(f"  EMA anchor model initialized (β={ema_beta})")
     
   
-    # Group anchors (cross-group alignment like PSFed)
-    from configs import (CASIAMS_SHORT_SPECTRA, CASIAMS_LONG_SPECTRA,
-                         XJTU_SHORT_SPECTRA, XJTU_LONG_SPECTRA,
-                         XPALM_SHORT_SPECTRA, XPALM_LONG_SPECTRA)
-
-    dataset = cfg["dataset"]
-    if dataset == "casiams":
-        short_set, long_set = set(CASIAMS_SHORT_SPECTRA), set(CASIAMS_LONG_SPECTRA)
-    elif dataset == "xpalm":
-        short_set, long_set = set(XPALM_SHORT_SPECTRA), set(XPALM_LONG_SPECTRA)
+    if cfg.get("clustering_mode", "manual") == "domain_aware":
+        from clustering import cluster_clients_by_style
+        short_ids, long_ids = cluster_clients_by_style(
+            style_bank,
+            alpha=cfg.get("cluster_alpha", 0.15),
+            scale=cfg.get("cluster_scale", "linear"),
+            diagonal=cfg.get("cluster_diagonal", True),
+            epsilon=cfg.get("cluster_epsilon", 0.1),
+            partition_method=cfg.get("cluster_partition", "farthest_pair"),
+        )
     else:
-        short_set, long_set = set(XJTU_SHORT_SPECTRA), set(XJTU_LONG_SPECTRA)
-
-    short_ids, long_ids = [], []
-    for ci, cd in enumerate(client_data):
-        if cd["spectrum"] in short_set:
-            short_ids.append(ci)
+        from configs import (CASIAMS_SHORT_SPECTRA, CASIAMS_LONG_SPECTRA,
+                              XJTU_SHORT_SPECTRA, XJTU_LONG_SPECTRA,
+                              XPALM_SHORT_SPECTRA, XPALM_LONG_SPECTRA)
+        dataset = cfg["dataset"]
+        if dataset == "casiams":
+            short_set, long_set = set(CASIAMS_SHORT_SPECTRA), set(CASIAMS_LONG_SPECTRA)
+        elif dataset == "xpalm":
+            short_set, long_set = set(XPALM_SHORT_SPECTRA), set(XPALM_LONG_SPECTRA)
         else:
-            long_ids.append(ci)
+            short_set, long_set = set(XJTU_SHORT_SPECTRA), set(XJTU_LONG_SPECTRA)
+
+        short_ids, long_ids = [], []
+        for ci, cd in enumerate(client_data):
+            if cd["spectrum"] in short_set:
+                short_ids.append(ci)
+            else:
+                long_ids.append(ci)
+              
     print(f"  Groups: SHORT={[client_data[i]['spectrum'] for i in short_ids]}")
     print(f"          LONG ={[client_data[i]['spectrum'] for i in long_ids]}")
 
