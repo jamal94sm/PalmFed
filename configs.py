@@ -110,6 +110,17 @@ CONFIG = {
     "dp_lr"            : 1e-3,
     "dp_batch_size"    : 64,
     "dp_mode"          : "ideal",
+
+    # Domain-Aware Clustering
+
+    "clustering_mode"   : "manual",         # "manual" | "domain_aware"
+    "cluster_alpha"     : 0.15,             # low-freq crop half-width (fraction of H/W)
+    "cluster_scale"     : "linear",         # "linear" | "log"
+    "cluster_diagonal"  : True,             # diagonal vs full covariance
+    "cluster_epsilon"   : 0.1,              # shrinkage regularization weight
+    "cluster_partition" : "farthest_pair",  # "farthest_pair" | "agglomerative" | "spectral"
+
+    
 }
 
 
