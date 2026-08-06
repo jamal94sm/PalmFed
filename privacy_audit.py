@@ -208,8 +208,11 @@ def experiment_1_identity_leakage(samples, img_side, alpha, scale, device):
 
     # Restrict to a single client for a clean closed-set identity task
     # (local labels are per-client; using client 0 keeps label space simple).
-    client0_samples = [(p, l) for p, l, c in samples if c == 0]
-    n_classes = len(set(l for _, l in client0_samples))
+    client0_samples_raw = [(p, l) for p, l, c in samples if c == 0]
+    unique_labels = sorted(set(l for _, l in client0_samples_raw))
+    remap = {old: new for new, old in enumerate(unique_labels)}
+    client0_samples = [(p, remap[l]) for p, l in client0_samples_raw]
+    n_classes = len(unique_labels)
     print(f" Using client-0 samples: {len(client0_samples)} images, "
           f"{n_classes} identities")
 
@@ -373,8 +376,11 @@ def experiment_3_membership_inference(samples, img_side, alpha, scale, device):
     print(f" Experiment 3 — Membership inference (alpha={alpha}, scale={scale})")
     print(f"{'─'*70}")
 
-    client0_samples = [(p, l) for p, l, c in samples if c == 0]
-    n_classes = len(set(l for _, l in client0_samples))
+    client0_samples_raw = [(p, l) for p, l, c in samples if c == 0]
+    unique_labels = sorted(set(l for _, l in client0_samples_raw))
+    remap = {old: new for new, old in enumerate(unique_labels)}
+    client0_samples = [(p, remap[l]) for p, l in client0_samples_raw]
+    n_classes = len(unique_labels)
 
     rng = np.random.default_rng(2)
     idx = np.arange(len(client0_samples))
