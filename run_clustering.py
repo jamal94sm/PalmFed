@@ -9,6 +9,16 @@
 #
 # Reads clustering params from configs.py::CONFIG (the "proposed"
 # config), overridable via CLI flags below.
+
+
+
+
+
+#python run_clustering.py --datasets casiams --cluster_scale log --cluster_partition spectral
+
+
+
+
 # ==============================================================
 import argparse
 import json
