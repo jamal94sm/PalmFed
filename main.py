@@ -203,6 +203,10 @@ def parse_overrides():
     p.add_argument("--eval_every", type=int)
     p.add_argument("--random_seed", type=int)
     p.add_argument("--splits_path")
+    p.add_argument("--clustering_mode", choices=["manual", "domain_aware"])
+    p.add_argument("--cluster_scale", choices=["linear", "log"])
+    p.add_argument("--cluster_partition",
+                   choices=["farthest_pair", "agglomerative", "spectral"])
     args, _ = p.parse_known_args()
     method = args.method
     overrides = {k: v for k, v in vars(args).items()
